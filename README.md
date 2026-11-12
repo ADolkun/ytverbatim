@@ -4,7 +4,17 @@ Turn YouTube URLs into verified, timestamped transcripts for LLM context.
 
 Language models need transcripts they can cite. `ytverbatim` aims to produce text where every line carries a timestamp, so a quote can be traced back to the exact moment in the video. It works with your own logged-in browser session, so Premium and members-only videos you can already watch are covered. Speech recognition runs locally on Apple Silicon (MLX), with a focus on Mandarin and English.
 
-**Status: pre-alpha — not usable yet.**
+**Status: pre-alpha.** The first usable slice works: `ytverbatim run` turns a video into a transcript with local Whisper and no LLM. Correction, numeric verification and the engine selection are still to come.
+
+## Usage
+
+```
+ytverbatim run URL... [--out DIR] [--auth SPEC] [--engine ID] [--captions/--no-captions] [--force]
+```
+
+Each video (playlists and channels are expanded) gets a folder `<out>/<video id>/` holding `context.json` (the versioned contract), `context.md` (the same transcript as markdown with a timestamped link per paragraph and YouTube chapters as headings) and the downloaded audio. A video that already has a `context.json` is skipped unless `--force` is given. Exit codes: 0 ok, 1 some videos failed, 2 auth error, 3 batch stopped. `ytverbatim fetch` downloads without transcribing; `ytverbatim auth` sets up your browser login (see [docs/auth.md](docs/auth.md)).
+
+The default engine, `w-prod`, is mlx-whisper large-v3 and needs the `whisper` extra (`uv sync --extra whisper`).
 
 ## Planned for v1
 
