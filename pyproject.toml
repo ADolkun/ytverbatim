@@ -125,9 +125,9 @@ max-statements = 80
 
 [tool.pyrefly]
 preset = "strict"
-project-includes = ["src", "tests", "scripts"]
+project-includes = ["src", "tests", "scripts", "evals"]
 python-version = "3.12"
-search-path = ["scripts", "tests/asr"]
+search-path = [".", "scripts", "tests/asr"]
 
 [tool.pyrefly.errors]
 unannotated-attribute = true
@@ -155,5 +155,5 @@ no-matching-overload = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-pythonpath = ["scripts"]
+pythonpath = [".", "scripts"]
 addopts = "-p no:cacheprovider"
