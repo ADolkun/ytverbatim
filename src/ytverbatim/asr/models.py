@@ -70,6 +70,8 @@ class WorkerRequest(_Model):
     out_dir: str
     files: tuple[FileJob, ...]
     hf_hub_cache: str | None = None
+    # Off only for diagnostics: the guard hides an engine's raw failure rate by re-decoding what failed.
+    quality_guard: bool = True
 
     @model_validator(mode="after")
     def _plans_match_chunking(self) -> Self:
