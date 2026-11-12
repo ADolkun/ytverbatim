@@ -8,7 +8,7 @@ Public videos need no login. Members-only videos, and Premium formats, need your
 - It keeps only `youtube.com` and `google.com` cookies and writes them to a private snapshot file (mode `0600`, in a `0700` directory under `~/.local/state/ytverbatim/auth/`).
 - yt-dlp uses that snapshot for the job, and the snapshot is deleted afterwards. Your browser's own cookie database is never written.
 - Cookies never leave your machine except in the requests yt-dlp makes to YouTube itself. They are never logged, printed, or sent anywhere else.
-- Videos are always tried anonymously first. Cookies are used only when YouTube asks for a login.
+- By default, videos are tried anonymously first, and cookies are used only when YouTube asks for a login. Cookies are used from the first request for members playlists (`UUMO…`), for channels listed in `auth.cookie_channels`, and with `--policy always`.
 
 Brave, Chromium, Edge and Vivaldi work the same way: replace `chrome` with the browser name.
 
@@ -67,9 +67,10 @@ Chrome is rolling out Device Bound Session Credentials (DBSC), which tie Google 
 
 ytverbatim keeps your account's footprint small:
 
-- Videos are fetched anonymously first; your login is used only when YouTube requires it.
+- By default, videos are fetched anonymously first, and your login is used only when YouTube requires it. Members playlists (`UUMO…`), channels in `auth.cookie_channels`, and `--policy always` use it from the start.
 - Batches sleep between requests, and each run has a video cap.
-- A bot check, captcha, IP block, or rate limit stops the batch and starts a cooldown (one hour, doubling on repeats, at most a day). Later runs refuse to start until it ends.
+- A bot check, captcha, IP block, or rate limit stops the batch and starts a cooldown (one hour, doubling on repeats, at most a day). Later runs refuse to start until it ends. When the signal arrives on a request that still succeeded, the current video finishes first.
+- `auth status` and `auth doctor` respect the cooldown too: while it runs they skip the `:ytfav` request and show when it ends, and a stop signal on their own request starts or extends it. `--ignore-cooldown` makes the request anyway, at the account's risk.
 - **Never add cookies to get past a bot check.** That ties the flagged traffic to your account. Wait out the cooldown, and disconnect any VPN or proxy.
 
 ## PO token

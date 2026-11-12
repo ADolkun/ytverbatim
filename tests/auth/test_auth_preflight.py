@@ -1,6 +1,7 @@
 import json
 import re
 import stat
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -8,10 +9,11 @@ import pytest
 from ytverbatim import paths
 from ytverbatim.auth import cookiefile, preflight
 from ytverbatim.auth.cookiefile import CookieEntry
+from ytverbatim.auth.cooldown import read_cooldown, start_cooldown
 from ytverbatim.auth.fixes import FIXES, fix_for
 from ytverbatim.auth.source import BrowserSource, CookieFileSource
 from ytverbatim.auth.state import AuthState
-from ytverbatim.errors import AuthError
+from ytverbatim.errors import AuthError, YtverbatimError
 from ytverbatim.ytdlp import jsruntime, version
 from ytverbatim.ytdlp.types import Signal
 
@@ -140,6 +142,55 @@ def test_probe_outcomes(kit, exit_ok: bool, signals: tuple[Signal | None, ...], 
     assert report.logged_in is True
     assert "fakeLikedId" not in report.detail
     assert not paths.preflight_cache_file().exists()
+
+
+@pytest.mark.parametrize(
+    ("exit_ok", "signals", "state"),
+    [
+        (False, (Signal.BOT_CHECK,), AuthState.BOT_CHECK),
+        (False, (Signal.LOGIN_REQUIRED, Signal.IP_BLOCKED), AuthState.IP_BLOCKED),
+        (False, (None, Signal.HTTP_429), AuthState.RATE_LIMITED),
+        (True, (Signal.CAPTCHA,), AuthState.CAPTCHA),
+    ],
+)
+def test_a_stop_signal_on_the_probe_starts_a_cooldown(
+    kit, exit_ok: bool, signals: tuple[Signal | None, ...], state: AuthState
+) -> None:
+    primary, *secondary = signals
+    runner = kit.ok(*[s for s in signals if s is not None]) if exit_ok else kit.fail(primary, *secondary)
+    report = preflight.preflight(DEFAULT, runner, now=NOW)
+    assert report.state is state and not report.probe_skipped
+    cooldown = read_cooldown()
+    assert cooldown is not None and report.cooldown == cooldown
+    assert cooldown.until == datetime.fromtimestamp(NOW, UTC) + timedelta(hours=1)
+    assert "Wait until " in report.fix and "an hour has passed" not in report.fix
+
+
+def test_active_cooldown_skips_the_probe_unless_ignored(kit) -> None:
+    started = start_cooldown(Signal.BOT_CHECK, datetime.fromtimestamp(NOW, UTC))
+    runner = kit.ok()
+    report = preflight.preflight(DEFAULT, runner, refresh=True, now=NOW + 60)
+    assert runner.calls == [] and report.probe_skipped and report.cooldown == started
+    assert report.state is AuthState.BOT_CHECK and report.logged_in is True
+    assert preflight.preflight(DEFAULT, runner, refresh=True, now=NOW + 60, ignore_cooldown=True).ok
+    assert len(runner.calls) == 1
+    assert preflight.preflight(DEFAULT, kit.ok(), refresh=True, now=NOW + 7200).ok
+
+
+def test_a_stop_during_an_ignored_cooldown_extends_it(kit) -> None:
+    start_cooldown(Signal.BOT_CHECK, datetime.fromtimestamp(NOW, UTC))
+    report = preflight.preflight(DEFAULT, kit.fail(Signal.BOT_CHECK), now=NOW + 60, ignore_cooldown=True)
+    cooldown = read_cooldown()
+    assert cooldown is not None and cooldown.hours == 2 and report.cooldown == cooldown
+
+
+def test_unreadable_cooldown_refuses_the_probe(kit) -> None:
+    paths.cooldown_file().write_text("{", encoding="utf-8")
+    runner = kit.ok()
+    with pytest.raises(YtverbatimError, match=r"cooldown\.json is unreadable"):
+        preflight.preflight(DEFAULT, runner, refresh=True, now=NOW)
+    assert runner.calls == []
+    assert preflight.preflight(DEFAULT, runner, refresh=True, now=NOW, ignore_cooldown=True).ok
 
 
 def test_cookie_file_rejected_by_youtube_is_a_file_state(kit) -> None:

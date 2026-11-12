@@ -1,25 +1,16 @@
-import json
 import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from ytverbatim import paths
+from ytverbatim.auth.cooldown import STOP_STATES, read_cooldown, shown_time
 from ytverbatim.auth.fixes import fix_for
 from ytverbatim.auth.preflight import YTDLP_STALE_DAYS, preflight
 from ytverbatim.auth.source import resolve_source
 from ytverbatim.auth.state import AuthState
-from ytverbatim.errors import AuthError, DependencyError
+from ytverbatim.errors import AuthError, DependencyError, YtverbatimError
 from ytverbatim.ytdlp import jsruntime, version
-from ytverbatim.ytdlp.types import Signal, YtDlpRunner
-
-_COOLDOWN_STATES = {
-    Signal.BOT_CHECK.value: AuthState.BOT_CHECK,
-    Signal.CAPTCHA.value: AuthState.CAPTCHA,
-    Signal.IP_BLOCKED.value: AuthState.IP_BLOCKED,
-    Signal.RATE_LIMITED.value: AuthState.RATE_LIMITED,
-    Signal.HTTP_429.value: AuthState.RATE_LIMITED,
-}
+from ytverbatim.ytdlp.types import YtDlpRunner
 
 
 class Status(StrEnum):
@@ -38,11 +29,15 @@ class Check:
     auth: bool = False
 
 
-def run_doctor(runner: YtDlpRunner, *, now: datetime | None = None) -> list[Check]:
-    """Run every check in order; the login checks always probe YouTube afresh instead of trusting the cache."""
+def run_doctor(runner: YtDlpRunner, *, now: datetime | None = None, ignore_cooldown: bool = False) -> list[Check]:
+    """Run every check in order; the login checks always probe YouTube afresh instead of trusting the cache.
+
+    While a cooldown is active the probe is skipped, unless ``ignore_cooldown`` is set.
+    """
+    now = now or datetime.now(UTC)
     checks = [_binary("ffmpeg"), _binary("ffprobe"), _js_runtime(), _ytdlp()]
-    checks += _auth_checks(runner)
-    checks.append(_cooldown(now or datetime.now(UTC)))
+    checks += _auth_checks(runner, now, ignore_cooldown=ignore_cooldown)
+    checks.append(_cooldown(now))
     return checks
 
 
@@ -74,14 +69,18 @@ def _ytdlp() -> Check:
     return Check("yt-dlp", Status.OK, f"{installed.version} ({age} days old)")
 
 
-def _auth_checks(runner: YtDlpRunner) -> list[Check]:
+def _auth_checks(runner: YtDlpRunner, now: datetime, *, ignore_cooldown: bool) -> list[Check]:
     try:
         source = resolve_source()
     except AuthError as exc:
         return [_failed("source", exc.state, exc.detail, fix_for(exc.state))]
     if source is None:
         return [_failed("source", AuthState.NO_SOURCE, "no auth source configured", fix_for(AuthState.NO_SOURCE))]
-    report = preflight(source, runner, refresh=True)
+    try:
+        report = preflight(source, runner, refresh=True, now=now.timestamp(), ignore_cooldown=ignore_cooldown)
+    except YtverbatimError as exc:
+        # Only an unreadable cooldown file gets here; the cooldown check below names it.
+        return [Check("login", Status.WARN, f"skipped: {exc}", auth=True)]
     checks: list[Check] = []
     if report.state in (AuthState.BROWSER_NOT_FOUND, AuthState.PROFILE_NOT_FOUND):
         return [_failed("source", report.state, report.detail, report.fix)]
@@ -93,7 +92,10 @@ def _auth_checks(runner: YtDlpRunner) -> list[Check]:
         return checks
     counts = ", ".join(f"{n} {domain}" for domain, n in report.counts.items())
     checks.append(Check("snapshot", Status.OK, f"signed-in cookies found ({counts})", auth=True))
-    if report.ok:
+    if report.probe_skipped:
+        skipped = f"skipped: {report.detail} (--ignore-cooldown probes anyway)"
+        checks.append(Check("login", Status.WARN, skipped, auth=True))
+    elif report.ok:
         checks.append(Check("login", Status.OK, "YouTube accepted the cookies (:ytfav)", auth=True))
     else:
         checks.append(_failed("login", report.state, report.detail, report.fix))
@@ -108,36 +110,16 @@ def _failed(name: str, state: AuthState, detail: str, fix: str) -> Check:
 
 
 def _cooldown(now: datetime) -> Check:
-    """Read the cooldown the fetch session writes after a bot or rate-limit signal."""
-    path = paths.cooldown_file()
     try:
-        raw: object = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return Check("cooldown", Status.OK, "none active", auth=True)
+        cooldown = read_cooldown()
     except (OSError, ValueError) as exc:
-        return Check("cooldown", Status.FAIL, f"cooldown.json is unreadable ({type(exc).__name__})", auth=True)
-    fields = raw if isinstance(raw, dict) else {}
-    until = _parse_until(fields.get("until"))
-    if until is None:
-        return Check("cooldown", Status.FAIL, "cooldown.json has no valid 'until' time", auth=True)
-    if until <= now:
+        fix = "Delete cooldown.json only if you are sure no cooldown is due; ytverbatim rewrites it on the next stop."
+        return Check("cooldown", Status.FAIL, f"cooldown.json is unreadable ({exc})", fix, auth=True)
+    if cooldown is None or not cooldown.active(now):
         return Check("cooldown", Status.OK, "none active", auth=True)
-    signal = fields.get("signal")
-    state = _COOLDOWN_STATES.get(signal, AuthState.BOT_CHECK) if isinstance(signal, str) else AuthState.BOT_CHECK
-    shown = until.astimezone().strftime("%Y-%m-%d %H:%M")
+    state = STOP_STATES[cooldown.signal]
+    shown = shown_time(cooldown.until)
     return _failed("cooldown", state, f"active until {shown}", fix_for(state, until=shown))
-
-
-def _parse_until(value: object) -> datetime | None:
-    if isinstance(value, int | float) and not isinstance(value, bool):
-        return datetime.fromtimestamp(value, UTC)
-    if isinstance(value, str):
-        try:
-            parsed = datetime.fromisoformat(value)
-        except ValueError:
-            return None
-        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
-    return None
 
 
 def exit_code(checks: list[Check]) -> int:

@@ -1,5 +1,8 @@
 """Auth status: offline snapshot checks plus one ``:ytfav`` probe, with OK results cached for an hour.
 
+The probe runs through the cooldown guard like every fetch call: a stop signal starts or extends the cooldown,
+and while one is active the probe is skipped unless the caller passes ``ignore_cooldown``.
+
 The cache (``auth/preflight.json``) holds only states, cookie counts, profile directory names and times. It
 is keyed by a hash of the source spec and resolved profile, so a cookie-file path never lands in it.
 """
@@ -14,10 +17,11 @@ from pathlib import Path
 
 from ytverbatim import atomic, paths
 from ytverbatim.auth import chromium, snapshot
+from ytverbatim.auth.cooldown import STOP_STATES, Cooldown, active_cooldown, guarded, shown_time
 from ytverbatim.auth.fixes import fix_for
 from ytverbatim.auth.source import BrowserSource, CookieFileSource, CookieSource, format_spec
 from ytverbatim.auth.state import AuthState
-from ytverbatim.errors import AuthError, YtDlpError
+from ytverbatim.errors import AuthError, BatchStopError, YtDlpError
 from ytverbatim.ytdlp import jsruntime, version
 from ytverbatim.ytdlp.runner import redact
 from ytverbatim.ytdlp.types import Signal, YtDlpRunner
@@ -28,13 +32,6 @@ PROBE_ARGS: tuple[str, ...] = ("--flat-playlist", "-I", "1", "--print", "id", ":
 PROBE_TIMEOUT_S = 120.0
 _CACHE_VERSION = 1
 
-_STOP_STATES: Mapping[Signal, AuthState] = {
-    Signal.BOT_CHECK: AuthState.BOT_CHECK,
-    Signal.CAPTCHA: AuthState.CAPTCHA,
-    Signal.IP_BLOCKED: AuthState.IP_BLOCKED,
-    Signal.RATE_LIMITED: AuthState.RATE_LIMITED,
-    Signal.HTTP_429: AuthState.RATE_LIMITED,
-}
 _PO_TOKEN = frozenset({Signal.PO_TOKEN_GVS, Signal.PO_TOKEN_SUBS})
 
 
@@ -55,6 +52,9 @@ class AuthReport:
     warnings: tuple[str, ...] = ()
     detail: str = ""
     cached: bool = False
+    # Set when a cooldown is active: either the probe was skipped for it or the probe started it.
+    cooldown: Cooldown | None = None
+    probe_skipped: bool = False
 
     @property
     def ok(self) -> bool:
@@ -78,6 +78,8 @@ class AuthReport:
             "ytdlp_age_days": self.ytdlp_age_days,
             "js_runtime": self.js_runtime,
             "warnings": list(self.warnings),
+            "cooldown_until": self.cooldown.until.isoformat(timespec="seconds") if self.cooldown else None,
+            "probe_skipped": self.probe_skipped,
         }
 
 
@@ -105,6 +107,8 @@ class _Outcome:
     detail: str = ""
     checked_at: float | None = None
     cached: bool = False
+    cooldown: Cooldown | None = None
+    probe_skipped: bool = False
 
 
 def preflight(
@@ -113,18 +117,20 @@ def preflight(
     refresh: bool = False,
     *,
     now: float | None = None,
+    ignore_cooldown: bool = False,
 ) -> AuthReport:
     """Check ``source`` offline (snapshot) and online (``:ytfav``); a fresh OK result is served from cache.
 
-    Only OK results are cached, so a problem the user just fixed never lingers for an hour.
+    Only OK results are cached, so a problem the user just fixed never lingers for an hour. Raises
+    `YtverbatimError` when the cooldown file is unreadable, unless ``ignore_cooldown`` is set.
     """
     now = time.time() if now is None else now
-    outcome, premium = _check(source, runner, refresh=refresh, now=now)
+    outcome, premium = _check(source, runner, refresh=refresh, now=now, ignore_cooldown=ignore_cooldown)
     return _report(outcome, source, premium, now)
 
 
 def _check(
-    source: CookieSource | None, runner: YtDlpRunner, *, refresh: bool, now: float
+    source: CookieSource | None, runner: YtDlpRunner, *, refresh: bool, now: float, ignore_cooldown: bool
 ) -> tuple[_Outcome, bool | None]:
     if source is None:
         return _Outcome(AuthState.NO_SOURCE), None
@@ -140,7 +146,7 @@ def _check(
     try:
         with snapshot.cookie_snapshot(source) as snap:
             summary = snap.summary
-            probed = _probe(runner, snap.path, source)
+            probed = _probe(runner, snap.path, source, now=now, ignore_cooldown=ignore_cooldown)
     except AuthError as exc:
         return _Outcome(exc.state, profile, detail=exc.detail), premium
     outcome = replace(
@@ -179,11 +185,20 @@ def _named_profile(source: CookieSource) -> str | None:
     return source.profile if isinstance(source, BrowserSource) else None
 
 
-def _probe(runner: YtDlpRunner, cookies: Path, source: CookieSource) -> _Outcome:
+def _probe(runner: YtDlpRunner, cookies: Path, source: CookieSource, *, now: float, ignore_cooldown: bool) -> _Outcome:
+    when = datetime.fromtimestamp(now, UTC)
+    if not ignore_cooldown and (cooldown := active_cooldown(when)) is not None:
+        detail = f"cooldown active until {shown_time(cooldown.until)}; the :ytfav probe was skipped"
+        return _Outcome(STOP_STATES[cooldown.signal], detail=detail, cooldown=cooldown, probe_skipped=True)
+    guard = guarded(runner, lambda: when)
     try:
-        result = runner.run(PROBE_ARGS, cookies=cookies, timeout_s=PROBE_TIMEOUT_S, label="auth-probe")
+        result = guard.run(PROBE_ARGS, cookies=cookies, timeout_s=PROBE_TIMEOUT_S, label="auth-probe")
+    except BatchStopError as exc:
+        return _stopped(exc.signal, guard.stop)
     except YtDlpError as exc:
         return _failed_probe(exc, source)
+    if guard.stop is not None:
+        return _stopped(guard.stop.signal, guard.stop)
     # stdout is the first liked video's id (or empty for an empty list); it is never read or kept.
     warnings = (AuthState.PO_TOKEN_REQUIRED.value,) if not _PO_TOKEN.isdisjoint(result.secondary) else ()
     if Signal.ROTATED in result.secondary:
@@ -191,12 +206,15 @@ def _probe(runner: YtDlpRunner, cookies: Path, source: CookieSource) -> _Outcome
     return _Outcome(AuthState.OK, warnings=warnings)
 
 
+def _stopped(signal: Signal, cooldown: Cooldown | None) -> _Outcome:
+    until = f"; cooldown until {shown_time(cooldown.until)}" if cooldown is not None else ""
+    return _Outcome(STOP_STATES[signal], detail=f"the :ytfav probe hit {signal.value}{until}", cooldown=cooldown)
+
+
 def _failed_probe(exc: YtDlpError, source: CookieSource) -> _Outcome:
     # The stderr preview is not kept: the probe's output can name a liked video.
     if Signal.ROTATED in exc.secondary:
         return _Outcome(AuthState.ROTATED, detail="yt-dlp reported the account cookies are no longer valid")
-    if exc.primary is not None and exc.primary in _STOP_STATES:
-        return _Outcome(_STOP_STATES[exc.primary], detail=f"the :ytfav probe hit {exc.primary.value}")
     if exc.primary is Signal.LOGIN_REQUIRED:
         state = AuthState.COOKIE_FILE_LOGGED_OUT if isinstance(source, CookieFileSource) else AuthState.LOGGED_OUT
         return _Outcome(state, detail="YouTube did not accept the cookies as a signed-in session")
@@ -218,6 +236,7 @@ def _report(outcome: _Outcome, source: CookieSource | None, premium: bool | None
         **fix_context(source, outcome.profile),
         premium=premium_text(premium),
         verified=checked_at.astimezone().strftime("%Y-%m-%d %H:%M"),
+        until=shown_time(outcome.cooldown.until) if outcome.cooldown is not None else None,
     )
     return AuthReport(
         state=outcome.state,
@@ -234,6 +253,8 @@ def _report(outcome: _Outcome, source: CookieSource | None, premium: bool | None
         warnings=tuple(dict.fromkeys(warnings)),
         detail=outcome.detail,
         cached=outcome.cached,
+        cooldown=outcome.cooldown,
+        probe_skipped=outcome.probe_skipped,
     )
 
 
