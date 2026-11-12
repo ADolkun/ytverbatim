@@ -1,6 +1,6 @@
 import pytest
 
-from evals.correction import BaseFile, CandidateFile
+from evals.correction import BaseFile, CandidateFile, audible_edits
 from evals.correction_metrics import (
     DELTA_UPPER_BOUND,
     OVER_CORRECTION_MAX,
@@ -10,7 +10,6 @@ from evals.correction_metrics import (
     Estimate,
     HumanEstimates,
     JudgeStats,
-    audible_edits,
     breaks_numbers,
     decide,
     human_estimate,

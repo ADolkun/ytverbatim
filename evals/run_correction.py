@@ -1,12 +1,14 @@
 """Correction-LLM eval runner: ``uv run python -m evals.run_correction <command>``.
 
 Order: ``base --hyp H`` → ``correct --candidate C`` per candidate (then ``cleanup --candidate C`` for a local one) →
-``session --candidate C`` → ``listen``. Every command is resumable and writes only under ``$YTVERBATIM_EVAL_DIR``
-(``correction/``, and the session under ``ab/``).
+``screen`` → ``session`` → ``listen`` → ``report`` → ``decide``. Every command is resumable and writes only under
+``$YTVERBATIM_EVAL_DIR`` (``correction/``, and the session under ``ab/``), except ``decide``, which writes the
+aggregate ``evals/results/correction-<date>.md``.
 """
 
 import contextlib
 from contextlib import AbstractContextManager
+from datetime import date
 from pathlib import Path
 
 import click
@@ -19,7 +21,7 @@ from evals.correction import (
     CandidateFile,
     build_base,
     cleanup_candidate,
-    complete_candidates,
+    failure_note,
     first_try_validity,
     load_failure,
     local_server,
@@ -28,12 +30,32 @@ from evals.correction import (
     run_dir,
     session_for,
 )
+from evals.correction_metrics import decide, require_decided
+from evals.correction_report import (
+    ITEMS_FILE,
+    REJECTIONS_FILE,
+    REPORT_JSON,
+    REPORT_MD,
+    SCREEN_FILE,
+    Report,
+    assess,
+    build_report,
+    build_screen,
+    gather,
+    judge_dir,
+    load_screen,
+    render_decision,
+    render_markdown,
+    resolve_candidates,
+    screen_text,
+)
+from evals.judge import JUDGE_MODEL, run_judge
 from evals.listen import listen as listen_loop
 from evals.manifest import load_manifest
-from evals.run_asr import default_hf_cache, layout
+from evals.run_asr import RESULTS_DIR, default_hf_cache, layout
 from evals.session import write_session
-from evals.store import Layout
-from ytverbatim import config
+from evals.store import Layout, dump_jsonl, now, write_json
+from ytverbatim import atomic, config
 from ytverbatim.asr import registry
 from ytverbatim.asr.runner import memory_cap_bytes
 from ytverbatim.errors import ConfigError, YtverbatimError
@@ -41,6 +63,7 @@ from ytverbatim.llm import ClaudeCLIClient, apply_spec, claude_cli, client_from_
 from ytverbatim.llm.protocol import LLMClient, Readiness
 
 DEFAULT_PUNCTUATION_LLM = "claude-cli:claude-sonnet-5-5"
+JUDGE_SAMPLE = 1500
 _LOCAL = sorted(c.id for c in CANDIDATES.values() if c.local)
 
 
@@ -59,6 +82,10 @@ def punctuation_client(spec: str) -> LLMClient:
     if options.provider == "claude-cli":
         _require_ready(claude_cli.readiness())
     return client
+
+
+def judge_client() -> LLMClient:
+    return ClaudeCLIClient(model=JUDGE_MODEL)
 
 
 def open_client(store: Layout, candidate: Candidate, cache: Path) -> AbstractContextManager[LLMClient]:
@@ -120,10 +147,7 @@ def correct(candidate_id: str, files: str | None, hf_cache: Path | None) -> None
         outcome = run_candidate(store, manifest, candidate, pending, client)
     click.echo(_summary(candidate, outcome.corrected))
     if load_failure(store, candidate) is not None:
-        click.echo(
-            f"note: {run_dir(store, candidate) / 'failure.json'} records an earlier invalid-JSON failure; the "
-            "candidate stays ineligible until that file is deleted"
-        )
+        click.echo(f"note: {failure_note(candidate, str(run_dir(store, candidate)))}")
 
 
 def _summary(candidate: Candidate, corrected: tuple[CandidateFile, ...]) -> str:
@@ -148,30 +172,68 @@ def cleanup(candidate_id: str, hf_cache: Path | None) -> None:
 
 
 @main.command()
+@click.option("--candidates", help="Comma-separated candidate ids to compare (default: every finished run).")
+@click.option("--judge-n", default=JUDGE_SAMPLE, show_default=True, help="Edit disputes sampled for the judge.")
+@click.option("--seed", default=0, show_default=True)
+@click.option("--max-calls", type=int, default=None, help="Stop after this many judge calls (quota).")
+@click.option("--no-judge", is_flag=True, help="Use the cached verdicts only; make no judge call.")
+def screen(candidates: str | None, judge_n: int, seed: int, max_calls: int | None, no_judge: bool) -> None:
+    """Find every candidate's edits, have the blind judge sample them, and pick the candidate to test."""
+    store, manifest = layout(), load_manifest()
+    screened, unfinished = resolve_candidates(store, manifest, _files(candidates))
+    gathered = gather(store, manifest, screened, unfinished, seed=seed, sample=judge_n)
+    dump_jsonl(store.correction / ITEMS_FILE, gathered.spans)
+    dump_jsonl(store.correction / REJECTIONS_FILE, gathered.rejections)
+    if not no_judge:
+        run_judge(
+            judge_client(),
+            gathered.to_judge,
+            judge_dir(store),
+            model=JUDGE_MODEL,
+            max_calls=max_calls,
+            progress=click.echo,
+        )
+    result = build_screen(gathered, assess(store, manifest, gathered), now())
+    write_json(store.correction / SCREEN_FILE, result)
+    click.echo(screen_text(result))
+
+
+@main.command()
 @click.option(
     "--candidate",
     "candidate_id",
-    required=True,
     type=click.Choice(sorted(CANDIDATES)),
-    help="The candidate whose audible edits are heard.",
+    help="The candidate whose audible edits are heard (default: the judge's pick in screen.json).",
 )
 @click.option("--n", "count", default=SESSION_N, show_default=True)
 @click.option("--seed", default=0, show_default=True)
 @click.option("--name", default=SESSION_NAME, show_default=True)
-def session(candidate_id: str, count: int, seed: int, name: str) -> None:
-    """Build the blind A/B session of one candidate's audible edits against the base."""
+def session(candidate_id: str | None, count: int, seed: int, name: str) -> None:
+    """Build the blind A/B session of the picked candidate's audible edits against the base."""
     store, manifest = layout(), load_manifest()
-    candidates = complete_candidates(store, manifest)
-    if not candidates:
-        raise ConfigError("no candidate has finished `correct` for every file; run it first")
-    shown, key = session_for(store, manifest, candidates, CANDIDATES[candidate_id], n=count, seed=seed)
+    screening = load_screen(store)
+    judge = screening.judge
+    if not judge.complete:
+        raise ConfigError(
+            f"the judge sample is incomplete ({judge.answered} of {judge.sample} answered); rerun `screen`, which "
+            "resumes from its cache, then run `session`"
+        )
+    target = candidate_id or screening.pick.candidate
+    if target is None:
+        raise ConfigError(
+            f"no candidate passed the screening ({screening.pick.reason}), so there is nothing to test and "
+            "correction stays default-off; see `screen` for why each was ineligible"
+        )
+    # The judge's options, and so every span id, depend on exactly the candidates `screen` compared.
+    screened = [CANDIDATES[c] for c in screening.screened]
+    shown, key = session_for(store, manifest, screened, CANDIDATES[target], n=count, seed=seed)
     created = write_session(store, name, shown, key)
     numeric = sum(e.stratum == "numeric" for e in key.entries)
     by_language = {lang: sum(e.language == lang for e in key.entries) for lang in ("zh", "en")}
     click.echo(
         f"session {name!r} {'built' if created else 'already exists'}: {len(shown)} spans "
         f"({numeric} numeric/entity; zh {by_language['zh']}, en {by_language['en']}) "
-        f"from {sum(key.population.values())} audible edits of {candidate_id}"
+        f"from {sum(key.population.values())} audible edits of {target}"
     )
 
 
@@ -180,6 +242,35 @@ def session(candidate_id: str, count: int, seed: int, name: str) -> None:
 def listen(name: str) -> None:
     """Blind A/B in the terminal: one keypress per clip (the same loop as `run_asr listen`)."""
     listen_loop(layout(), load_manifest(), name, getchar=click.getchar, echo=click.echo)
+
+
+@main.command()
+@click.option("--name", default=SESSION_NAME, show_default=True, help="The session to read the owner's labels from.")
+def report(name: str) -> None:
+    """Aggregate JSON and markdown report under $YTVERBATIM_EVAL_DIR/correction."""
+    store, manifest = layout(), load_manifest()
+    result = build_report(store, manifest, load_screen(store), name, now())
+    if result.correction.human is not None:
+        require_decided(result.correction.human)
+    write_json(store.correction / REPORT_JSON, result)
+    atomic.write_text(store.correction / REPORT_MD, render_markdown(result))
+    click.echo(f"wrote {store.correction / REPORT_MD}")
+
+
+@main.command(name="decide")
+@click.option("--date", "day", default=None, help="Date for the results file name (default: today).")
+def decide_command(day: str | None) -> None:
+    """Apply the default-on rule: print the decision as JSON and write evals/results/correction-<date>.md."""
+    path = layout().correction / REPORT_JSON
+    if not path.exists():
+        raise ConfigError("no report; run `report` first")
+    result = Report.model_validate_json(path.read_text(encoding="utf-8"))
+    decision = decide(result.correction)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    written = RESULTS_DIR / f"correction-{day or date.today().isoformat()}.md"
+    atomic.write_text(written, render_markdown(result) + "\n" + render_decision(decision))
+    click.echo(decision.model_dump_json(indent=2))
+    click.echo(f"wrote {written}", err=True)
 
 
 def run() -> None:

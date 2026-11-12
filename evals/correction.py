@@ -185,6 +185,15 @@ class Failure(_Frozen):
     at: str
 
 
+class CallRecord(_Frozen):
+    """One line of ``calls.jsonl``: a reply's time and tokens, as the recording client saw them."""
+
+    file: str
+    elapsed_s: float
+    input_tokens: int | None
+    output_tokens: int | None
+
+
 class ServerRecord(_Frozen):
     candidate: str
     model: str
@@ -216,6 +225,26 @@ def run_dir(store: Layout, candidate: Candidate) -> Path:
 def load_failure(store: Layout, candidate: Candidate) -> Failure | None:
     directory = run_dir(store, candidate)
     return _load(directory / FAILURE_FILE, Failure, directory)
+
+
+def failure_note(candidate: Candidate, where: str) -> str:
+    return (
+        f"{candidate.id} is ineligible: a correction call returned invalid JSON twice. {FAILURE_FILE} stays on "
+        f"purpose, because production would have failed on it too. To try again, move {where} aside and rerun "
+        f"`python -m evals.run_correction correct --candidate {candidate.id}` from scratch"
+    )
+
+
+def load_server_record(store: Layout, candidate: Candidate) -> ServerRecord | None:
+    directory = run_dir(store, candidate)
+    return _load(directory / SERVER_RECORD, ServerRecord, directory)
+
+
+def load_calls(store: Layout, candidate: Candidate) -> list[CallRecord]:
+    path = run_dir(store, candidate) / CALLS_FILE
+    if not path.exists():
+        return []
+    return [CallRecord.model_validate_json(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
 
 
 def candidate_path(store: Layout, candidate: Candidate, file: str) -> Path:
@@ -360,15 +389,15 @@ class RecordingClient:
     def complete(self, request: LLMRequest) -> LLMResponse:
         response = self._inner.complete(request)
         usage = response.usage
-        line = {
-            "file": self._file,
-            "elapsed_s": round(response.elapsed_s, 3),
-            "input_tokens": None if usage is None else usage.input_tokens,
-            "output_tokens": None if usage is None else usage.output_tokens,
-        }
+        record = CallRecord(
+            file=self._file,
+            elapsed_s=round(response.elapsed_s, 3),
+            input_tokens=None if usage is None else usage.input_tokens,
+            output_tokens=None if usage is None else usage.output_tokens,
+        )
         self._calls.parent.mkdir(parents=True, exist_ok=True)
         with self._calls.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(line) + "\n")
+            handle.write(record.model_dump_json() + "\n")
         return response
 
 
@@ -622,7 +651,7 @@ def complete_candidates(store: Layout, manifest: Manifest) -> list[Candidate]:
     return [c for c in CANDIDATES.values() if not pending_files(store, manifest, c, [])]
 
 
-def _require_run(store: Layout, candidate: Candidate, file: str) -> CandidateFile:
+def require_run(store: Layout, candidate: Candidate, file: str) -> CandidateFile:
     run = load_candidate_file(store, candidate, file)
     if run is None:
         raise ConfigError(
@@ -704,7 +733,7 @@ def edit_spans(
     spans: list[Span] = []
     for video in videos(manifest, files):
         base = load_base(store, video.id)
-        runs = {c.id: _require_run(store, c, video.id) for c in candidates}
+        runs = {c.id: require_run(store, c, video.id) for c in candidates}
         changed = [i for i, s in enumerate(base.stretches) if any(run.texts[i] != s.text for run in runs.values())]
         if not changed:
             continue
@@ -739,7 +768,7 @@ def rejection_spans(
     """
     proposals: dict[str, list[list[RejectionSpan]]] = {}
     for video in videos(manifest, files):
-        runs = [(c, _require_run(store, c, video.id)) for c in candidates]
+        runs = [(c, require_run(store, c, video.id)) for c in candidates]
         if not any(run.rejections for _, run in runs):
             continue
         timing = _timing(store, video, load_base(store, video.id))

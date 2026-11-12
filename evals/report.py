@@ -134,12 +134,10 @@ def ab_result(layout: Layout, name: str, labels: dict[str, str]) -> ABResult:
     )
 
 
-def build_report(
-    layout: Layout, manifest: Manifest, screen: ScreenResult, session: str | None, generated: str
-) -> Report:
+def file_rows(layout: Layout, manifest: Manifest) -> tuple[FileRow, ...]:
     labels = manifest.labels()
     references = rows_by_file(layout, REFERENCE)
-    files = tuple(
+    return tuple(
         FileRow(
             label=labels[v.id],
             language=v.view_language,
@@ -149,10 +147,27 @@ def build_report(
         )
         for v in sorted(manifest.videos, key=lambda v: labels[v.id])
     )
+
+
+def build_report(
+    layout: Layout, manifest: Manifest, screen: ScreenResult, session: str | None, generated: str
+) -> Report:
+    labels = manifest.labels()
     ab = None
     if session is not None and (layout.session_dir(session) / KEY_FILE).exists():
         ab = ab_result(layout, session, labels)
-    return Report(generated=generated, files=files, screen=screen, ab=ab)
+    return Report(generated=generated, files=file_rows(layout, manifest), screen=screen, ab=ab)
+
+
+def files_table(files: Sequence[FileRow]) -> list[str]:
+    return [
+        "| label | language view | access | minutes | manual reference |",
+        "|---|---|---|---|---|",
+        *(
+            f"| {f.label} | {f.language} | {f.access} | {f.minutes} | {'yes' if f.has_reference else 'no'} |"
+            for f in files
+        ),
+    ]
 
 
 def _ci(stats: WinStats) -> str:
@@ -200,12 +215,7 @@ def render_markdown(report: Report) -> str:
         "",
         "## Files",
         "",
-        "| label | language view | access | minutes | manual reference |",
-        "|---|---|---|---|---|",
-        *(
-            f"| {f.label} | {f.language} | {f.access} | {f.minutes} | {'yes' if f.has_reference else 'no'} |"
-            for f in report.files
-        ),
+        *files_table(report.files),
         "",
         "## Screening",
         "",
