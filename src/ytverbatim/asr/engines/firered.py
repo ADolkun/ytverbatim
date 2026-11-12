@@ -23,6 +23,14 @@ if TYPE_CHECKING:
 
 # Above every chunk we hand over, so mlx-audio never re-splits an input with its Qwen splitter.
 CHUNK_DURATION_S = 60.0
+# mlx-audio's own beam-search defaults (fireredasr2.py `_generate_single` and `beam_search`), pinned so an upgrade
+# that changes them cannot shift results. `max_len=0` caps the decode at the encoder length.
+_FIXED_PARAMS: dict[str, float | int] = {
+    "softmax_smoothing": 1.25,
+    "length_penalty": 0.6,
+    "eos_penalty": 1.0,
+    "max_len": 0,
+}
 
 
 class _Output(Protocol):
@@ -67,7 +75,9 @@ class FireRedEngine:
         if seconds > self._max_input_s:
             raise EngineError(f"{self._spec.id} takes at most {self._max_input_s:g}s per chunk, got {seconds:.1f}s")
         mx = importlib.import_module("mlx.core")
-        output = model.generate(mx.array(audio), beam_size=self._beam_size, chunk_duration=CHUNK_DURATION_S)
+        output = model.generate(
+            mx.array(audio), beam_size=self._beam_size, chunk_duration=CHUNK_DURATION_S, **_FIXED_PARAMS
+        )
         # One chunk is one segment; an empty decode reports 0.0, which is "no tokens", not "low confidence".
         confidence = float(output.segments[0]["confidence"]) if output.text else None
         # The decoder's step cap is the encoder length and is not exposed, so a cap hit cannot be detected.

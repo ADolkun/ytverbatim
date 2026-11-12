@@ -70,7 +70,14 @@ def test_decodes_with_the_exact_kwargs_and_keeps_the_lowercase_text(monkeypatch:
 
     [(passed, kwargs)] = model.calls
     assert passed == ("mx", audio)
-    assert kwargs == {"beam_size": 3, "chunk_duration": 60.0}
+    assert kwargs == {
+        "beam_size": 3,
+        "chunk_duration": 60.0,
+        "softmax_smoothing": 1.25,
+        "length_penalty": 0.6,
+        "eos_penalty": 1.0,
+        "max_len": 0,
+    }
     assert raw.text == "nvda rose 3.5 percent"
 
 

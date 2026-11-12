@@ -115,6 +115,22 @@ def test_the_lookup_is_restored_when_loading_fails(monkeypatch: pytest.MonkeyPat
     assert rec.loads == []
 
 
+def test_a_load_that_never_consults_the_pin_fails_loud(monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = install(monkeypatch, FakeModel())
+    stt = sys.modules["mlx_audio.stt"]
+
+    def load_ignoring_the_hook(repo: str, **kwargs: Any) -> FakeModel:
+        rec.loads.append((repo, kwargs))
+        return rec.model
+
+    stt.load = load_ignoring_the_hook  # type: ignore[attr-defined]
+    engine = mimo.create(SPEC, DEFINITION.variant)
+    with pytest.raises(EngineError, match=rf"without consulting the pinned tokenizer {TOKENIZER_REPO}"):
+        engine.load()
+    with pytest.raises(EngineError, match="load"):
+        engine.transcribe(np.zeros(16_000, dtype=np.float32), language=None, context=None)
+
+
 def test_every_generation_parameter_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
     model = FakeModel()
     engine, rec = loaded_engine(monkeypatch, model)

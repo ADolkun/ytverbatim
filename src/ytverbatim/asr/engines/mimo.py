@@ -3,7 +3,8 @@
 mlx-audio silently misbehaves for MiMo in three ways, and the adapter sets each explicitly:
 - the model reads 24 kHz audio and does not resample arrays, so the worker's 16 kHz chunk is resampled here;
 - `max_tokens` defaults to 256 and truncates a long chunk without any signal, so it is derived from the duration;
-- the audio tokenizer repo is resolved from the model's manifest without a revision, so it is pinned here.
+- the audio tokenizer repo is resolved from the model's manifest without a revision, so it is pinned here, and
+  `load` fails if the pin was never consulted.
 
 The output is one segment with no word timestamps and no confidence.
 """
@@ -75,20 +76,22 @@ def model_language(language: str | None) -> str | None:
 
 
 @contextmanager
-def _pinned_tokenizer(model_class: Any, tokenizer_dir: Path) -> Iterator[None]:
+def _pinned_tokenizer(model_class: Any, tokenizer_dir: Path) -> Iterator[list[Path]]:
     """Make `Model.post_load_hook` use the pinned tokenizer snapshot instead of resolving the manifest's repo name.
 
     The manifest names the repo without a revision, and redirecting that lookup is the only seam that does not mean
-    copying the loader.
+    copying the loader. The yielded list records each model path the redirect answered for.
     """
+    used: list[Path] = []
 
-    def pinned(_model_path: Path) -> Path:
+    def pinned(model_path: Path) -> Path:
+        used.append(model_path)
         return tokenizer_dir
 
     original = vars(model_class)["_resolve_audio_tokenizer_dir"]
     model_class._resolve_audio_tokenizer_dir = staticmethod(pinned)
     try:
-        yield
+        yield used
     finally:
         model_class._resolve_audio_tokenizer_dir = original
 
@@ -110,8 +113,8 @@ class MimoEngine:
             raise DependencyError("install ytverbatim[asr]") from exc
         try:
             tokenizer_dir = Path(utils.get_model_path(self._tokenizer_repo, revision=self._tokenizer_revision))
-            with _pinned_tokenizer(asr.Model, tokenizer_dir):
-                self._model = cast(_Model, stt.load(spec.repo, revision=spec.revision))
+            with _pinned_tokenizer(asr.Model, tokenizer_dir) as used:
+                model = cast(_Model, stt.load(spec.repo, revision=spec.revision))
         except Exception as exc:
             cache = os.environ.get("HF_HUB_CACHE", "the default Hugging Face cache")
             raise EngineError(
@@ -119,6 +122,13 @@ class MimoEngine:
                 f"{self._tokenizer_revision} (weights are fetched into {cache} on first use, so this also fails "
                 f"offline or on a full disk): {exc}"
             ) from exc
+        if not used:
+            # An mlx-audio that no longer resolves the tokenizer through this hook would load an unpinned one.
+            raise EngineError(
+                f"{spec.id} loaded without consulting the pinned tokenizer {self._tokenizer_repo}@"
+                f"{self._tokenizer_revision}; the installed mlx-audio changed how MiMo finds its audio tokenizer"
+            )
+        self._model = model
 
     def transcribe(self, audio: "NDArray[np.float32]", *, language: str | None, context: AsrContext | None) -> RawChunk:
         model = self._model
