@@ -46,7 +46,7 @@ from ytverbatim import config, pipeline, proc, stages
 from ytverbatim.acquire.metadata import VideoMetadata, trim_info
 from ytverbatim.asr import registry
 from ytverbatim.asr.models import ChunkHypothesis
-from ytverbatim.asr.runner import default_memory_cap_bytes, worker_lock
+from ytverbatim.asr.runner import default_memory_cap_bytes, memory_fix, worker_lock
 from ytverbatim.contract.models import Edit, Flag, LLMUsage, Word
 from ytverbatim.errors import (
     ConfigError,
@@ -546,7 +546,7 @@ class ServerSeams:
     free: Callable[[Path], int] = disk.free_bytes
     download: Callable[[str, str, Path], Path] = _snapshot_download
     runtime: Callable[[], None] = _require_mlx_lm
-    lock: Callable[[], AbstractContextManager[None]] = worker_lock
+    lock: Callable[[], AbstractContextManager[int]] = worker_lock
     background: Callable[..., AbstractContextManager[proc.Background]] = proc.background
     ready: Callable[[str], Readiness] = openai_compat.readiness
     port: Callable[[], int] = _free_port
@@ -576,41 +576,45 @@ def local_server(
     seams.runtime()
     disk.require_candidate_cache(cache)
     disk.check_weights([weights], cache, candidate.id, free=seams.free)
-    snapshot = (
-        disk.repo_dir(cache, weights.repo) / "snapshots" / weights.revision
-        if disk.present(cache, weights)
-        else seams.download(weights.repo, weights.revision, cache)
-    )
+    # Even when the snapshot looks present: an interrupted download leaves it partial, and the hub finishes it, or
+    # does nothing when it is complete.
+    snapshot = seams.download(weights.repo, weights.revision, cache)
     cap = memory_cap or default_memory_cap_bytes()
-    port = seams.port()
-    base_url = f"http://127.0.0.1:{port}/v1"
     directory.mkdir(parents=True, exist_ok=True)
     log = directory / SERVER_LOG
-    argv = [
-        sys.executable, "-m", "evals.mlx_server", "--memory-cap-bytes", str(cap), "--",
-        "--model", str(snapshot), "--host", "127.0.0.1", "--port", str(port), *_SERVER_FLAGS,
-    ]  # fmt: skip
     try:
-        with (
-            seams.lock(),
-            seams.background(
-                argv, log=log, memory_watch=proc.MemoryWatch(cap), cwd=REPO_ROOT, env=_server_env(cache)
-            ) as server,
-        ):
-            try:
-                _await_ready(server, base_url, log, seams)
-                yield OpenAICompatClient(base_url=base_url, model=SERVER_MODEL, timeout_s=CLIENT_TIMEOUT_S)
-            finally:
-                write_json(
-                    directory / SERVER_RECORD,
-                    ServerRecord(
-                        candidate=candidate.id,
-                        model=weights.repo,
-                        revision=weights.revision,
-                        cap_bytes=cap,
-                        peak_footprint_bytes=server.peak_footprint_bytes,
-                    ),
-                )
+        with proc.exit_on_signals(), seams.lock() as lock_fd:
+            # Picked only now: the lock can take hours to come free, and a port picked before could be taken by then.
+            port = seams.port()
+            base_url = f"http://127.0.0.1:{port}/v1"
+            argv = [
+                sys.executable, "-m", "evals.mlx_server", "--memory-cap-bytes", str(cap), "--",
+                "--model", str(snapshot), "--host", "127.0.0.1", "--port", str(port), *_SERVER_FLAGS,
+            ]  # fmt: skip
+            with seams.background(
+                argv,
+                log=log,
+                memory_watch=proc.MemoryWatch(cap),
+                cwd=REPO_ROOT,
+                env=_server_env(cache),
+                # The server holds the lock too, so it stays taken for as long as the server runs, even past this
+                # process.
+                pass_fds=(lock_fd,),
+            ) as server:
+                try:
+                    _await_ready(server, base_url, log, seams)
+                    yield OpenAICompatClient(base_url=base_url, model=SERVER_MODEL, timeout_s=CLIENT_TIMEOUT_S)
+                finally:
+                    write_json(
+                        directory / SERVER_RECORD,
+                        ServerRecord(
+                            candidate=candidate.id,
+                            model=weights.repo,
+                            revision=weights.revision,
+                            cap_bytes=cap,
+                            peak_footprint_bytes=server.peak_footprint_bytes,
+                        ),
+                    )
     except ProcMemoryExceeded as exc:
         raise EngineMemoryError(
             f"{candidate.id} server stopped to protect the machine: {exc}", _memory_fix(exc), exc
@@ -641,13 +645,7 @@ def _tail(log: Path) -> str:
 
 
 def _memory_fix(exc: ProcMemoryExceeded) -> str:
-    resume = "finished batches are kept and the next run resumes from them"
-    if exc.trigger == "available":
-        return f"close memory-heavy apps, then run again ({resume})"
-    return (
-        "raise asr.memory_cap_gib in the config file (14 suits this model) only if this Mac has that much memory to "
-        f"spare, or run the smaller l-qwen3-8b ({resume})"
-    )
+    return memory_fix(exc, smaller="run the smaller l-qwen3-8b", kept="finished batches")
 
 
 def _server_env(cache: Path) -> dict[str, str]:

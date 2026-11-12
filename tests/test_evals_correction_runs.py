@@ -2,6 +2,7 @@ import contextlib
 import fcntl
 import json
 import os
+import signal
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -422,6 +423,8 @@ class Rig:
     started: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
     downloads: list[tuple[str, str, Path]] = field(default_factory=list[tuple[str, str, Path]])
     locked_during: list[bool] = field(default_factory=list[bool])
+    locked_at_port: list[bool] = field(default_factory=list[bool])
+    passed_the_lock: list[bool] = field(default_factory=list[bool])
     answers: list[bool] = field(default_factory=lambda: [False, True])
     server: FakeServer = field(default_factory=FakeServer)
     breach: ProcMemoryExceeded | None = None
@@ -434,7 +437,7 @@ class Rig:
             runtime=lambda: None,
             background=self._background,
             ready=self._ready,
-            port=lambda: 50123,
+            port=self._port,
             poll_s=0.0,
             ready_timeout_s=5.0,
         )
@@ -442,6 +445,10 @@ class Rig:
     def _download(self, repo: str, revision: str, cache: Path) -> Path:
         self.downloads.append((repo, revision, cache))
         return cache / "downloaded"
+
+    def _port(self) -> int:
+        self.locked_at_port.append(_lock_is_held())
+        return 50123
 
     def _ready(self, base_url: str) -> Readiness:
         assert base_url == "http://127.0.0.1:50123/v1"
@@ -451,6 +458,10 @@ class Rig:
     def _background(self, argv: list[str], **kwargs: object) -> Generator[FakeServer]:
         self.started.append({"argv": argv, **kwargs})
         self.locked_during.append(_lock_is_held())
+        passed = kwargs.get("pass_fds")
+        assert isinstance(passed, tuple)
+        lock_file = os.stat(paths.locks_dir() / "mlx-worker.lock")
+        self.passed_the_lock.append([os.fstat(fd).st_ino for fd in passed] == [lock_file.st_ino])
         try:
             yield self.server
         except BaseException as exc:
@@ -504,6 +515,8 @@ def test_the_local_server_runs_pinned_bounded_and_under_the_worker_lock(rig: Rig
     assert argv[argv.index("--port") + 1] == "50123"
     assert argv[argv.index("--chat-template-args") + 1] == '{"enable_thinking":false}'
     assert rig.locked_during == [True]
+    assert rig.locked_at_port == [True]
+    assert rig.passed_the_lock == [True]
     assert started["cwd"] == correction.REPO_ROOT
     assert started["log"] == rig.directory / "server.log"
     assert started["memory_watch"].cap_bytes == 12 << 30  # type: ignore[attr-defined]
@@ -520,7 +533,7 @@ def test_the_local_server_runs_pinned_bounded_and_under_the_worker_lock(rig: Rig
     assert record["candidate"] == "l-qwen35-9b"
 
 
-def test_a_present_snapshot_is_used_without_a_download(rig: Rig) -> None:
+def test_a_present_snapshot_skips_the_disk_gate_but_still_goes_through_the_download(rig: Rig) -> None:
     assert LOCAL.revision is not None
     snapshot = disk.repo_dir(rig.cache, LOCAL.model) / "snapshots" / LOCAL.revision
     snapshot.mkdir(parents=True)
@@ -528,8 +541,19 @@ def test_a_present_snapshot_is_used_without_a_download(rig: Rig) -> None:
     rig.free = 0
     with local_server(LOCAL, rig.cache, rig.directory, seams=rig.seams()):
         pass
-    assert rig.downloads == []
-    assert rig.started[0]["argv"][rig.started[0]["argv"].index("--model") + 1] == str(snapshot)  # type: ignore[index]
+    # A partial snapshot looks present too; the hub's download finishes it, and is a no-op for a complete one.
+    assert rig.downloads == [(LOCAL.model, LOCAL.revision, rig.cache)]
+
+
+def test_sigterm_during_the_run_leaves_through_the_servers_exit(rig: Rig) -> None:
+    before = signal.getsignal(signal.SIGTERM)
+    with pytest.raises(SystemExit) as info, local_server(LOCAL, rig.cache, rig.directory, seams=rig.seams()):
+        os.kill(os.getpid(), signal.SIGTERM)
+        pytest.fail("SIGTERM must end the block")
+    assert info.value.code == 128 + signal.SIGTERM
+    assert (rig.directory / "server.json").exists()
+    assert not _lock_is_held()
+    assert signal.getsignal(signal.SIGTERM) == before
 
 
 def test_the_disk_gate_refuses_before_any_download_or_server(rig: Rig) -> None:

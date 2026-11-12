@@ -123,40 +123,41 @@ class Background:
     def alive(self) -> bool:
         return self.returncode is None
 
-    def _sample(self) -> ProcMemoryExceeded | None:
-        with self._lock:
-            if self._child.poll() is not None:
-                return None
-            sample, breach = _check(self._child, self._command, self._watch)
-        if sample is not None:
-            self._peak = max(sample.peak, self._peak or 0)
-        return breach
-
     def _run(self) -> None:
         try:
             while True:
-                breach = self._sample()
-                if breach is not None:
-                    self._error = breach
-                    _signal_group(self.pid, signal.SIGKILL)
-                    return
-                if self._child.returncode is not None or self._stop.wait(self._watch.poll_s):
+                with self._lock:
+                    if self._child.poll() is not None:
+                        return
+                    sample, breach = _check(self._child, self._command, self._watch)
+                    if sample is not None:
+                        self._peak = max(sample.peak, self._peak or 0)
+                    if breach is not None:
+                        self._error = breach
+                        _signal_group(self.pid, signal.SIGKILL)
+                        return
+                if self._stop.wait(self._watch.poll_s):
                     return
         except BaseException as exc:
             # A watch that cannot read memory must not leave the child running unwatched.
             self._error = exc
-            _signal_group(self.pid, signal.SIGKILL)
+            with self._lock:
+                _signal_group(self.pid, signal.SIGKILL)
 
     def _close(self, grace_s: float) -> BaseException | None:
         """Stop watching, end the process group, and return what the watch caught, if anything."""
-        self._stop.set()
-        self._thread.join()
-        _signal_group(self.pid, signal.SIGTERM)
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            self._child.wait(timeout=grace_s)
-        # Also after a clean exit of the leader: a grandchild that ignored SIGTERM would otherwise outlive it.
-        _signal_group(self.pid, signal.SIGKILL)
-        self._child.wait()
+        try:
+            self._stop.set()
+            self._thread.join()
+            _signal_group(self.pid, signal.SIGTERM)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                self._child.wait(timeout=grace_s)
+        finally:
+            # Also after a clean exit of the leader, where a grandchild that ignored SIGTERM would otherwise outlive
+            # it, and after a second interrupt during the grace.
+            with self._lock:
+                _signal_group(self.pid, signal.SIGKILL)
+                self._child.wait()
         return self._error
 
 
@@ -168,6 +169,7 @@ def background(
     memory_watch: MemoryWatch,
     env: Mapping[str, str] | None = None,
     cwd: Path | None = None,
+    pass_fds: Sequence[int] = (),
     term_grace_s: float = DEFAULT_TERM_GRACE_S,
 ) -> Generator[Background, None, None]:
     """Run a long-lived child (a server) under `memory_watch` for the duration of the block.
@@ -177,6 +179,10 @@ def background(
     it is left, sends the group SIGTERM, then SIGKILL after `term_grace_s`. A breach is raised as `ProcMemoryExceeded`
     at exit, chained to the block's own exception if it raised one: the block usually fails only because its server
     was killed under it.
+
+    `pass_fds` are inherited by the child, for example a lock that must be held for exactly as long as it runs.
+    The child is ended only if this block's exit runs: wrap it in `exit_on_signals` so SIGTERM and SIGHUP run it,
+    and make the child exit by itself when its parent dies of SIGKILL.
     """
     command = Path(argv[0]).name
     with log.open("ab") as sink, _spawning(command, cwd):
@@ -187,6 +193,7 @@ def background(
             stderr=subprocess.STDOUT,
             env=None if env is None else dict(env),
             cwd=cwd,
+            pass_fds=tuple(pass_fds),
             start_new_session=True,
         )
     try:
@@ -205,6 +212,31 @@ def background(
     error = handle._close(term_grace_s)
     if error is not None:
         raise error
+
+
+@contextlib.contextmanager
+def exit_on_signals() -> Generator[None, None, None]:
+    """Raise `SystemExit` on SIGTERM and SIGHUP inside the block, so `finally` blocks run.
+
+    By default both end the process on the spot, which skips them: closing the terminal tab of a long run would
+    leave its background children running. Only the main thread can install handlers; elsewhere this is a no-op.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = {signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGHUP)}
+
+    def leave(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    for signum in previous:
+        signal.signal(signum, leave)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            # None: a handler installed outside Python, which cannot be put back.
+            signal.signal(signum, signal.SIG_DFL if handler is None else handler)
 
 
 def _check(

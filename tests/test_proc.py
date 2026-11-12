@@ -1,4 +1,6 @@
+import fcntl
 import os
+import signal
 import subprocess
 import sys
 import textwrap
@@ -407,3 +409,71 @@ def test_background_reports_a_missing_binary(tmp_path: Path) -> None:
         proc.background(["ytverbatim-no-such-binary"], log=tmp_path / "log", memory_watch=watch),
     ):
         pass
+
+
+class _InterruptError(Exception):
+    pass
+
+
+def test_an_interrupt_during_the_grace_still_kills_the_group(script: Path, tmp_path: Path) -> None:
+    def interrupt(_signum: int, _frame: object) -> None:
+        raise _InterruptError
+
+    pid_file = tmp_path / "pids"
+    watch = proc.MemoryWatch(1 << 40, poll_s=0.05, available_percent=_plenty)
+    previous = signal.signal(signal.SIGALRM, interrupt)
+    started = time.monotonic()
+    try:
+        with (
+            pytest.raises(_InterruptError),
+            proc.background(
+                _serve(script, pid_file, "stubborn"), log=tmp_path / "log", memory_watch=watch, term_grace_s=30
+            ),
+        ):
+            leader, helper = _pids(pid_file)
+            # Fires inside the 30 s wait for the SIGTERM-ignoring leader, as a second Ctrl-C would.
+            signal.setitimer(signal.ITIMER_REAL, 0.3)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    assert time.monotonic() - started < 10
+    assert _all_gone(leader, helper)
+
+
+def _locked(path: Path) -> bool:
+    fd = os.open(path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def test_a_passed_lock_stays_held_while_the_child_runs_and_frees_when_it_ends(script: Path, tmp_path: Path) -> None:
+    lock = tmp_path / "lock"
+    pid_file = tmp_path / "pids"
+    watch = proc.MemoryWatch(1 << 40, poll_s=0.05, available_percent=_plenty)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    with proc.background(_serve(script, pid_file), log=tmp_path / "log", memory_watch=watch, pass_fds=(fd,)):
+        _pids(pid_file)
+        os.close(fd)
+        assert _locked(lock)
+    assert not _locked(lock)
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
+def test_exit_on_signals_turns_the_signal_into_system_exit_and_restores_the_handler(signum: signal.Signals) -> None:
+    before = signal.getsignal(signum)
+    ran: list[str] = []
+    with pytest.raises(SystemExit) as info, proc.exit_on_signals():
+        try:
+            os.kill(os.getpid(), signum)
+            pytest.fail("the signal must end the block")
+        finally:
+            ran.append("finally")
+    assert info.value.code == 128 + signum
+    assert ran == ["finally"]
+    assert signal.getsignal(signum) == before
