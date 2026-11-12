@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from ytverbatim.ytdlp.signals import DecryptCounts, LineKind, classify, js_challenge_failed, line_kind
+from ytverbatim.ytdlp.signals import LineKind, classify, js_challenge_failed, line_kind
 from ytverbatim.ytdlp.types import Signal
 
 FIXTURES = Path(__file__).parent / "fixtures" / "ytdlp"
@@ -127,13 +127,6 @@ SECONDARY_ROWS = [
         f"[youtube] {VID}: This video is age-restricted and YouTube is requiring account age-verification; "
         "some formats may be missing",
     ),
-    (Signal.COOKIE_DB_MISSING, 'ERROR: could not find chrome cookies database in "/tmp/example/pin"'),
-    (Signal.KEYCHAIN, "WARNING: find-generic-password failed"),
-    (Signal.KEYCHAIN, "WARNING: exception running find-generic-password: boom"),
-    (Signal.KEYCHAIN, "WARNING: cannot decrypt v10 cookies: no key found"),
-    (Signal.KEYCHAIN, "WARNING: cannot decrypt v11 cookies: no key found"),
-    (Signal.DECRYPT_PARTIAL, "Extracted 940 cookies from chrome (12 could not be decrypted)"),
-    (Signal.COOKIE_LOAD, "ERROR: failed to load cookies"),
     (Signal.SKIP_CLIENT_NO_COOKIES, 'WARNING: [youtube] Skipping client "visionos" since it does not support cookies'),
     (Signal.JS_MISSING, JS_MISSING_WARNING),
     (Signal.N_CHALLENGE, N_CHALLENGE_WARNING),
@@ -178,7 +171,7 @@ def test_members_error_with_n_challenge_warning_is_members_only() -> None:
     found = classify(stderr)
     assert found.primary is Signal.MEMBERS_ONLY
     assert Signal.N_CHALLENGE in found.secondary
-    assert not found.js_challenge_failed
+    assert not js_challenge_failed(found.primary, found.secondary)
 
 
 def test_retriable_text_in_warnings_does_not_become_the_cause() -> None:
@@ -202,12 +195,12 @@ def test_highest_precedence_error_line_wins() -> None:
 def test_no_formats_after_js_failure_is_distinguishable(warning: str) -> None:
     found = classify("\n".join([warning, f"ERROR: [youtube] {VID}: Requested format is not available."]))
     assert found.primary is Signal.NO_FORMATS
-    assert found.js_challenge_failed
     assert js_challenge_failed(found.primary, found.secondary)
 
 
 def test_no_formats_alone_is_not_a_js_failure() -> None:
-    assert not classify(f"ERROR: [youtube] {VID}: No video formats found!").js_challenge_failed
+    found = classify(f"ERROR: [youtube] {VID}: No video formats found!")
+    assert not js_challenge_failed(found.primary, found.secondary)
 
 
 def test_n_challenge_never_becomes_primary() -> None:
@@ -226,12 +219,6 @@ def test_rotated_on_success_lands_in_secondary_with_warning_text() -> None:
     assert found.primary is None
     assert found.secondary == (Signal.ROTATED,)
     assert found.warnings == (ROTATED_WARNING.removeprefix("WARNING: "),)
-
-
-def test_decrypt_partial_counts() -> None:
-    found = classify("Extracting cookies from chrome\nExtracted 940 cookies from chrome (12 could not be decrypted)")
-    assert found.decrypt_partial == DecryptCounts(extracted=940, browser="chrome", failed=12)
-    assert classify("Extracted 940 cookies from chrome").decrypt_partial is None
 
 
 def test_ansi_is_stripped_and_matching_ignores_case() -> None:

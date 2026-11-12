@@ -31,10 +31,6 @@ class Signal(StrEnum):
     PREMIUM = "premium"
     AUTH_COOKIES_FOUND = "auth_cookies_found"
     AGE_VERIFICATION = "age_verification"
-    COOKIE_DB_MISSING = "cookie_db_missing"
-    KEYCHAIN = "keychain"
-    DECRYPT_PARTIAL = "decrypt_partial"
-    COOKIE_LOAD = "cookie_load"
     SKIP_CLIENT_NO_COOKIES = "skip_client_no_cookies"
 
 
