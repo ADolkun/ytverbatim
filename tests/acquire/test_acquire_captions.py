@@ -261,29 +261,32 @@ def test_missing_file_is_reported_as_a_warning(fakes, tmp_path: Path) -> None:
     assert "no json3 or vtt caption file for 'en'" in result.warnings[0]
 
 
-@pytest.mark.parametrize("signal", [Signal.HTTP_429, Signal.PO_TOKEN_SUBS])
-def test_a_rate_limited_subtitle_download_drops_captions_with_a_warning(fakes, tmp_path: Path, signal: Signal) -> None:
+def test_a_rate_limited_subtitle_download_drops_captions_with_a_warning(fakes, tmp_path: Path) -> None:
     captions_dir = tmp_path / "c"
     captions_dir.mkdir()
     (captions_dir / "captions.en.json3").write_text("{}", encoding="utf-8")
-    runner = fakes.runner(fakes.raises(fakes.fail(signal)))
+    runner = fakes.runner(fakes.raises(fakes.fail(Signal.HTTP_429)))
 
     result = captions.fetch_captions(runner, tmp_path / "i.json", captions_dir, make_meta(subtitle_langs=("en",)))
 
     assert result.tracks == ()
     assert len(result.warnings) == 1
-    assert signal.value in result.warnings[0]
+    assert Signal.HTTP_429.value in result.warnings[0]
     assert list(captions_dir.iterdir()) == []
 
 
-def test_a_429_warning_on_a_successful_exit_also_drops_captions(fakes, tmp_path: Path) -> None:
-    runner = fakes.runner(lambda _args, _label: fakes.ok(secondary=(Signal.HTTP_429,)))
-    result = captions.fetch_captions(runner, tmp_path / "i.json", tmp_path / "c", make_meta(subtitle_langs=("en",)))
-    assert result.tracks == ()
-    assert "http_429" in result.warnings[0]
-
-
-def test_other_failures_still_raise(fakes, tmp_path: Path) -> None:
-    runner = fakes.runner(fakes.raises(fakes.fail(Signal.MEMBERS_ONLY)))
+@pytest.mark.parametrize(
+    ("primary", "secondary"),
+    [
+        (Signal.MEMBERS_ONLY, ()),
+        (Signal.RATE_LIMITED, ()),
+        (None, (Signal.HTTP_429,)),
+        (Signal.TRANSIENT, (Signal.HTTP_429,)),
+    ],
+)
+def test_other_failures_still_raise(
+    fakes, tmp_path: Path, primary: Signal | None, secondary: tuple[Signal, ...]
+) -> None:
+    runner = fakes.runner(fakes.raises(fakes.fail(primary, *secondary)))
     with pytest.raises(YtDlpError):
         captions.fetch_captions(runner, tmp_path / "i.json", tmp_path / "c", make_meta(subtitle_langs=("en",)))
