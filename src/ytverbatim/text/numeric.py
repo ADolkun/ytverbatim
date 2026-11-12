@@ -40,6 +40,7 @@ from ytverbatim.errors import LLMOutputError
 from ytverbatim.llm.jsonio import complete_json
 from ytverbatim.llm.protocol import LLMClient, LLMRequest
 from ytverbatim.llm.usage import UsageMeter
+from ytverbatim.text import offsets
 from ytverbatim.text.guards import check_numeric_fix
 from ytverbatim.text.numbers import QToken, quantity_tokens
 
@@ -64,6 +65,7 @@ _MIN_ANCHOR_RATIO = 0.4
 _MIN_ANCHOR_UNITS = 4
 _MAX_OUTPUT_TOKENS = 4096
 _MARK_OPEN, _MARK_CLOSE = "⟦", "⟧"
+NO_LLM_NOTE = "independent readings disagree and no LLM was configured to choose among them; re-verify"
 
 _CJK = re.compile(r"[一-鿿]")
 _PLAIN_UNIT = re.compile(r"[A-Za-z0-9]+(?:'[A-Za-z]+)?|[一-鿿]")
@@ -267,10 +269,12 @@ def verify_numbers(
     *,
     language: str,
     evidence: Evidence,
-    client: LLMClient,
+    client: LLMClient | None,
     checkpoint_dir: Path,
 ) -> NumericResult:
     """Verify every quantity in ``segments`` against ``evidence`` and return the flagged, possibly fixed texts.
+
+    Without a ``client`` nothing is adjudicated: every disputed span keeps the transcript's reading and its flag.
 
     A span heard by the transcript alone is flagged ``numeric_single_source`` only when some alternate source had
     speech in its window yet heard no number there; that is doubt about this one span. When nothing else covered the
@@ -305,14 +309,18 @@ def verify_numbers(
             span.anchored.append(pair.anchored)
     ordered = [span for by_unit in spans for span in by_unit.values()]
     meter = UsageMeter()
-    decisions = _decide(
-        [span for span in ordered if span.status == "disputed"],
-        segments,
-        language=language,
-        client=meter.metered(STAGE, client),
-        checkpoint_dir=checkpoint_dir,
-    )
-    texts, edits, flags, fixed = _apply(segments, ordered, decisions, client_id=client.id)
+    disputed = [span for span in ordered if span.status == "disputed"]
+    if client is None:
+        decisions = {index: _Decision(None, NO_LLM_NOTE) for index in range(len(disputed))}
+    else:
+        decisions = _decide(
+            disputed,
+            segments,
+            language=language,
+            client=meter.metered(STAGE, client),
+            checkpoint_dir=checkpoint_dir,
+        )
+    texts, edits, flags, fixed = _apply(segments, ordered, decisions, client_id=client.id if client else None)
     counts = Counter(span.status for span in ordered)
     stats = NumericStats(
         agreed=counts["agreed"], disputed=counts["disputed"], single_source=counts["single_source"], fixed=fixed
@@ -332,38 +340,9 @@ def remap_flags(flags: Sequence[Flag], edits: Sequence[Edit]) -> tuple[Flag, ...
     """Move one segment's ``flags`` from the text before ``edits`` to the text after them, applied in order.
 
     Numeric fixes change lengths, so flags an earlier stage raised (``entity_corrected`` from correction) must follow.
-    Each edit replaces one contiguous run; a flag that overlaps the run stretches over its replacement.
+    A flag that overlaps a replaced run stretches over its replacement.
     """
-    moved = list(flags)
-    for edit in edits:
-        before, after = edit.before, edit.after
-        prefix = 0
-        while prefix < min(len(before), len(after)) and before[prefix] == after[prefix]:
-            prefix += 1
-        suffix = 0
-        while suffix < min(len(before), len(after)) - prefix and before[-1 - suffix] == after[-1 - suffix]:
-            suffix += 1
-        old_end, new_end = len(before) - suffix, len(after) - suffix
-
-        def shift(
-            offset: int, *, closing: bool, prefix: int = prefix, old_end: int = old_end, new_end: int = new_end
-        ) -> int:
-            if offset <= prefix:
-                return offset
-            if offset >= old_end:
-                return offset + new_end - old_end
-            return new_end if closing else prefix
-
-        moved = [
-            flag.model_copy(
-                update={
-                    "char_start": shift(flag.char_start, closing=False),
-                    "char_end": shift(flag.char_end, closing=True),
-                }
-            )
-            for flag in moved
-        ]
-    return tuple(moved)
+    return offsets.remap_flags(flags, ((edit.before, edit.after) for edit in edits))
 
 
 def second_opinion_request(
@@ -772,7 +751,7 @@ def _apply(
     spans: list[_Span],
     decisions: dict[int, _Decision],
     *,
-    client_id: str,
+    client_id: str | None,
 ) -> tuple[tuple[str, ...], tuple[tuple[Edit, ...], ...], tuple[tuple[Flag, ...], ...], int]:
     texts = [segment.text for segment in segments]
     edits: list[list[Edit]] = [[] for _ in segments]

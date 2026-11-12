@@ -34,9 +34,15 @@ class AsrOptions:
 
 @dataclass(frozen=True)
 class TextOptions:
-    correct: bool = True
-    chapters: Literal["youtube", "none"] = "youtube"
+    # Off until the correction head-to-head shows it helps.
+    correct: bool = False
+    # "auto" is YouTube's chapters; an LLM fallback for videos without them is deferred.
+    chapters: Literal["auto", "youtube", "none"] = "auto"
+    # An ASR hypothesis id that re-decodes the numeric spans as independent evidence, or "off".
     numeric_second_opinion: str = "off"
+    script: Literal["zh-Hans", "keep"] = "zh-Hans"
+    # Verbatim by default: fillers are what was said, and removing them edits the quotable text.
+    fillers: Literal["keep", "remove"] = "keep"
 
 
 @dataclass(frozen=True)

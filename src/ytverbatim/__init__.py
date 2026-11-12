@@ -5,15 +5,21 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ytverbatim.config import Options
     from ytverbatim.contract import ContextDocument
+    from ytverbatim.llm import LLMClient
     from ytverbatim.pipeline import process
 
 __version__ = version("ytverbatim")
 
 # The library surface is imported on first use so `ytverbatim --version` and the lighter commands never pay for
 # yt-dlp, pydantic and the pipeline.
-_LAZY = {"process": "ytverbatim.pipeline", "Options": "ytverbatim.config", "ContextDocument": "ytverbatim.contract"}
+_LAZY = {
+    "process": "ytverbatim.pipeline",
+    "Options": "ytverbatim.config",
+    "ContextDocument": "ytverbatim.contract",
+    "LLMClient": "ytverbatim.llm",
+}
 
-__all__ = ["ContextDocument", "Options", "__version__", "process"]
+__all__ = ["ContextDocument", "LLMClient", "Options", "__version__", "process"]
 
 
 def __getattr__(name: str) -> object:

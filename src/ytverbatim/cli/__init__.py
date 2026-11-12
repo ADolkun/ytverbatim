@@ -12,6 +12,7 @@ LAZY_COMMANDS: Mapping[str, str] = {
     "auth": "ytverbatim.cli.auth:auth",
     "fetch": "ytverbatim.cli.fetch:fetch_command",
     "llm": "ytverbatim.cli.llm:llm",
+    "render": "ytverbatim.cli.render:render_command",
     "run": "ytverbatim.cli.run:run_command",
 }
 

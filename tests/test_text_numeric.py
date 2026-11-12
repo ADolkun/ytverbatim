@@ -114,6 +114,22 @@ def test_readings_that_differ_only_in_surface_form_agree(asr: str, caption: str,
     assert client.requests == []
 
 
+def test_without_an_llm_a_dispute_is_flagged_with_its_readings_and_nothing_changes(tmp_path: Path) -> None:
+    result = verify_numbers(
+        DISPUTED,
+        language="zh",
+        evidence=Evidence(PRIMARY, captions=(DISPUTED_CAPTIONS,)),
+        client=None,
+        checkpoint_dir=tmp_path / "checkpoints",
+    )
+    assert result.texts == (DISPUTED[0].text,) and result.edits == ((),)
+    (flag,) = result.flags[0]
+    assert flag.kind == "numeric_disputed" and flag.readings == DISPUTED_READINGS
+    assert span_text(result, 0, flag) == "十五个百分点" and "no LLM" in flag.note
+    assert result.stats == NumericStats(disputed=1) and result.usage == ()
+    assert not (tmp_path / "checkpoints").exists()
+
+
 def test_dispute_resolved_by_choosing_a_listed_reading(tmp_path: Path) -> None:
     client = FakeClient([verdicts((0, "五十个百分点", "high"))])
     result = run(DISPUTED, Evidence(PRIMARY, captions=(DISPUTED_CAPTIONS,)), client, tmp_path)

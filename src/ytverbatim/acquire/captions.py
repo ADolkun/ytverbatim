@@ -156,7 +156,7 @@ def fetch_captions(
     warnings: list[str] = []
     manual = set(metadata.subtitle_langs)
     for code in codes:
-        track, warning = _load_track(captions_dir, code, CaptionKind.MANUAL if code in manual else CaptionKind.AUTO)
+        track, warning = load_track(captions_dir, code, CaptionKind.MANUAL if code in manual else CaptionKind.AUTO)
         if track is not None:
             tracks.append(track)
         if warning is not None:
@@ -262,7 +262,7 @@ def _dropped(captions_dir: Path) -> CaptionsResult:
     return CaptionsResult((), (warning,))
 
 
-def _load_track(captions_dir: Path, code: str, kind: CaptionKind) -> tuple[CaptionTrack | None, str | None]:
+def load_track(captions_dir: Path, code: str, kind: CaptionKind) -> tuple[CaptionTrack | None, str | None]:
     files = {
         path.suffix.removeprefix(".").lower(): path
         for path in captions_dir.glob(f"{FILE_STEM}.{code}.*")

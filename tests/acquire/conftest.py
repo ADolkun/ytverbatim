@@ -129,6 +129,9 @@ class FakeYtDlp:
     stderr: dict[tuple[str, bool], str] = field(default_factory=dict)
     playlist: list[str] = field(default_factory=list)
     no_captions: set[str] = field(default_factory=set)
+    # Per video: its declared language, and its caption files by track code (an "-orig" code is the auto track).
+    language: dict[str, str] = field(default_factory=dict)
+    tracks: dict[str, dict[str, str]] = field(default_factory=dict)
     calls: list[YtCall] = field(default_factory=list)
 
     def run(self, args: Sequence[str], *, cookies: Path | None, timeout_s: float, label: str) -> YtDlpResult:
@@ -144,7 +147,11 @@ class FakeYtDlp:
             return self._ok(json.dumps(self._info(call.video_id)), secondary, stderr)
         if label == "captions":
             target = args[args.index("-o") + 1].removeprefix("subtitle:").replace("%(ext)s", "")
-            Path(f"{target}en-orig.json3").write_text((FIXTURES / "auto_en_orig.json3").read_text("utf-8"), "utf-8")
+            files = self.tracks.get(Path(target).parent.parent.name)
+            if files is None:
+                files = {"en-orig": (FIXTURES / "auto_en_orig.json3").read_text("utf-8")}
+            for code, content in files.items():
+                Path(f"{target}{code}.json3").write_text(content, "utf-8")
         elif label == "audio":
             Path(args[args.index("-o") + 1].replace("%(ext)s", "webm")).write_bytes(b"fake audio")
         elif label == "expand":
@@ -158,12 +165,19 @@ class FakeYtDlp:
             "channel": "Synthetic channel",
             "channel_id": "UCxxxxxxxxxxxxxxxxxxxxxx",
             "duration": INFO_DURATION,
-            "language": "en",
+            "language": self.language.get(video_id, "en"),
             "availability": self.availability.get(video_id, "public"),
             "chapters": [{"start_time": 0, "end_time": 50, "title": "One"}, {"start_time": 50, "end_time": 100}],
-            "automatic_captions": {} if video_id in self.no_captions else {"en-orig": [], "en": [], "fr": []},
-            "subtitles": {},
+            "automatic_captions": self._auto(video_id),
+            "subtitles": {code: [] for code in self.tracks.get(video_id, {}) if not code.endswith("-orig")},
         }
+
+    def _auto(self, video_id: str) -> dict[str, list[object]]:
+        if video_id in self.no_captions:
+            return {}
+        if video_id in self.tracks:
+            return {code: [] for code in self.tracks[video_id] if code.endswith("-orig")}
+        return {"en-orig": [], "en": [], "fr": []}
 
     @staticmethod
     def _ok(stdout: str, secondary: tuple[Signal, ...], stderr: str) -> YtDlpResult:
