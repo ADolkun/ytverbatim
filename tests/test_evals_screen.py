@@ -6,18 +6,21 @@ from evals_fixture import CHUNKS, ZH, chunk_rows, make_eval, write_pair
 from evals.consensus import Segment, TimedUnit, find_disputes, timed_units
 from evals.metrics import weighted_wilson, wilson_interval
 from evals.screen import (
+    NO_SPEED,
     HypothesisScreen,
     Quality,
+    ScreenResult,
     Share,
-    Speed,
     build_screen,
     collect_spans,
     file_quality,
     format_only,
     recommend,
+    screen_table,
+    speed,
 )
-from evals.store import load_plan, row_units, write_rows
-from ytverbatim.asr.models import ChunkHypothesis
+from evals.store import RunRecord, append_history, load_plan, row_units, write_rows
+from ytverbatim.asr.models import ChunkHypothesis, RunMetrics
 from ytverbatim.contract.models import Word
 
 
@@ -132,8 +135,7 @@ def share(wins: int, decided: int) -> Share:
 def row(name: str, judge: Share | None) -> HypothesisScreen:
     q = {"zh": Quality(), "en": Quality()}
     return HypothesisScreen(hypothesis=name, quality=q, reference_cer={}, reference_cer_raw={}, reference_mer={},
-                            caption_wer=None, speed=Speed(rtf=None, load_s=None, peak_memory_bytes=None,
-                            max_rss_bytes=None), judge=judge, disputes=0)  # fmt: skip
+                            caption_wer=None, speed=NO_SPEED, judge=judge, disputes=0)  # fmt: skip
 
 
 def test_recommendation_flags_overlapping_challengers() -> None:
@@ -157,3 +159,52 @@ def test_weighted_wilson_reduces_to_wilson_with_equal_weights() -> None:
 
 def test_timed_unit_midpoint() -> None:
     assert TimedUnit("a", 1.0, 3.0).midpoint_s == 2.0
+
+
+GB = 1_000_000_000
+
+
+def history_row(*, footprint: int | None, mlx: int | None, rss: int, children: int = 0) -> RunRecord:
+    metrics = RunMetrics(
+        hypothesis="q-base",
+        files=1,
+        chunks_decoded=4,
+        chunks_skipped=0,
+        load_s=1.0,
+        decode_s=2.0,
+        audio_s=10.0,
+        peak_memory_bytes=mlx,
+        max_rss_bytes=rss,
+        peak_footprint_bytes=footprint,
+    )
+    return RunRecord(
+        at="t", files=("f",), file_seconds=10.0, metrics=metrics, children_max_rss_bytes=children, elapsed_s=3.0
+    )
+
+
+def test_speed_reports_each_memory_peak_from_the_rows_that_have_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout, _ = make_eval(tmp_path / "eval", monkeypatch)
+    layout.run_dir("q-base").mkdir(parents=True, exist_ok=True)
+    append_history(layout, "q-base", history_row(footprint=None, mlx=3 * GB, rss=2 * GB))
+    assert speed(layout, "q-base").peak_footprint_bytes is None
+    append_history(layout, "q-base", history_row(footprint=9 * GB, mlx=4 * GB, rss=2 * GB, children=5 * GB))
+    append_history(layout, "q-base", history_row(footprint=7 * GB, mlx=None, rss=1 * GB))
+    result = speed(layout, "q-base")
+    assert (result.peak_footprint_bytes, result.peak_memory_bytes, result.max_rss_bytes) == (9 * GB, 4 * GB, 5 * GB)
+
+
+def test_the_screen_table_labels_and_dashes_missing_memory_peaks() -> None:
+    old = NO_SPEED.model_copy(update={"peak_memory_bytes": 3 * GB, "max_rss_bytes": 2 * GB})
+    new = old.model_copy(update={"peak_footprint_bytes": 9 * GB})
+    rows = tuple(row(name, None).model_copy(update={"speed": s}) for name, s in (("old", old), ("new", new)))
+    screen = ScreenResult(
+        generated="t", hypotheses=rows, spans=0, format_only_spans=0, judge_model=None, judge_prompt_version=None,
+        judge_seed=0, judge_sample=0, judge_answered=0,
+        recommendation=recommend(rows),
+    )  # fmt: skip
+    lines = screen_table(screen).splitlines()
+    assert "peak GB (footprint / MLX / RSS)" in lines[0]
+    assert lines[2].endswith("| — / 3.00 / 2.00 |")
+    assert lines[3].endswith("| 9.00 / 3.00 / 2.00 |")
