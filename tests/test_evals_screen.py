@@ -38,9 +38,9 @@ def dispute_of(a: str, b: str, language: str = "zh"):
 
 
 def test_written_form_only_differences_are_set_aside_but_case_errors_stay() -> None:
-    assert format_only(dispute_of("买一百五十股", "买150股"), "zh")
-    assert not format_only(dispute_of("买NVDA", "买nvda"), "zh")
-    assert not format_only(dispute_of("买一百股", "买两百股"), "zh")
+    assert format_only(dispute_of("买一百五十股", "买150股").distinct, "zh")
+    assert not format_only(dispute_of("买NVDA", "买nvda").distinct, "zh")
+    assert not format_only(dispute_of("买一百股", "买两百股").distinct, "zh")
 
 
 def en_dispute(a: str, b: str):
@@ -50,8 +50,8 @@ def en_dispute(a: str, b: str):
 
 
 def test_english_sentence_capitals_are_written_form_but_acronym_case_is_not() -> None:
-    assert format_only(en_dispute("so They said", "so they said"), "en")
-    assert not format_only(en_dispute("buy NVDA now", "buy nvda now"), "en")
+    assert format_only(en_dispute("so They said", "so they said").distinct, "en")
+    assert not format_only(en_dispute("buy NVDA now", "buy nvda now").distinct, "en")
     assert not en_dispute("They said it", "We said it").touches_latin
     assert en_dispute("we met Powell today", "we met Paul today").touches_latin
 

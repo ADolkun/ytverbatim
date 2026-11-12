@@ -28,7 +28,7 @@ from evals import disk
 from evals.consensus import TimedUnit
 from evals.manifest import Manifest, Video
 from evals.normalize import Language, to_units
-from evals.screen import DISPUTE_VIEW, Span, window_spans
+from evals.screen import DISPUTE_VIEW, Span, format_only, window_spans
 from evals.session import SessionKey, ShownSpan, session_from_spans
 from evals.store import (
     Layout,
@@ -57,7 +57,7 @@ from ytverbatim.errors import (
     ProcMemoryExceeded,
 )
 from ytverbatim.llm import OpenAICompatClient, openai_compat
-from ytverbatim.llm.protocol import LLMClient, LLMRequest, LLMResponse, Readiness
+from ytverbatim.llm.protocol import LLMClient, LLMRequest, LLMResponse, Readiness, Usage
 from ytverbatim.stages import Stretch
 from ytverbatim.store import digest
 from ytverbatim.text import clean
@@ -71,6 +71,8 @@ CALLS_FILE = "calls.jsonl"
 FAILURE_FILE = "failure.json"
 SERVER_LOG = "server.log"
 SERVER_RECORD = "server.json"
+THINK_TAG = "<think>"
+THINK_ERROR = f"the reply holds a {THINK_TAG} block; thinking was not switched off"
 
 # Reading names inside the eval's own disputes; a span never reaches the judge or the listener under these.
 BASE = "base"
@@ -192,6 +194,8 @@ class CallRecord(_Frozen):
     elapsed_s: float
     input_tokens: int | None
     output_tokens: int | None
+    # Set when the call raised or its reply was refused; the tokens of a raised call are unknown.
+    error: str | None = None
 
 
 class ServerRecord(_Frozen):
@@ -229,7 +233,7 @@ def load_failure(store: Layout, candidate: Candidate) -> Failure | None:
 
 def failure_note(candidate: Candidate, where: str) -> str:
     return (
-        f"{candidate.id} is ineligible: a correction call returned invalid JSON twice. {FAILURE_FILE} stays on "
+        f"{candidate.id} is ineligible: a correction call raised LLMOutputError (see {FAILURE_FILE}). It stays on "
         f"purpose, because production would have failed on it too. To try again, move {where} aside and rerun "
         f"`python -m evals.run_correction correct --candidate {candidate.id}` from scratch"
     )
@@ -374,31 +378,47 @@ def load_base(store: Layout, file: str) -> BaseFile:
 
 
 class RecordingClient:
-    """Reports ``id`` instead of the wrapped client's and appends every reply's time and tokens to ``calls.jsonl``."""
+    """Reports ``id`` instead of the wrapped client's and appends every call, failed or not, to ``calls.jsonl``.
 
-    def __init__(self, inner: LLMClient, *, client_id: str, calls: Path, file: str) -> None:
+    With ``reject_think`` a reply that holds a ``<think>`` tag raises `LLMOutputError`: a local model whose thinking
+    was not switched off could otherwise have a draft inside the block parsed as the answer.
+    """
+
+    def __init__(self, inner: LLMClient, *, client_id: str, calls: Path, file: str, reject_think: bool = False) -> None:
         self._inner = inner
         self._id = client_id
         self._calls = calls
         self._file = file
+        self._reject_think = reject_think
 
     @property
     def id(self) -> str:
         return self._id
 
     def complete(self, request: LLMRequest) -> LLMResponse:
-        response = self._inner.complete(request)
-        usage = response.usage
+        started = time.monotonic()
+        try:
+            response = self._inner.complete(request)
+        except Exception as exc:
+            self._record(time.monotonic() - started, None, f"{type(exc).__name__}: {exc}"[:300])
+            raise
+        error = THINK_ERROR if self._reject_think and THINK_TAG in response.text else None
+        self._record(response.elapsed_s, response.usage, error)
+        if error is not None:
+            raise LLMOutputError(error)
+        return response
+
+    def _record(self, elapsed_s: float, usage: Usage | None, error: str | None) -> None:
         record = CallRecord(
             file=self._file,
-            elapsed_s=round(response.elapsed_s, 3),
+            elapsed_s=round(elapsed_s, 3),
             input_tokens=None if usage is None else usage.input_tokens,
             output_tokens=None if usage is None else usage.output_tokens,
+            error=error,
         )
         self._calls.parent.mkdir(parents=True, exist_ok=True)
         with self._calls.open("a", encoding="utf-8") as handle:
             handle.write(record.model_dump_json() + "\n")
-        return response
 
 
 @dataclass(frozen=True)
@@ -448,6 +468,7 @@ def run_candidate(
             client_id=candidate.client_id,
             calls=run_dir(store, candidate) / CALLS_FILE,
             file=video.id,
+            reject_think=candidate.local,
         )
         try:
             result = correct_segments(
@@ -670,6 +691,8 @@ class _Timing:
     language: Language
     base: BaseFile
     words: list[tuple[Word, ...]]
+    # Units of untimed stretches the donor had no word for; their clips are placed only approximately.
+    unaligned: int = 0
 
     def units(self, name: str, index: int, text: str) -> list[TimedUnit]:
         """Units of ``text`` as one hypothesis's reading of base stretch ``index``, timed by that stretch's words."""
@@ -717,20 +740,23 @@ def _timing(store: Layout, video: Video, base: BaseFile) -> _Timing:
             borrowed[i].append(Word(text=unit, start=timed[position].start_s, end=timed[position].end_s))
     for i, found in borrowed.items():
         words[i] = tuple(found)
-    return _Timing(video, plan, language, base, words)
+    unaligned = sum(1 for position, (i, _) in enumerate(units) if i in borrowed and position not in timed)
+    return _Timing(video, plan, language, base, words, unaligned)
 
 
-def edit_spans(
+def edit_disputes(
     store: Layout, manifest: Manifest, candidates: Sequence[Candidate], files: Sequence[str] = ()
-) -> list[Span]:
-    """Disputes between the base and every candidate's text, with the base as pivot.
+) -> tuple[list[Span], int]:
+    """Return the disputes between the base and every candidate's text, and how many units had no donor time.
 
-    Only stretches where some candidate's text differs are aligned, so an unchanged stretch gives none. Every span
-    carries a reading for `BASE` and for each candidate id, and is numbered ``<file>#<stretch>#<n>``.
+    The base is the pivot. Only stretches where some candidate's text differs are aligned, so an unchanged stretch
+    gives none. Every span carries a reading for `BASE` and for each candidate id, and is numbered
+    ``<file>#<stretch>#<n>``.
     """
     if not candidates:
         raise ConfigError("no candidate to compare with the base")
     spans: list[Span] = []
+    unaligned = 0
     for video in videos(manifest, files):
         base = load_base(store, video.id)
         runs = {c.id: require_run(store, c, video.id) for c in candidates}
@@ -738,16 +764,33 @@ def edit_spans(
         if not changed:
             continue
         timing = _timing(store, video, base)
+        unaligned += timing.unaligned
         for i in changed:
             units = {BASE: timing.units(BASE, i, base.stretches[i].text)}
             units.update({cid: timing.units(cid, i, run.texts[i]) for cid, run in runs.items()})
             spans += window_spans(video, timing.language, i, units, pivot=BASE)
-    return spans
+    return spans, unaligned
+
+
+def edit_spans(
+    store: Layout, manifest: Manifest, candidates: Sequence[Candidate], files: Sequence[str] = ()
+) -> list[Span]:
+    return edit_disputes(store, manifest, candidates, files)[0]
 
 
 def audible_edits(spans: Sequence[Span], candidate: str) -> list[Span]:
-    """Return the disputes where ``candidate`` changed the base's words in a way a listener can hear."""
-    return [s for s in spans if not s.format_only and s.reading(candidate).text != s.reading(BASE).text]
+    """Return the disputes where ``candidate`` changed the base's words in a way a listener can hear.
+
+    Written form is judged on the candidate's own pair of readings: another candidate's different spelling in the
+    same dispute does not make ``fed`` to ``Fed`` audible.
+    """
+    return [
+        s
+        for s in spans
+        if not s.format_only
+        and s.reading(candidate).text != s.reading(BASE).text
+        and not format_only((s.reading(BASE).text, s.reading(candidate).text), s.language)
+    ]
 
 
 def rejection_spans(
@@ -828,4 +871,4 @@ def session_for(
     if target.id not in {c.id for c in candidates}:
         raise ConfigError(f"{target.id} is not among the candidates whose edits were compared")
     spans = audible_edits(edit_spans(store, manifest, candidates), target.id)
-    return session_from_spans(spans, manifest, BASE, target.id, n=n, seed=seed)
+    return session_from_spans(spans, manifest, BASE, target.id, n=n, seed=seed, candidates=[c.id for c in candidates])

@@ -3,6 +3,7 @@ import pytest
 from evals.correction import BaseFile, CandidateFile, audible_edits
 from evals.correction_metrics import (
     DELTA_UPPER_BOUND,
+    MIN_DECIDED,
     OVER_CORRECTION_MAX,
     Answer,
     CandidateScreen,
@@ -367,10 +368,12 @@ def human(
     undecided: int = 0,
     candidate: str = "c1",
     spans: int = 80,
+    answered: int = MIN_DECIDED,
 ) -> HumanEstimates:
     value, low, high = delta
     estimate = human_estimate([Answer("a", "zh", "other", 1.0, "after")], edits=10, hours=1.0, resamples=10).model_copy(
         update={
+            "answered": answered,
             "over_correction": Estimate(value=over, low=0.0, high=0.3),
             "delta_per_hour": Estimate(value=value, low=low, high=high),
         }
@@ -393,11 +396,22 @@ def test_decide_all_pass_is_on() -> None:
     assert all(c.passed for c in decision.checks)
     assert {c.name for c in decision.checks} >= {
         "every span decided",
+        "enough labels",
         "over-correction",
         "errors per hour",
         "number preservation",
         "JSON after the retry",
     }
+
+
+def test_decide_needs_enough_decided_spans() -> None:
+    assert MIN_DECIDED == 30
+    few = decide(report(human=human(answered=MIN_DECIDED - 1)))
+    assert not few.default_on
+    assert [c.name for c in few.checks if not c.passed] == ["enough labels"]
+    assert "too few labels" in next(c.detail for c in few.checks if c.name == "enough labels")
+    assert decide(report(human=human(answered=MIN_DECIDED))).default_on
+    assert not decide(report(human=human(answered=1))).default_on
 
 
 def test_decide_ci_including_zero_is_off() -> None:

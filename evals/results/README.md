@@ -51,13 +51,15 @@ uv run python -m evals.run_correction base --hyp w-prod             # normalize 
 uv run python -m evals.run_correction correct --candidate c-sonnet  # the production correction, per candidate
 uv run python -m evals.run_correction correct --candidate c-haiku
 uv run python -m evals.run_correction correct --candidate l-qwen35-9b
-uv run python -m evals.run_correction cleanup --candidate l-qwen35-9b   # local weights, once its run is complete
 uv run python -m evals.run_correction screen                        # edit disputes, blind judge sample, the pick
 uv run python -m evals.run_correction session                       # the picked candidate's edits, blind A/B
 uv run python -m evals.run_correction listen                        # the owner's blind terminal A/B
 uv run python -m evals.run_correction report
 uv run python -m evals.run_correction decide                        # prints the decision JSON, writes the file
+uv run python -m evals.run_correction cleanup --candidate l-qwen35-9b   # last: deletes the local weights
 ```
+
+`cleanup` comes last and is skipped when the local model wins and the owner keeps its weights.
 
 Correction changes the text only where it edits, so a candidate's net change in errors is the sum over its edits of
 +1 (a fix), -1 (a break) and 0. The blind LLM judge labels a uniform sample of those edits to rank the candidates and
@@ -65,10 +67,21 @@ pick one to test (`screen --judge-n`, `--max-calls` and the judge cache resume a
 on `screen.json` and refuses while the judge sample is incomplete. The owner's labels of that one candidate, weighted
 back by stratum, decide.
 
-Correction ships default-on only if every session span is decided, over-correction is at most 15%, the upper 95%
+Correction ships default-on only if every session span is decided, at least 30 spans are decided (with fewer, the
+interval is meaningless), over-correction is at most 15%, the upper 95%
 bound of the change in errors per hour is below 0, no number changed, and no correction call returned invalid JSON
 after its retry (the first-try validity is reported, not gated). Otherwise it stays default-off. See
 `evals/correction_metrics.py` for the exact rule.
 
-A candidate whose call failed twice keeps its `failure.json` and stays ineligible, as production would have failed on
-it too. To try it again, move `correction/runs/<candidate>` aside and rerun `correct` from scratch.
+A candidate with a correction call that raised `LLMOutputError` (invalid JSON after the retry, a cut-off or empty
+reply, or a `<think>` block from the local model) keeps its `failure.json` and stays ineligible, as production would
+have failed on it too; `correct` refuses to run it again. To try it again, move `correction/runs/<candidate>` aside
+and rerun `correct` from scratch.
+
+## Limits
+
+- **Punctuation parity:** production punctuates with the same `[llm]` model that corrects. Here the base is punctuated
+  once by `claude-sonnet-5-5` for every candidate, a deliberate choice so all candidates correct identical text. A
+  local winner's own punctuation is therefore not measured.
+- The intervals cover edit sampling and labelling, not variation between videos or channels; recall (errors
+  correction missed) is not measured.

@@ -14,6 +14,7 @@ from evals.correction import (
     audible_edits,
     build_base,
     complete_candidates,
+    edit_disputes,
     edit_spans,
     load_base,
     rejection_spans,
@@ -170,6 +171,25 @@ def test_audible_edits_keep_only_the_candidates_own_real_changes(
     assert {s.id for s in audible_edits(spans, "c-haiku")} == {f"{ZH}#0#0", f"{ZH}#2#0", f"{EN}#2#0"}
 
 
+def test_a_written_form_change_by_the_tested_candidate_is_not_audible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout, manifest = world(tmp_path / "eval", monkeypatch)
+    write_run(layout, SONNET, ZH, {})
+    write_run(layout, HAIKU, ZH, {})
+    # The base reads "cat"; sonnet only capitalizes it, haiku really changes it.
+    write_run(layout, SONNET, EN, {2: "The Cat sat down."})
+    write_run(layout, HAIKU, EN, {2: "The cap sat down."})
+    spans = edit_spans(layout, manifest, [SONNET, HAIKU])
+    (dispute,) = spans
+    assert not dispute.format_only
+    assert {dispute.reading(h).text for h in (BASE, "c-sonnet", "c-haiku")} == {"cat", "Cat", "cap"}
+    assert audible_edits(spans, "c-sonnet") == []
+    assert [s.id for s in audible_edits(spans, "c-haiku")] == [dispute.id]
+    with pytest.raises(ConfigError, match="no audible disputes between base and c-sonnet"):
+        session_for(layout, manifest, [SONNET, HAIKU], SONNET)
+
+
 def test_a_candidate_without_a_run_is_refused_with_its_fix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     layout, manifest = world(tmp_path / "eval", monkeypatch)
     with pytest.raises(ConfigError, match=r"c-sonnet has no output for zhfile00001.*correct --candidate c-sonnet"):
@@ -220,6 +240,28 @@ def test_an_untimed_hypothesis_borrows_the_donors_word_times(tmp_path: Path, mon
     assert span.reading(BASE).text == "适应"
     assert (span.reading(BASE).start, span.reading(BASE).end) == pytest.approx((0.8, 1.0))
     assert (span.reading("c-sonnet").start, span.reading("c-sonnet").end) == pytest.approx((0.8, 1.0))
+
+
+def test_units_the_donor_cannot_place_are_counted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    layout, manifest = untimed_world(tmp_path / "eval", monkeypatch, donor=True)
+    write_run(layout, SONNET, ZH, {0: "我们看这个公司的市盈率。"})
+    write_run(layout, SONNET, EN, {})
+    assert edit_disputes(layout, manifest, [SONNET])[1] == 0
+    # A donor that heard only the first stretch leaves the rest of the file without word times.
+    row = ChunkHypothesis(
+        hypothesis=HYPOTHESIS,
+        file=ZH,
+        chunk=0,
+        start=0.0,
+        end=20.0,
+        text=ZH_TEXTS[0].rstrip("。"),
+        words=tuple(Word(text=ch, start=i * 0.1, end=(i + 1) * 0.1) for i, ch in enumerate(ZH_TEXTS[0].rstrip("。"))),
+    )
+    write_rows(layout, HYPOTHESIS, [row])
+    spans, unaligned = edit_disputes(layout, manifest, [SONNET])
+    assert [s.id for s in spans] == [f"{ZH}#0#0"]
+    # 然后卖出了一百股, 看, NVDA, 的财报 and 大家好: every unit of the three stretches after the first.
+    assert unaligned == 16
 
 
 def test_an_untimed_hypothesis_without_the_donor_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

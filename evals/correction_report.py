@@ -14,13 +14,14 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict
 
 from evals.correction import (
+    BASE,
     CANDIDATES,
     PROPOSED,
     Candidate,
     RejectionSpan,
     audible_edits,
     complete_candidates,
-    edit_spans,
+    edit_disputes,
     failure_note,
     first_try_validity,
     load_base,
@@ -32,6 +33,9 @@ from evals.correction import (
     run_dir,
 )
 from evals.correction_metrics import (
+    DELTA_UPPER_BOUND,
+    MIN_DECIDED,
+    OVER_CORRECTION_MAX,
     Agreement,
     CandidateScreen,
     CorrectionDecision,
@@ -54,7 +58,7 @@ from evals.metrics import ErrorCounts, cer, mer
 from evals.normalize import Language, View
 from evals.report import FileRow, file_rows, files_table
 from evals.screen import LANGUAGES, SECONDS_PER_HOUR, Span, judge_items
-from evals.session import KEY_FILE, load_key
+from evals.session import KEY_FILE, SessionKey, cell_name, load_key, stratum
 from evals.store import REFERENCE, Layout, row_text, rows_by_file, videos
 from ytverbatim.errors import ConfigError
 
@@ -82,6 +86,8 @@ class JudgeRun(_Frozen):
     rejection_answered: int
     spans: int
     format_only_spans: int
+    # Units that had no donor word time, so the clips of edits near them are placed only approximately.
+    unaligned_units: int
 
     @property
     def complete(self) -> bool:
@@ -149,12 +155,15 @@ class CostRow(_Frozen):
 class Report(_Frozen):
     generated: str
     files: tuple[FileRow, ...]
+    punctuation_llm: str
     judge: JudgeRun
     correction: CorrectionReport
     agreement: Agreement | None
     guards: tuple[GuardRate, ...]
     reference: tuple[ReferenceScore, ...]
     cost: tuple[CostRow, ...]
+    # Cells (file label/stratum) with audible edits but no sampled span: the estimate leaves their edits out.
+    unsampled_cells: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -163,6 +172,8 @@ class Gathered:
     # Candidates with a run directory but no finished run; listed as ineligible and left out of the disputes.
     unfinished: tuple[Candidate, ...]
     seed: int
+    # Units of stretches without word times that the timing donor could not place; see `JudgeRun.unaligned_units`.
+    unaligned: int
     spans: list[Span]
     items: list[JudgeItem]
     rejections: list[RejectionSpan]
@@ -217,12 +228,13 @@ def gather(
     seed: int,
     sample: int,
 ) -> Gathered:
-    spans = edit_spans(store, manifest, screened)
+    spans, unaligned = edit_disputes(store, manifest, screened)
     rejections = rejection_spans(store, manifest, screened, seed=seed)
     return Gathered(
         screened=tuple(screened),
         unfinished=tuple(unfinished),
         seed=seed,
+        unaligned=unaligned,
         spans=spans,
         items=judge_items(spans, sample, seed),
         rejections=rejections,
@@ -258,6 +270,7 @@ def assess(store: Layout, manifest: Manifest, gathered: Gathered) -> Assessment:
         rejection_answered=sum(i.span_id in verdicts for i in gathered.rejection_items),
         spans=len(gathered.spans),
         format_only_spans=sum(s.format_only for s in gathered.spans),
+        unaligned_units=gathered.unaligned,
     )
     return Assessment(verdicts, judge, tuple(screens), guard_rates(gathered.rejections, verdicts))
 
@@ -423,38 +436,78 @@ def build_report(store: Layout, manifest: Manifest, screen: CorrectionScreen, se
         )
     directory = store.session_dir(session)
     human = agreement = None
+    unsampled: tuple[str, ...] = ()
     if (directory / KEY_FILE).exists():
         key, decisions = load_key(directory), read_decisions(directory)
-        by_id = {s.id: s for s in gathered.spans}
-        edits = audible_edits(gathered.spans, key.challenger)
-        hours = _hours(manifest)
+        edits = _session_edits(session, key, screen.screened, gathered.spans)
         human = human_estimates(
             key,
             decisions,
             edits={lang: sum(s.language == lang for s in edits) for lang in LANGUAGES},
-            hours=hours,
+            hours=_hours(manifest),
         )
+        by_id = {s.id: s for s in gathered.spans}
         labels: dict[str, int] = {}
         for entry in key.entries:
-            span, verdict = by_id.get(entry.source), assessment.verdicts.get(entry.source)
-            if span is None:
-                raise ConfigError(
-                    f"session {session!r} holds spans the screened candidates no longer have; rebuild it with `session`"
-                )
-            label = None if verdict is None else judge_label(span, verdict, key.challenger)
+            verdict = assessment.verdicts.get(entry.source)
+            label = None if verdict is None else judge_label(by_id[entry.source], verdict, key.challenger)
             if label is not None:
                 labels[entry.id] = label
         agreement = judge_agreement(labels, session_answers(key, decisions)[0])
+        names = manifest.labels()
+        sampled = {cell_name(e.file, e.stratum) for e in key.entries}
+        unsampled = tuple(
+            f"{names[cell.rsplit('|', 1)[0]]}/{cell.rsplit('|', 1)[1]}"
+            for cell in key.population
+            if cell not in sampled
+        )
     return Report(
         generated=generated,
         files=file_rows(store, manifest),
+        punctuation_llm=load_base(store, videos(manifest)[0].id).punctuation_llm,
         judge=assessment.judge,
         correction=CorrectionReport(candidates=assessment.candidates, human=human),
         agreement=agreement,
         guards=assessment.guards,
         reference=reference_scores(store, manifest, gathered, assessment.verdicts),
         cost=cost_rows(store, manifest, gathered),
+        unsampled_cells=unsampled,
     )
+
+
+def _session_edits(name: str, key: SessionKey, screened: Sequence[str], spans: Sequence[Span]) -> list[Span]:
+    """Return the tested candidate's audible edits, after checking that ``key`` was drawn from exactly them.
+
+    Span ids are positional and the disputes, strata and counts all depend on the screened set, so a session built
+    before `screen` was rerun with another set would be read against the wrong disputes.
+    """
+    rebuild = (
+        "build a new session with `session --name NEW`, hear it with `listen --name NEW`, then `report --name NEW`"
+    )
+    if key.control != BASE:
+        raise ConfigError(
+            f"session {name!r} is not a correction session (its control is {key.control!r}); check --name"
+        )
+    if key.challenger not in screened:
+        raise ConfigError(f"session {name!r} tests {key.challenger!r}, which `screen` did not compare; {rebuild}")
+    if key.candidates != tuple(sorted(screened)):
+        drawn = ", ".join(key.candidates) or "an unrecorded set"
+        raise ConfigError(
+            f"session {name!r} was drawn from the candidates {drawn}, but `screen` compared "
+            f"{', '.join(sorted(screened))}; its span ids no longer match. {rebuild}"
+        )
+    edits = audible_edits(spans, key.challenger)
+    if sum(key.population.values()) != len(edits):
+        raise ConfigError(
+            f"session {name!r} was drawn from {sum(key.population.values())} audible edits of {key.challenger}, but "
+            f"the stored runs now have {len(edits)}; the runs changed after the session. {rebuild}"
+        )
+    by_id = {s.id: s for s in edits}
+    for entry in key.entries:
+        span = by_id.get(entry.source)
+        if span is None or (span.file, span.language, stratum(span)) != (entry.file, entry.language, entry.stratum):
+            raise ConfigError(f"session {name!r} span {entry.id} no longer matches the stored disputes; {rebuild}")
+    return edits
 
 
 def _estimate(value: Estimate | None, spec: str = ".3f") -> str:
@@ -496,6 +549,15 @@ def pick_lines(candidates: Sequence[CandidateScreen], chosen: Pick) -> list[str]
     return lines
 
 
+def _timing_note(judge: JudgeRun) -> list[str]:
+    if not judge.unaligned_units:
+        return []
+    return [
+        f"{judge.unaligned_units} units of stretches without word times had no timing donor word, so the clips of "
+        "edits near them are placed only approximately and may miss the edit."
+    ]
+
+
 def screen_text(screen: CorrectionScreen) -> str:
     """Summarize a screening for the console."""
     j = screen.judge
@@ -505,6 +567,7 @@ def screen_text(screen: CorrectionScreen) -> str:
         *candidate_table(screen.candidates),
         *pick_lines(screen.candidates, screen.pick),
     ]
+    lines += _timing_note(j)
     if not j.complete:
         lines.append(
             f"The judge sample is incomplete ({j.sample - j.answered} spans left); rerun `screen` to resume, "
@@ -619,8 +682,29 @@ def render_markdown(report: Report) -> str:
             for c in report.cost
         ),
         "",
+        "## Limits",
+        "",
+        *_limits(report),
+        "",
     ]
     return "\n".join(lines)
+
+
+def _limits(report: Report) -> list[str]:
+    lines = [
+        f"- Punctuation parity: production punctuates with the same `[llm]` model that corrects, but here every "
+        f"candidate corrects a base punctuated once by {report.punctuation_llm}, so a local winner's own "
+        "punctuation is not measured.",
+        "- The intervals cover edit sampling and labelling, not variation between videos; the set is a few videos "
+        "from a few channels. Recall (errors correction missed) is not measured.",
+        *(f"- {line}" for line in _timing_note(report.judge)),
+    ]
+    if report.unsampled_cells:
+        lines.append(
+            f"- No span was sampled from {', '.join(report.unsampled_cells)}, which hold audible edits; the owner's "
+            "estimate leaves those edits out."
+        )
+    return lines
 
 
 def render_decision(decision: CorrectionDecision) -> str:
@@ -635,9 +719,10 @@ def render_decision(decision: CorrectionDecision) -> str:
         "",
         "Rule: the judge picks the best eligible candidate by net errors removed per hour (a local one whose interval "
         "overlaps it is preferred); only that candidate's edits go to the owner. It ships default-on only if every "
-        "session span is decided, over-correction is at most 15%, the upper 95% bound of the change in errors per "
-        "hour is below 0, no number changed and no correction call returned invalid JSON after its retry. "
-        "Otherwise correction stays default-off.",
+        f"session span is decided and at least {MIN_DECIDED} are, over-correction is at most "
+        f"{OVER_CORRECTION_MAX:.0%}, the upper 95% bound of the change in errors per hour is below "
+        f"{DELTA_UPPER_BOUND:g}, no number changed and no correction call raised `LLMOutputError`. Otherwise "
+        "correction stays default-off.",
         "",
     ]
     return "\n".join(lines)
