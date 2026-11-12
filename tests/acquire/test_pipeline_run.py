@@ -245,6 +245,17 @@ def test_a_bot_check_stops_the_batch(session_kit, worker: FakeWorker) -> None:
     assert worker.calls == []
 
 
+def test_a_stop_seen_on_a_successful_call_finishes_that_video_and_stops_the_rest(
+    session_kit, worker: FakeWorker
+) -> None:
+    yt = session_kit.yt()
+    yt.secondary[("metadata", False)] = (Signal.BOT_CHECK,)
+    report, _, _ = run(session_kit, yt, [PUBLIC, "pubVideo002"])
+    assert report.exit_code == 3 and report.stopped is not None and report.stopped.signal is Signal.BOT_CHECK
+    assert [v.status for v in report.videos] == [session.VideoStatus.OK, session.VideoStatus.NOT_ATTEMPTED]
+    assert (session_kit.out / PUBLIC / "context.md").is_file()
+
+
 def test_process_reraises_a_batch_stop(session_kit, worker: FakeWorker) -> None:
     yt = session_kit.yt()
     yt.failures[("metadata", False)] = [session_kit.fail(Signal.BOT_CHECK)]

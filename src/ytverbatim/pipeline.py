@@ -32,7 +32,6 @@ from ytverbatim.acquire.session import (
     PlannedVideo,
     VideoOutcome,
     VideoStatus,
-    _GuardedRunner,
     check_cooldown,
     plan_videos,
     sleep_args,
@@ -42,6 +41,7 @@ from ytverbatim.asr import chunks, registry
 from ytverbatim.asr import runner as asr_runner
 from ytverbatim.asr.models import ChunkHypothesis, FileJob, WorkerRequest
 from ytverbatim.asr.protocol import EngineDef
+from ytverbatim.auth.cooldown import guarded
 from ytverbatim.auth.source import CookieSource, resolve_source
 from ytverbatim.auth.state import AuthState
 from ytverbatim.contract import (
@@ -187,9 +187,7 @@ def process_many(  # noqa: PLR0913
         max_videos=options.ytdlp.max_videos_per_run,
         ignore_cooldown=ignore_cooldown,
     )
-    videos, capped = plan_videos(
-        _GuardedRunner(runner_factory(()), clock), targets, source=source, options=fetch_options
-    )
+    videos, capped = plan_videos(guarded(runner_factory(()), clock), targets, source=source, options=fetch_options)
     session = FetchSession(
         runner_factory(sleep_args(len(videos))), source=source, out=out, options=fetch_options, sleep=sleep, clock=clock
     )
@@ -215,6 +213,9 @@ def process_many(  # noqa: PLR0913
             outcomes.append(result.outcome)
             if on_video is not None:
                 on_video(result)
+            # A stop seen on a successful call lets that video finish but no later one start.
+            if stopped is None:
+                stopped = session.pending_stop()
     finally:
         report = BatchReport(tuple(outcomes), stopped, capped, started, clock())
         out.mkdir(parents=True, exist_ok=True)
