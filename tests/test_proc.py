@@ -3,6 +3,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -130,15 +131,22 @@ def _plenty() -> int:
     return 50
 
 
-def _group_gone(pgid: int) -> bool:
+def _gone(probe: Callable[[], None]) -> bool:
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         try:
-            os.killpg(pgid, 0)
+            probe()
         except ProcessLookupError:
+            return True
+        except PermissionError:
+            # Only zombies are left: a killed orphan stays in the table, unsignalable, until launchd reaps it.
             return True
         time.sleep(0.05)
     return False
+
+
+def _group_gone(pgid: int) -> bool:
+    return _gone(lambda: os.killpg(pgid, 0))
 
 
 def test_memory_watch_kills_a_hog_and_its_whole_group(script: Path, tmp_path: Path) -> None:
@@ -155,8 +163,7 @@ def test_memory_watch_kills_a_hog_and_its_whole_group(script: Path, tmp_path: Pa
     assert "over the 0.59 GiB cap" in str(error)
     hog, helper = map(int, pid_file.read_text(encoding="utf-8").split())
     assert _group_gone(hog)
-    with pytest.raises(ProcessLookupError):
-        os.kill(helper, 0)
+    assert _gone(lambda: os.kill(helper, 0))
 
 
 def test_memory_watch_stops_the_child_when_the_machine_runs_short(script: Path, tmp_path: Path) -> None:
