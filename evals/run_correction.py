@@ -139,6 +139,8 @@ def correct(candidate_id: str, files: str | None, hf_cache: Path | None) -> None
     """Run the production correction over the base with one candidate (resumes per batch)."""
     store, manifest = layout(), load_manifest()
     candidate = CANDIDATES[candidate_id]
+    if load_failure(store, candidate) is not None:
+        raise ConfigError(failure_note(candidate, str(run_dir(store, candidate))))
     pending = pending_files(store, manifest, candidate, _files(files))
     if not pending:
         click.echo(f"{candidate_id}: complete for all selected files")
@@ -146,8 +148,6 @@ def correct(candidate_id: str, files: str | None, hf_cache: Path | None) -> None
     with open_client(store, candidate, hf_cache or default_hf_cache()) as client:
         outcome = run_candidate(store, manifest, candidate, pending, client)
     click.echo(_summary(candidate, outcome.corrected))
-    if load_failure(store, candidate) is not None:
-        click.echo(f"note: {failure_note(candidate, str(run_dir(store, candidate)))}")
 
 
 def _summary(candidate: Candidate, corrected: tuple[CandidateFile, ...]) -> str:

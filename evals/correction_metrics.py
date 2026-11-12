@@ -5,9 +5,10 @@ Correction changes the text only where it edits, so a candidate's net change in 
 to test; the owner's labels of that candidate's edits, reweighted by stratum, decide. No candidate ships on judge
 evidence alone.
 
-Default-on needs all of: every session span decided; over-correction at most `OVER_CORRECTION_MAX`; the 95% upper
-bound of the change in errors per hour below `DELTA_UPPER_BOUND`; no number violation; and no correction call that
-raised `LLMOutputError` after its retry. The first-try JSON validity is reported and not gated.
+Default-on needs all of: every session span decided, and at least `MIN_DECIDED` of them; over-correction at most
+`OVER_CORRECTION_MAX`; the 95% upper bound of the change in errors per hour below `DELTA_UPPER_BOUND`; no number
+violation; and no correction call that raised `LLMOutputError` after its retry. The first-try JSON validity is
+reported and not gated.
 """
 
 import random
@@ -31,6 +32,9 @@ from ytverbatim.errors import ConfigError
 from ytverbatim.text.numbers import quantity_tokens
 
 OVER_CORRECTION_MAX = 0.15
+# With few labels the percentile bootstrap collapses (no "before" answer means it almost never reaches 0), so an
+# interval bound below 0 would be meaningless; this many decided spans are needed before the interval counts.
+MIN_DECIDED = 30
 MAX_NUMBER_VIOLATIONS = 0
 # A candidate must remove errors on the judge's reading: its net per hour must exceed this.
 JUDGE_NET_FLOOR_PER_HOUR = 0.0
@@ -449,6 +453,15 @@ def decide(report: CorrectionReport) -> CorrectionDecision:
         return _decision(chosen.candidate, checks)
     over, delta = estimate.over_correction.value, estimate.delta_per_hour
     checks += [
+        Check(
+            name="enough labels",
+            passed=estimate.answered >= MIN_DECIDED,
+            detail=(
+                f"{estimate.answered} decided spans (needs >= {MIN_DECIDED})"
+                if estimate.answered >= MIN_DECIDED
+                else f"too few labels: {estimate.answered} decided spans (needs >= {MIN_DECIDED})"
+            ),
+        ),
         Check(
             name="over-correction",
             passed=over <= OVER_CORRECTION_MAX,

@@ -249,6 +249,44 @@ def test_a_double_json_failure_is_recorded_and_raised(tmp_path: Path, monkeypatc
     assert pending_files(layout, manifest, SONNET, []) == [ZH, EN]
 
 
+class Thinking(FakeLLM):
+    def _reply(self, request: LLMRequest) -> str:
+        return '<think>\n{"fixed": []}\n</think>\n' + super()._reply(request)
+
+
+def test_a_think_block_from_a_local_model_disqualifies_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    layout, manifest = based(tmp_path, monkeypatch)
+    with pytest.raises(LLMOutputError, match="<think>"):
+        run_candidate(layout, manifest, LOCAL, [], Thinking())
+    failure = correction.load_failure(layout, LOCAL)
+    assert failure is not None
+    assert "<think>" in failure.error
+    (record,) = correction.load_calls(layout, LOCAL)
+    assert record.error is not None
+    assert record.output_tokens == 20
+
+
+def test_a_claude_candidate_is_not_screened_for_think_tags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    layout, manifest = based(tmp_path, monkeypatch)
+    run_candidate(layout, manifest, SONNET, [ZH], Thinking())
+    assert correction.load_failure(layout, SONNET) is None
+
+
+def test_a_call_that_raised_is_logged_with_its_error(tmp_path: Path) -> None:
+    class Down(FakeLLM):
+        def complete(self, request: LLMRequest) -> LLMResponse:
+            raise LLMUnavailableError("quota resets at 5pm")
+
+    calls = tmp_path / "calls.jsonl"
+    client = RecordingClient(Down("inner"), client_id="outer", calls=calls, file="f")
+    with pytest.raises(LLMUnavailableError):
+        client.complete(LLMRequest(system="s", user="SEGMENTS:\n[]"))
+    (line,) = calls.read_text().splitlines()
+    record = correction.CallRecord.model_validate_json(line)
+    assert record.error == "LLMUnavailableError: quota resets at 5pm"
+    assert record.input_tokens is None
+
+
 def test_correct_refuses_another_base_version_or_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     layout, manifest = based(tmp_path, monkeypatch)
     run_candidate(layout, manifest, SONNET, [ZH], FakeLLM())

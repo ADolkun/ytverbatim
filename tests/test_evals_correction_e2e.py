@@ -11,10 +11,10 @@ import pytest
 from click.testing import CliRunner, Result
 from evals_fixture import EN, ZH, FakeJudge, chunk_rows, make_eval, whole_file_rows
 
-from evals import correction, listen, run_correction
+from evals import correction, correction_metrics, listen, run_correction
 from evals.correction import CANDIDATES, Failure
 from evals.correction_report import SCREEN_FILE, CorrectionScreen
-from evals.session import ShownSpan, load_shown
+from evals.session import KEY_FILE, ShownSpan, load_key, load_shown
 from evals.store import REFERENCE, Layout, write_json, write_rows
 from ytverbatim.errors import ConfigError
 from ytverbatim.llm import claude_cli
@@ -45,6 +45,7 @@ PRIVATE = (
 CHECKS = {
     "eligible candidate",
     "every span decided",
+    "enough labels",
     "over-correction",
     "errors per hour",
     "number preservation",
@@ -185,7 +186,11 @@ def screen_json(layout: Layout) -> CorrectionScreen:
     return CorrectionScreen.model_validate_json((layout.correction / SCREEN_FILE).read_text(encoding="utf-8"))
 
 
-def test_the_whole_flow_picks_decides_and_publishes_only_generic_labels(rig: Rig) -> None:
+def test_the_whole_flow_picks_decides_and_publishes_only_generic_labels(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The fixture has two audible edits; the real minimum is covered by the next test and the metrics tests.
+    monkeypatch.setattr(correction_metrics, "MIN_DECIDED", 2)
     rig.ok("base", "--hyp", HYPOTHESIS)
     rig.correct_all()
 
@@ -226,6 +231,8 @@ def test_the_whole_flow_picks_decides_and_publishes_only_generic_labels(rig: Rig
 
     published = (rig.results / "correction-2026-11-12.md").read_text(encoding="utf-8")
     assert "correction ships default-on with c-sonnet" in published
+    assert "Punctuation parity" in published
+    assert "fake:punct" in published
     assert "zh-01" in published
     assert "en-01" in published
     for check in CHECKS:
@@ -250,6 +257,20 @@ def test_the_whole_flow_picks_decides_and_publishes_only_generic_labels(rig: Rig
     ):
         rig.ok(*args)
     assert rig.llm_calls == calls
+
+
+def test_a_handful_of_labels_never_turns_correction_on(rig: Rig) -> None:
+    rig.ok("base", "--hyp", HYPOTHESIS)
+    rig.correct_all()
+    rig.ok("screen")
+    rig.ok("session")
+    rig.ok("listen")
+    rig.ok("report")
+    decision = json.loads(rig.ok("decide", "--date", "2026-11-12").stdout)
+    assert decision["default_on"] is False
+    failed = [c for c in decision["checks"] if not c["passed"]]
+    assert [c["name"] for c in failed] == ["enough labels"]
+    assert "too few labels" in failed[0]["detail"]
 
 
 def test_a_session_waits_for_the_judge_and_a_pick(rig: Rig) -> None:
@@ -284,7 +305,7 @@ def test_a_stale_failure_is_named_with_its_fix(rig: Rig) -> None:
         Failure(file=ZH, error="invalid JSON twice", at="2026-11-12T00:00:00+00:00"),
     )
     output = rig.ok("screen").output
-    assert "c-haiku is ineligible: a correction call returned invalid JSON twice" in output
+    assert "c-haiku is ineligible: a correction call raised LLMOutputError (see failure.json)" in output
     assert "move correction/runs/c-haiku" in output
     assert "from scratch" in output
     rig.ok("session")
@@ -314,3 +335,77 @@ def test_without_a_session_the_decision_is_default_off(rig: Rig) -> None:
     decision = json.loads(rig.ok("decide", "--date", "2026-11-12").stdout)
     assert decision["default_on"] is False
     assert [c["name"] for c in decision["checks"] if not c["passed"]] == ["human session"]
+
+
+def test_a_disqualified_candidate_is_not_run_again(rig: Rig) -> None:
+    rig.ok("base", "--hyp", HYPOTHESIS)
+    rig.ok("correct", "--candidate", "c-haiku")
+    write_json(
+        correction.run_dir(rig.layout, CANDIDATES["c-haiku"]) / correction.FAILURE_FILE,
+        Failure(file=ZH, error="empty reply", at="2026-11-12T00:00:00+00:00"),
+    )
+    calls = rig.llm_calls
+    message = rig.refused("correct", "--candidate", "c-haiku")
+    assert "raised LLMOutputError" in message
+    assert "from scratch" in message
+    assert rig.llm_calls == calls
+
+
+def sessioned(rig: Rig, *args: str) -> None:
+    rig.ok("base", "--hyp", HYPOTHESIS)
+    rig.correct_all()
+    rig.ok("screen")
+    rig.ok("session", *args)
+    rig.ok("listen")
+
+
+def test_report_refuses_a_session_drawn_from_another_candidate_set(rig: Rig) -> None:
+    sessioned(rig)
+    rig.ok("screen", "--candidates", "c-sonnet,l-qwen35-9b")
+    message = rig.refused("report")
+    assert "was drawn from the candidates c-haiku, c-sonnet, l-qwen35-9b" in message
+    assert "session --name NEW" in message
+
+
+def test_report_refuses_a_challenger_screen_did_not_compare(rig: Rig) -> None:
+    rig.ok("base", "--hyp", HYPOTHESIS)
+    rig.correct_all()
+    rig.ok("screen")
+    rig.ok("session", "--candidate", "c-haiku")
+    rig.ok("listen")
+    rig.ok("screen", "--candidates", "c-sonnet,l-qwen35-9b")
+    assert "which `screen` did not compare" in rig.refused("report")
+
+
+def test_report_refuses_a_session_that_is_not_a_correction_session(rig: Rig) -> None:
+    sessioned(rig)
+    directory = rig.layout.session_dir("correction")
+    other = rig.layout.session_dir("asr")
+    other.mkdir(parents=True)
+    for path in directory.iterdir():
+        (other / path.name).write_bytes(path.read_bytes())
+    key = load_key(directory).model_copy(update={"control": "w-prod"})
+    (other / KEY_FILE).write_text(key.model_dump_json(), encoding="utf-8")
+    assert "not a correction session" in rig.refused("report", "--name", "asr")
+
+
+def test_report_refuses_a_session_whose_spans_no_longer_match(rig: Rig) -> None:
+    sessioned(rig)
+    path = rig.layout.session_dir("correction") / KEY_FILE
+    key = load_key(path.parent)
+    population = {cell: count + 1 for cell, count in key.population.items()}
+    path.write_text(key.model_copy(update={"population": population}).model_dump_json(), encoding="utf-8")
+    assert "the runs changed after the session" in rig.refused("report")
+    first = key.entries[0].model_copy(update={"language": "en" if key.entries[0].language == "zh" else "zh"})
+    moved = key.model_copy(update={"entries": (first, *key.entries[1:])})
+    path.write_text(moved.model_dump_json(), encoding="utf-8")
+    assert "no longer matches the stored disputes" in rig.refused("report")
+
+
+def test_report_says_when_a_cell_with_edits_got_no_span(rig: Rig) -> None:
+    sessioned(rig, "--n", "1")
+    rig.ok("report")
+    report = (rig.layout.correction / "report.md").read_text(encoding="utf-8")
+    assert "No span was sampled from" in report
+    assert "/other" in report
+    assert ZH not in report

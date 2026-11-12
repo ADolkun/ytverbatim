@@ -68,6 +68,8 @@ class SessionKey(_Frozen):
     created: str
     population: dict[str, int]
     entries: tuple[KeyEntry, ...]
+    # Candidates whose disputes the spans were drawn from (correction eval only): span ids and cells depend on the set.
+    candidates: tuple[str, ...] = ()
 
 
 def cell_name(file: str, stratum: Stratum) -> str:
@@ -202,6 +204,7 @@ def session_from_spans(
     n: int = DEFAULT_N,
     seed: int = 0,
     numeric_share: float = NUMERIC_SHARE,
+    candidates: Sequence[str] = (),
 ) -> tuple[list[ShownSpan], SessionKey]:
     """Sample ``spans`` into a session; spans that differ only in written form are set aside first.
 
@@ -260,6 +263,7 @@ def session_from_spans(
         created=now(),
         population=dict(sorted(population.items())),
         entries=tuple(entries),
+        candidates=tuple(sorted(candidates)),
     )
     return shown, key
 

@@ -90,16 +90,16 @@ class Span(_Frozen):
         return next(r for r in self.readings if r.hypothesis == hypothesis)
 
 
-def format_only(dispute: Dispute, language: Language) -> bool:
-    """Whether the readings differ only in written form (``150期`` against ``一百五十期``), not in what was said.
+def format_only(readings: Sequence[str], language: Language) -> bool:
+    """Whether the ``readings`` differ only in written form (``150期`` against ``一百五十期``), not in what was said.
 
     A listener cannot separate such readings, so they go to neither the judge nor the A/B. Latin case stays a real
     difference where it marks a ticker or acronym, ``nvda`` for ``NVDA``; in Chinese text every Latin token is one.
     English sentence-start capitals (``They`` against ``they``) are written form.
     """
-    if len({normalize(text, language, "itn") for text in dispute.distinct}) > 1:
+    if len({normalize(text, language, "itn") for text in readings}) > 1:
         return False
-    latin = {tuple(_LATIN_RUN.findall(text)) for text in dispute.distinct}
+    latin = {tuple(_LATIN_RUN.findall(text)) for text in readings}
     folded = {tuple(word.casefold() for word in words) for words in latin}
     case_conflict = len(folded) == 1 and len(latin) > 1
     if case_conflict and language == "en":
@@ -170,7 +170,7 @@ def _span(video: Video, language: Language, window: int, dispute: Dispute) -> Sp
         end=dispute.end_s,
         touches_quantity=dispute.touches_quantity,
         touches_latin=dispute.touches_latin,
-        format_only=format_only(dispute, language),
+        format_only=format_only(dispute.distinct, language),
     )
 
 
