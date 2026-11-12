@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# Never commit media, cookies, secrets or eval data (public repo)
+*.wav
+*.m4a
+*.opus
+*.webm
+*.mp4
+*.mkv
+cookies*.txt
+*.cookies
+.env
+.env.*
+!.env.example
+/eval-data/

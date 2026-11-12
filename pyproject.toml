@@ -1,0 +1,136 @@
+[project]
+name = "ytverbatim"
+version = "0.0.1"
+description = "Verified, timestamped YouTube transcripts for LLM context, with local ASR on Apple Silicon."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Albert Dolkun" }]
+requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Typing :: Typed",
+]
+dependencies = ["click>=8.1"]
+
+[project.urls]
+Homepage = "https://github.com/ADolkun/ytverbatim"
+Repository = "https://github.com/ADolkun/ytverbatim"
+
+[project.scripts]
+ytverbatim = "ytverbatim.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pyrefly",
+    "pytest",
+    "ruff",
+]
+
+[tool.ruff]
+line-length = 120
+indent-width = 4
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",       # pycodestyle errors
+    "F",       # pyflakes
+    "W",       # pycodestyle warnings
+    "I",       # isort
+    "B",       # flake8-bugbear
+    "UP",      # pyupgrade
+    "SIM",     # flake8-simplify
+    "RUF",     # ruff-specific
+    "N",       # pep8-naming
+    "TID",     # flake8-tidy-imports
+    "D",       # pydocstyle
+    "C901",    # mccabe complexity
+    "PLR0911", # too many returns
+    "PLR0912", # too many branches
+    "PLR0913", # too many args
+    "PLR0915", # too many statements
+    "PLR2004", # magic-value comparison
+]
+ignore = [
+    # Mandarin text is first-class data here (transcripts, fixtures); the
+    # confusable-character checks are noise for it.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    "D100", # missing module docstring
+    "D101", # missing public class docstring
+    "D102", # missing public method docstring
+    "D103", # missing public function docstring
+    "D104", # missing package docstring
+    "D105", # missing magic-method docstring
+    "D106", # missing nested-class docstring
+    "D107", # missing __init__ docstring
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ytverbatim"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
+[tool.ruff.lint.mccabe]
+max-complexity = 16
+
+[tool.ruff.lint.pylint]
+max-args = 10
+max-returns = 10
+max-branches = 18
+max-statements = 80
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D", "PLR2004"]
+"scripts/**" = ["D", "PLR2004", "C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915"]
+
+[tool.pyrefly]
+preset = "strict"
+project-includes = ["src", "tests", "scripts"]
+python-version = "3.12"
+search-path = ["scripts"]
+
+[tool.pyrefly.errors]
+unannotated-attribute = true
+unannotated-return = true
+
+[[tool.pyrefly.sub-config]]
+matches = "tests/**"
+# Tests are verified by execution; relax the kinds that fire on concrete
+# literals passed into precisely typed source signatures. Source stays fully checked.
+[tool.pyrefly.sub-config.errors]
+implicit-any = false
+implicit-any-parameter = false
+implicit-any-type-argument = false
+implicit-any-attribute = false
+implicit-any-empty-container = false
+implicit-any-lambda = false
+unannotated-attribute = false
+unannotated-return = false
+missing-override-decorator = false
+bad-argument-type = false
+bad-index = false
+not-iterable = false
+no-matching-overload = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+pythonpath = ["scripts"]
+addopts = "-p no:cacheprovider"
