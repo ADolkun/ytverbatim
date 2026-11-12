@@ -46,6 +46,9 @@ def run(
     memory_watch: MemoryWatch | None = None,
 ) -> ProcResult:
     command = Path(argv[0]).name
+    if memory_watch is not None and stdin is not None:
+        # The watch retries communicate(); on Python 3.12 a retry stops writing the input, so the child never sees EOF.
+        raise ValueError("a memory watch cannot be combined with stdin")
     started = time.monotonic()
     try:
         # Own session so a timeout can kill grandchildren (node, ffmpeg) along with the child.
@@ -72,7 +75,7 @@ def run(
         if memory_watch is None:
             stdout, stderr = child.communicate(stdin, timeout=timeout_s)
         else:
-            stdout, stderr = _watched(child, command, stdin, started + timeout_s, memory_watch)
+            stdout, stderr = _watched(child, command, started + timeout_s, memory_watch)
     except subprocess.TimeoutExpired:
         _kill_group(child)
         raise ProcTimeout(command, timeout_s) from None
@@ -82,20 +85,15 @@ def run(
     return ProcResult(child.returncode, stdout, stderr, time.monotonic() - started)
 
 
-def _watched(
-    child: subprocess.Popen[str], command: str, stdin: str | None, deadline: float, watch: MemoryWatch
-) -> tuple[str, str]:
-    pending = stdin
+def _watched(child: subprocess.Popen[str], command: str, deadline: float, watch: MemoryWatch) -> tuple[str, str]:
     while True:
         remaining = deadline - time.monotonic()
         try:
-            stdout, stderr = child.communicate(pending, timeout=max(0.0, min(watch.poll_s, remaining)))
+            stdout, stderr = child.communicate(timeout=max(0.0, min(watch.poll_s, remaining)))
             return stdout, stderr
         except subprocess.TimeoutExpired:
             if remaining <= watch.poll_s:
                 raise
-        # communicate() keeps feeding the input it was first given and refuses to be handed it a second time.
-        pending = None
         sample = watch.footprint(child.pid)
         available = watch.available_percent()
         current = None if sample is None else sample.current
