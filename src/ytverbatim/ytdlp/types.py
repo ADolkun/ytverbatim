@@ -24,6 +24,8 @@ class Signal(StrEnum):
     N_CHALLENGE = "n_challenge"
     NO_FORMATS = "no_formats"
     HTTP_403 = "http_403"
+    # Bare urllib 429, kept apart from RATE_LIMITED: on a subtitle download it only costs that video its captions.
+    HTTP_429 = "http_429"
     TRANSIENT = "transient"
     ROTATED = "rotated"
     PREMIUM = "premium"
