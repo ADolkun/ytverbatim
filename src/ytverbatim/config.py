@@ -7,6 +7,7 @@ from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 
 from ytverbatim import paths
 from ytverbatim.errors import ConfigError
+from ytverbatim.ytdlp.runner import redact
 
 
 @dataclass(frozen=True)
@@ -90,7 +91,7 @@ def _read(path: Path) -> dict[str, Any]:
     except FileNotFoundError:
         return {}
     except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise ConfigError(f"cannot read config file {path}: {exc}") from exc
+        raise ConfigError(redact(f"cannot read config file {path}: {exc}")) from exc
 
 
 def _checked(cls: type, section: str, values: Mapping[str, object]) -> dict[str, Any]:

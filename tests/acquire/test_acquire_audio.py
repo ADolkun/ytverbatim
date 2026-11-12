@@ -224,6 +224,19 @@ def test_to_wav16k_converts_to_the_asr_format_and_writes_atomically(tmp_path: Pa
     assert sorted(p.name for p in tmp_path.iterdir()) == ["audio.wav", "audio.webm"]
 
 
+def test_probe_stderr_shows_the_home_directory_as_tilde(
+    tmp_path: Path, fake_proc, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    media = tmp_path / "audio.webm"
+    media.write_bytes(b"x")
+    fake_proc.probe_returns("", 1, f"{media}: Invalid data found when processing input")
+    with pytest.raises(MediaValidationError) as caught:
+        audio.validate_audio(media, expected_duration=None)
+    assert str(tmp_path) not in str(caught.value)
+    assert "~/audio.webm: Invalid data" in str(caught.value)
+
+
 def test_failed_conversion_leaves_no_partial_wav(tmp_path: Path, fake_proc) -> None:
     source = tmp_path / "audio.webm"
     source.write_bytes(b"x")

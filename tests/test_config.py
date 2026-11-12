@@ -101,6 +101,14 @@ def test_malformed_toml_is_a_config_error(tmp_path: Path) -> None:
         load_options(_write(tmp_path, "[auth\n"))
 
 
+def test_read_error_shows_the_home_directory_as_tilde(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    with pytest.raises(ConfigError) as caught:
+        load_options(_write(tmp_path, "[auth\n"))
+    assert str(tmp_path) not in str(caught.value)
+    assert "cannot read config file ~/" in str(caught.value)
+
+
 def test_override_wins_over_file(tmp_path: Path) -> None:
     path = _write(tmp_path, '[auth]\npolicy = "never"\n[ytdlp]\nmax_videos_per_run = 5\n')
     options = load_options(path, {"auth": {"policy": "always"}, "llm": {"model": "m1"}})

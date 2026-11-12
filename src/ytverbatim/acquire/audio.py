@@ -8,6 +8,7 @@ from pathlib import Path
 from ytverbatim import proc
 from ytverbatim.acquire.metadata import fetch_info, info_path
 from ytverbatim.errors import MediaValidationError, YtDlpError, stderr_preview
+from ytverbatim.ytdlp.runner import redact
 from ytverbatim.ytdlp.types import Signal, YtDlpRunner
 
 log = logging.getLogger(__name__)
@@ -109,7 +110,8 @@ def probe_duration(path: Path) -> float:
         timeout_s=PROBE_TIMEOUT_S,
     )
     if result.returncode != 0:
-        raise MediaValidationError(f"audio is unreadable: {path.name}\n{stderr_preview(result.stderr)}")
+        # ffprobe and ffmpeg echo the absolute input path, which names the user.
+        raise MediaValidationError(f"audio is unreadable: {path.name}\n{stderr_preview(redact(result.stderr))}")
     try:
         duration = float(result.stdout.strip())
     except ValueError:
@@ -152,7 +154,9 @@ def to_wav16k(
             timeout_s=timeout_s,
         )
         if result.returncode != 0:
-            raise MediaValidationError(f"ffmpeg could not convert {source.name}\n{stderr_preview(result.stderr)}")
+            raise MediaValidationError(
+                f"ffmpeg could not convert {source.name}\n{stderr_preview(redact(result.stderr))}"
+            )
         validate_audio(tmp, expected_duration=expected_duration)
         os.replace(tmp, destination)
     except BaseException:
