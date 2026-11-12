@@ -23,7 +23,8 @@ def detect() -> JsRuntime:
     """Pick the runtime yt-dlp uses to solve YouTube's JS challenges; `finding` explains a missing one."""
     override = os.environ.get(ENV_OVERRIDE)
     if override:
-        return JsRuntime(override.split(":", 1)[0], ("--js-runtimes", override), None)
+        # Clearing first, or yt-dlp's default deno stays enabled and outranks the override.
+        return JsRuntime(override.split(":", 1)[0], ("--no-js-runtimes", "--js-runtimes", override), None)
     # yt-dlp enables deno by default, so it needs no flag.
     if shutil.which("deno"):
         return JsRuntime("deno", (), None)

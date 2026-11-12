@@ -30,7 +30,9 @@ def _node(monkeypatch: pytest.MonkeyPatch, stdout: str, code: int = 0) -> list[l
 def test_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(jsruntime.ENV_OVERRIDE, "node:/opt/node/bin/node")
     _path(monkeypatch, "deno")
-    assert jsruntime.detect() == jsruntime.JsRuntime("node", ("--js-runtimes", "node:/opt/node/bin/node"), None)
+    found = jsruntime.detect()
+    assert found == jsruntime.JsRuntime("node", ("--no-js-runtimes", "--js-runtimes", "node:/opt/node/bin/node"), None)
+    assert found.args.index("--no-js-runtimes") < found.args.index("--js-runtimes")
 
 
 def test_deno_needs_no_flag(monkeypatch: pytest.MonkeyPatch) -> None:
