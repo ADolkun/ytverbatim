@@ -2,7 +2,8 @@
 
 A correction may fix homophones and garbled terms; it must never change what the speaker asserted. Every guard
 compares the original with the proposed text and rejects recognized data, negation or direction changes and
-destructive rewrites. They are conservative checks, not a proof of semantic equivalence.
+destructive rewrites. They are conservative checks, not a proof of semantic equivalence. `check_numeric_fix` is the
+inverse guard for numeric verification, where the number is the one thing allowed to change.
 
 Ported from ytscript's ``analyze/correct.py`` with one guard loosened: an uppercase acronym or ticker may take one
 inserted or deleted letter or one adjacent transposition (GAP→GAAP, SMCI→MSCI), never a substituted letter.
@@ -58,6 +59,8 @@ _QUANTITY = (
     rf"{_SIGN_OR_CURRENCY}?(?:\d+(?:,\d{{3}})*(?:\.\d+)?|\.\d+)(?:\s*[%$¥€£元块塊分])?"
     rf"|{_SIGN_OR_CURRENCY}(?=[{_CJK_NUMERAL_CHARS}])"
 )
+# A numeric fix may touch only data characters; any other character in a changed run means a reword rode along.
+_NON_DATA_CHAR = re.compile(rf"[^\s0-9０-９.,%％$¥€£A-Z{_CJK_NUMERAL_CHARS}]")
 # Bare uppercase runs (NVDA, GAAP, SPX): acronyms and tickers, the one symbol class a fix may respell.
 _BARE_SYMBOL = re.compile(r"[A-Z]{2,}")
 # Dotted, exchange-prefixed and share-class tickers stay exact: BRK.B→BRK.A or $F→$T is a different security even
@@ -185,6 +188,28 @@ def check_fix(original: str, fixed: str, *, min_keep_ratio: float = MIN_KEEP_RAT
     return GuardVerdict(None, changes)
 
 
+def check_numeric_fix(original: str, fixed: str, suspects: list[str]) -> bool:
+    """Accept a numeric fix only if it touches the flagged ``suspects`` and nothing else.
+
+    The inverse of `check_fix`: that one forbids editing numbers, this one requires the edit be confined to the
+    flagged tokens. It rejects an empty or echoed result, a truncation or balloon, a CJK-to-non-CJK rewrite, a changed
+    run that touches a prose character, and a fix that also rewrites an unflagged data token.
+    """
+    if not fixed or fixed == original:
+        return False
+    if len(fixed) < MIN_KEEP_RATIO * len(original):
+        return False
+    if len(fixed) > max(_BALLOON_FLOOR, int(len(original) * _BALLOON_RATIO)):
+        return False
+    if _is_predominantly_cjk(original) and not _CJK.search(fixed):
+        return False
+    for tag, i1, i2, j1, j2 in SequenceMatcher(None, original, fixed, autojunk=False).get_opcodes():
+        if tag != "equal" and (_NON_DATA_CHAR.search(original[i1:i2]) or _NON_DATA_CHAR.search(fixed[j1:j2])):
+            return False
+    unflagged = Counter(_data_tokens(original)) - Counter(_data_tokens(" ".join(suspects)))
+    return not unflagged - Counter(_data_tokens(fixed))
+
+
 def symbol_changes(original: str, fixed: str) -> tuple[EntityChange, ...]:
     """Acronyms and tickers that differ position by position; both texts must hold the same number of them."""
     before = list(_BARE_SYMBOL.finditer(original))
@@ -211,6 +236,10 @@ def _is_near_symbol(before: str, after: str) -> bool:
         and len(before) == len(after)
         and any(before[:i] + before[i + 1] + before[i] + before[i + 2 :] == after for i in range(len(before) - 1))
     )
+
+
+def _data_tokens(text: str) -> list[str]:
+    return _DIGIT_RUN.findall(text) + _BARE_SYMBOL.findall(text) + _CJK_NUMERAL.findall(text)
 
 
 def _cjk_numerals_changed(original: str, fixed: str) -> bool:
