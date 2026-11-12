@@ -7,6 +7,8 @@ import pytest
 from evals import metrics
 from evals.consensus import TimedUnit
 from evals.metrics import (
+    ErrorCounts,
+    _percentile_index,
     cer,
     mer,
     nonspeech_intervals,
@@ -98,6 +100,15 @@ def test_quantity_accuracy_counts_a_multiset_and_can_filter_kinds() -> None:
     assert (only_tickers.successes, only_tickers.trials) == (0, 1)
 
 
+def test_quantity_accuracy_itn_matches_spelled_english_numbers() -> None:
+    itn = quantity_accuracy("Sales rose 15% at NVDA", "sales rose fifteen percent at NVDA", "en", "itn")
+    assert (itn.successes, itn.trials) == (2, 2)
+    spelled_reference = quantity_accuracy("fifteen percent", "15%", "en", "itn")
+    assert (spelled_reference.successes, spelled_reference.trials) == (1, 1)
+    raw = quantity_accuracy("Sales rose 15%", "sales rose fifteen percent", "en", "raw")
+    assert (raw.successes, raw.trials) == (0, 1)
+
+
 @pytest.mark.parametrize(
     ("successes", "trials", "low", "high"),
     [(8, 10, 0.4902, 0.9433), (0, 10, 0.0, 0.2775), (10, 10, 0.7225, 1.0), (50, 100, 0.4038, 0.5962)],
@@ -143,22 +154,41 @@ def test_units_in_nonspeech_uses_midpoints() -> None:
     assert units_in_nonspeech(units, []) == []
 
 
+def counts(errors: int, reference: int) -> ErrorCounts:
+    return ErrorCounts(substitutions=errors, deletions=0, insertions=0, hits=reference - errors)
+
+
 def test_paired_bootstrap_is_deterministic_per_seed() -> None:
-    a = [0.10, 0.12, 0.08, 0.15, 0.11, 0.09, 0.14, 0.13]
-    b = [0.22, 0.20, 0.19, 0.31, 0.21, 0.30, 0.20, 0.24]
+    a = [counts(e, 100) for e in (10, 12, 8, 15, 11, 9, 14, 13)]
+    b = [counts(e, 100) for e in (22, 20, 19, 31, 21, 30, 20, 24)]
     first = paired_bootstrap(a, b, seed=7)
     assert first == paired_bootstrap(a, b, seed=7)
     assert first != paired_bootstrap(a, b, seed=8)
-    assert first.low < first.mean_difference < first.high < 0
+    assert first.low < first.difference < first.high < 0
     assert first.excludes_zero
 
 
 def test_paired_bootstrap_interval_includes_zero_for_noise() -> None:
-    a = [0.1, 0.3, 0.2, 0.4]
-    b = [0.3, 0.1, 0.4, 0.2]
+    a = [counts(e, 10) for e in (1, 3, 2, 4)]
+    b = [counts(e, 10) for e in (3, 1, 4, 2)]
     assert not paired_bootstrap(a, b, seed=1).excludes_zero
+
+
+def test_paired_bootstrap_pools_counts_instead_of_averaging_window_rates() -> None:
+    # A one-unit window where a is wrong must not outweigh a 99-unit window where a is perfect.
+    a = [counts(1, 1), counts(0, 99)]
+    b = [counts(0, 1), counts(5, 99)]
+    result = paired_bootstrap(a, b, seed=0)
+    assert result.difference == pytest.approx(1 / 100 - 5 / 100)
+    assert result.difference < 0  # a per-window mean would say (1.0 - 0.05) / 2 > 0
+
+
+def test_percentile_indices_pick_the_right_ranks() -> None:
+    assert _percentile_index(0.025, 2000) == 49
+    assert _percentile_index(0.975, 2000) == 1949
+    assert _percentile_index(0.5, 3) == 1
 
 
 def test_paired_bootstrap_rejects_mismatched_samples() -> None:
     with pytest.raises(ValueError, match="equally long"):
-        paired_bootstrap([1.0], [1.0, 2.0], seed=0)
+        paired_bootstrap([counts(1, 2)], [counts(1, 2), counts(0, 2)], seed=0)
