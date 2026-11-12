@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ from click.testing import CliRunner
 from ytverbatim import paths
 from ytverbatim.auth import cookiefile, source
 from ytverbatim.auth.cookiefile import CookieEntry
+from ytverbatim.auth.cooldown import read_cooldown, start_cooldown
 from ytverbatim.auth.source import BrowserSource, CookieFileSource
 from ytverbatim.cli import auth as cli_auth
 from ytverbatim.cli import main
@@ -28,6 +30,8 @@ JSON_KEYS = {
     "ytdlp_age_days",
     "js_runtime",
     "warnings",
+    "cooldown_until",
+    "probe_skipped",
 }
 
 
@@ -193,3 +197,48 @@ def test_doctor_prints_one_line_per_check(kit, monkeypatch: pytest.MonkeyPatch) 
     assert lines[0] == "✓ ffmpeg: ffmpeg found"
     assert any(line.startswith("✗ source: no_source") for line in lines)
     assert any(line.startswith("    Fix: No auth source set") for line in lines)
+
+
+def test_status_during_a_cooldown_skips_the_probe_unless_ignored(kit, monkeypatch: pytest.MonkeyPatch) -> None:
+    source.save_source(BrowserSource("chrome", "Default"))
+    start_cooldown(Signal.BOT_CHECK, datetime.now(UTC))
+    runner = kit.ok()
+    _use_runner(monkeypatch, runner)
+    result = _invoke("status", "--refresh")
+    assert result.exit_code == 2 and runner.calls == []
+    assert result.output.startswith("✗ bot_check: cooldown active until ")
+    assert "Wait until " in result.output and "an hour has passed" not in result.output
+    assert "--ignore-cooldown" in result.output
+    payload = json.loads(_invoke("status", "--json", "--refresh").output)
+    assert payload["probe_skipped"] is True and payload["cooldown_until"] is not None
+
+    allowed = _invoke("status", "--refresh", "--ignore-cooldown")
+    assert allowed.exit_code == 0 and len(runner.calls) == 1
+
+
+def test_status_probe_stop_signal_starts_a_cooldown(kit, monkeypatch: pytest.MonkeyPatch) -> None:
+    source.save_source(BrowserSource("chrome", "Default"))
+    _use_runner(monkeypatch, kit.fail(Signal.BOT_CHECK))
+    result = _invoke("status", "--refresh")
+    assert result.exit_code == 2 and result.output.startswith("✗ bot_check: the :ytfav probe hit bot_check")
+    cooldown = read_cooldown()
+    assert cooldown is not None and cooldown.until > datetime.now(UTC) + timedelta(minutes=59)
+    runner = kit.ok()
+    _use_runner(monkeypatch, runner)
+    assert _invoke("status", "--refresh").exit_code == 2 and runner.calls == []
+
+
+def test_doctor_during_a_cooldown_skips_the_probe_unless_ignored(kit, monkeypatch: pytest.MonkeyPatch) -> None:
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda name: f"/opt/bin/{name}")
+    source.save_source(BrowserSource("chrome", "Default"))
+    start_cooldown(Signal.RATE_LIMITED, datetime.now(UTC))
+    runner = kit.ok()
+    _use_runner(monkeypatch, runner)
+    result = _invoke("doctor")
+    assert result.exit_code == 2 and runner.calls == []
+    assert any(line.startswith("! login: skipped: cooldown active") for line in result.output.splitlines())
+    assert any(line.startswith("✗ cooldown: rate_limited") for line in result.output.splitlines())
+    _invoke("doctor", "--ignore-cooldown")
+    assert len(runner.calls) == 1

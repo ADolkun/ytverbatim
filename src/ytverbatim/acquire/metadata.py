@@ -86,9 +86,18 @@ def fetch_info(
     if metadata.live_status in _LIVE_KINDS:
         raise UnavailableError(_LIVE_KINDS[metadata.live_status], "live and upcoming streams have no final transcript")
     stage_dir.mkdir(parents=True, exist_ok=True)
-    # 0600: the info JSON carries signed, session-bound format URLs.
-    atomic.write_text(info_path(stage_dir), result.stdout, mode=0o600)
+    # 0600: the info JSON carries signed, session-bound format URLs. yt-dlp also copies the account's cookie
+    # values into it (per format and on the selected one); later stages pass --cookies, so they are dropped.
+    atomic.write_text(info_path(stage_dir), json.dumps(_without_cookies(info), ensure_ascii=False), mode=0o600)
     return metadata
+
+
+def _without_cookies(value: object) -> object:
+    if isinstance(value, dict):
+        return {k: _without_cookies(v) for k, v in cast("dict[str, object]", value).items() if k != "cookies"}
+    if isinstance(value, list):
+        return [_without_cookies(item) for item in cast("list[object]", value)]
+    return value
 
 
 def load_metadata(stage_dir: Path) -> VideoMetadata:

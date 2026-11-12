@@ -6,6 +6,7 @@ import pytest
 
 from ytverbatim import paths
 from ytverbatim.auth import doctor, source
+from ytverbatim.auth.cooldown import read_cooldown, start_cooldown
 from ytverbatim.auth.doctor import Status
 from ytverbatim.auth.source import BrowserSource
 from ytverbatim.auth.state import AuthState
@@ -122,19 +123,72 @@ def test_po_token_warning(kit) -> None:
     assert checks["po token"].status is Status.WARN and "docs/auth.md#po-token" in checks["po token"].fix
 
 
+def test_active_cooldown_is_reported_with_its_fix(kit) -> None:
+    start_cooldown(Signal.RATE_LIMITED, NOW)
+    cooldown = _by_name(doctor.run_doctor(kit.ok(), now=NOW))["cooldown"]
+    assert cooldown.status is Status.FAIL and cooldown.message.startswith("rate_limited")
+    assert "Wait until " in cooldown.fix and "an hour has passed" not in cooldown.fix
+
+
+def test_expired_cooldown_is_ok(kit) -> None:
+    start_cooldown(Signal.BOT_CHECK, NOW - timedelta(hours=2))
+    assert _by_name(doctor.run_doctor(kit.ok(), now=NOW))["cooldown"].status is Status.OK
+
+
 @pytest.mark.parametrize(
-    ("payload", "status", "state"),
+    "payload",
     [
-        ({"until": (NOW + timedelta(hours=1)).isoformat(), "signal": "rate_limited"}, Status.FAIL, "rate_limited"),
-        ({"until": (NOW + timedelta(hours=1)).timestamp(), "signal": "bot_check"}, Status.FAIL, "bot_check"),
-        ({"until": (NOW - timedelta(hours=1)).isoformat(), "signal": "bot_check"}, Status.OK, None),
-        ({"signal": "bot_check"}, Status.FAIL, None),
+        {"signal": "bot_check", "hours": 1},
+        {"until": (NOW + timedelta(hours=1)).timestamp(), "signal": "bot_check", "hours": 1},
+        {"until": (NOW + timedelta(hours=1)).isoformat(), "signal": "bot_check"},
+        {"until": (NOW + timedelta(hours=1)).replace(tzinfo=None).isoformat(), "signal": "bot_check", "hours": 1},
+        {"until": (NOW + timedelta(hours=1)).isoformat(), "signal": "members_only", "hours": 1},
+        {"until": (NOW + timedelta(hours=1)).isoformat(), "signal": "nonsense", "hours": 1},
+        [],
     ],
 )
-def test_cooldown(kit, payload: dict[str, object], status: Status, state: str | None) -> None:
+def test_cooldown_in_any_other_format_is_unreadable(kit, payload: object) -> None:
+    source.save_source(BrowserSource("chrome", "Default"))
     paths.cooldown_file().write_text(json.dumps(payload), encoding="utf-8")
-    cooldown = _by_name(doctor.run_doctor(kit.ok(), now=NOW))["cooldown"]
-    assert cooldown.status is status
-    if state is not None:
-        assert cooldown.message.startswith(state)
-        assert "Wait until " in cooldown.fix and "an hour has passed" not in cooldown.fix
+    runner = kit.ok()
+    checks = _by_name(doctor.run_doctor(runner, now=NOW))
+    assert checks["cooldown"].status is Status.FAIL and "unreadable" in checks["cooldown"].message
+    assert checks["login"].status is Status.WARN and runner.calls == []
+
+
+def test_active_cooldown_skips_the_probe(kit) -> None:
+    source.save_source(BrowserSource("chrome", "Default"))
+    start_cooldown(Signal.BOT_CHECK, NOW)
+    runner = kit.ok()
+    checks = _by_name(doctor.run_doctor(runner, now=NOW + timedelta(minutes=10)))
+    assert runner.calls == []
+    assert checks["snapshot"].status is Status.OK
+    assert checks["login"].status is Status.WARN and "--ignore-cooldown" in checks["login"].message
+    assert checks["cooldown"].status is Status.FAIL and "Wait until " in checks["cooldown"].fix
+    assert doctor.exit_code(list(checks.values())) == 2
+
+
+def test_ignore_cooldown_probes_anyway(kit) -> None:
+    source.save_source(BrowserSource("chrome", "Default"))
+    start_cooldown(Signal.BOT_CHECK, NOW)
+    runner = kit.ok()
+    checks = _by_name(doctor.run_doctor(runner, now=NOW + timedelta(minutes=10), ignore_cooldown=True))
+    assert len(runner.calls) == 1 and checks["login"].status is Status.OK
+
+
+@pytest.mark.parametrize(
+    "runner_kind",
+    ["fail_primary", "fail_secondary", "ok_secondary"],
+)
+def test_a_stop_signal_on_the_probe_starts_a_cooldown(kit, runner_kind: str) -> None:
+    source.save_source(BrowserSource("chrome", "Default"))
+    runner = {
+        "fail_primary": kit.fail(Signal.BOT_CHECK),
+        "fail_secondary": kit.fail(Signal.LOGIN_REQUIRED, Signal.CAPTCHA),
+        "ok_secondary": kit.ok(Signal.RATE_LIMITED),
+    }[runner_kind]
+    checks = _by_name(doctor.run_doctor(runner, now=NOW))
+    assert checks["login"].status is Status.FAIL
+    assert checks["cooldown"].status is Status.FAIL
+    cooldown = read_cooldown()
+    assert cooldown is not None and cooldown.until == NOW + timedelta(hours=1)

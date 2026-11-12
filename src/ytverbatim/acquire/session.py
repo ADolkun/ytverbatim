@@ -11,7 +11,7 @@ import logging
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
@@ -24,6 +24,17 @@ from ytverbatim.acquire.captions import FILE_STEM as CAPTIONS_STEM
 from ytverbatim.acquire.expand import expand_target
 from ytverbatim.acquire.metadata import VideoMetadata, fetch_info, info_path, load_metadata
 from ytverbatim.auth import preflight, snapshot
+from ytverbatim.auth.cooldown import (
+    CAPTIONS_LABEL,
+    STOP_STATES,
+    Cooldown,
+    GuardedRunner,
+    check_cooldown,
+    read_cooldown,
+    start_cooldown,
+    stop_fix,
+    utcnow,
+)
 from ytverbatim.auth.fixes import fix_for
 from ytverbatim.auth.snapshot import Snapshot
 from ytverbatim.auth.source import BrowserSource, CookieFileSource, CookieSource
@@ -42,38 +53,17 @@ from ytverbatim.errors import (
 from ytverbatim.ytdlp import version
 from ytverbatim.ytdlp.runner import SLEEP_PRESET, SubprocessRunner, redact
 from ytverbatim.ytdlp.signals import js_challenge_failed
-from ytverbatim.ytdlp.types import Signal, YtDlpResult, YtDlpRunner
+from ytverbatim.ytdlp.types import Signal, YtDlpRunner
 
 log = logging.getLogger(__name__)
 
 type Policy = Literal["auto", "always", "never"]
-type BrowserKind = Literal["chrome", "brave", "chromium", "edge", "vivaldi"]
 type AuthSourceKind = Literal["none", "cookie-file", "chrome", "brave", "chromium", "edge", "vivaldi"]
 
-_BROWSER_KINDS: dict[str, BrowserKind] = {
-    "chrome": "chrome",
-    "brave": "brave",
-    "chromium": "chromium",
-    "edge": "edge",
-    "vivaldi": "vivaldi",
-}
-
-STOP_STATES: dict[Signal, AuthState] = {
-    Signal.BOT_CHECK: AuthState.BOT_CHECK,
-    Signal.IP_BLOCKED: AuthState.IP_BLOCKED,
-    Signal.CAPTCHA: AuthState.CAPTCHA,
-    Signal.RATE_LIMITED: AuthState.RATE_LIMITED,
-    Signal.HTTP_429: AuthState.RATE_LIMITED,
-}
 ESCALATE_SIGNALS = frozenset({Signal.LOGIN_REQUIRED, Signal.MEMBERS_ONLY, Signal.AGE_GATE, Signal.PRIVATE})
-# A bare 429 on a subtitle download only costs that video its captions (fetch_captions handles it).
-_CAPTIONS_LABEL = "captions"
 
 # Chromium commits its cookie store about every 30 s, so a re-snapshot sooner reads the same stale values.
 ROTATION_WAIT_S = 30.0
-COOLDOWN_BASE = timedelta(hours=1)
-COOLDOWN_MAX = timedelta(hours=24)
-COOLDOWN_REPEAT_WINDOW = timedelta(hours=24)
 
 SINGLE_VIDEO_SLEEP_ARGS: tuple[str, ...] = ("--sleep-requests", "0.75", "--sleep-subtitles", "5")
 MEMBERS_PLAYLIST_PREFIX = "UUMO"
@@ -85,9 +75,10 @@ TRACKS_FILE = "tracks.json"
 REPORT_FILE = "batch_report.json"
 _REPORT_VERSION = 1
 
-# Errors about the auth source itself: once one happens, every later cookied request in the batch would
-# fail the same way, so they are replayed without touching YouTube again.
-_PER_VIDEO_AUTH_STATES = frozenset({AuthState.NOT_MEMBER, AuthState.AUTH_REQUIRED})
+# Any other AuthError is about the auth source itself: once one happens, every later cookied request in the
+# batch would fail the same way, so it is replayed without touching YouTube again. AUTH_UNCERTAIN is one
+# video's refusal that the probe could not explain, so it says nothing about the next video.
+_PER_VIDEO_AUTH_STATES = frozenset({AuthState.NOT_MEMBER, AuthState.AUTH_REQUIRED, AuthState.AUTH_UNCERTAIN})
 
 _PERMANENT_FIXES: dict[Signal, str] = {
     Signal.UNAVAILABLE: "The video is unavailable or was removed; there is nothing to retry.",
@@ -97,10 +88,6 @@ _PERMANENT_FIXES: dict[Signal, str] = {
     Signal.AGE_GATE: "Age-restricted: the auth profile needs a signed-in, age-verified YouTube account.",
     Signal.PREMIUM_ONLY: "YouTube Premium only: the auth profile's account needs Premium.",
 }
-
-
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
 
 
 @dataclass(frozen=True)
@@ -113,125 +100,6 @@ class FetchOptions:
     cookie_channels: tuple[str, ...] = ()
     max_videos: int = 50
     ignore_cooldown: bool = False
-
-
-@dataclass(frozen=True)
-class Cooldown:
-    until: datetime
-    signal: str
-    hours: float
-
-
-def read_cooldown() -> Cooldown | None:
-    """Return the persisted cooldown, active or not; raise ValueError when the file exists but is unreadable."""
-    path = paths.cooldown_file()
-    try:
-        raw: object = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    if not isinstance(raw, dict):
-        raise ValueError("cooldown.json is not an object")
-    fields = cast("dict[str, object]", raw)
-    until_raw, signal, hours = fields.get("until"), fields.get("signal"), fields.get("hours", 1)
-    if not isinstance(until_raw, str) or not isinstance(signal, str):
-        raise ValueError("cooldown.json needs 'until' and 'signal' strings")
-    until = datetime.fromisoformat(until_raw)
-    if until.tzinfo is None:
-        until = until.replace(tzinfo=UTC)
-    duration = float(hours) if isinstance(hours, int | float) and not isinstance(hours, bool) and hours > 0 else 1.0
-    return Cooldown(until, signal, duration)
-
-
-def check_cooldown(now: datetime) -> None:
-    """Refuse to start while a cooldown is active; an unreadable cooldown file also refuses (fail loud)."""
-    try:
-        cooldown = read_cooldown()
-    except (OSError, ValueError) as exc:
-        raise YtverbatimError(
-            f"cooldown.json is unreadable ({exc}); inspect it with: ytverbatim auth doctor, or pass --ignore-cooldown"
-        ) from exc
-    if cooldown is not None and cooldown.until > now:
-        raise BatchStopError(_signal(cooldown.signal), cooldown.until)
-
-
-def start_cooldown(signal: Signal, now: datetime) -> datetime:
-    """Persist a cooldown of 1 h, doubled (up to 24 h) when the previous one ended less than 24 h ago."""
-    try:
-        previous = read_cooldown()
-    except (OSError, ValueError):
-        previous = None
-    hours = COOLDOWN_BASE / timedelta(hours=1)
-    until = now + COOLDOWN_BASE
-    if previous is not None and now < previous.until + COOLDOWN_REPEAT_WINDOW:
-        hours = min(previous.hours * 2, COOLDOWN_MAX / timedelta(hours=1))
-        until = max(now + timedelta(hours=hours), previous.until)
-    # `hours` rides along so the next repeat can double it; the doctor reads only `until` and `signal`.
-    atomic.write_json(
-        paths.cooldown_file(),
-        {"until": until.isoformat(timespec="seconds"), "signal": signal.value, "hours": hours},
-        mode=0o600,
-    )
-    return until
-
-
-def _signal(value: str) -> Signal:
-    try:
-        return Signal(value)
-    except ValueError:
-        return Signal.BOT_CHECK
-
-
-def stop_fix(signal: Signal, until: datetime | None) -> str:
-    shown = until.astimezone().strftime("%Y-%m-%d %H:%M") if until is not None else None
-    return fix_for(STOP_STATES.get(signal, AuthState.BOT_CHECK), until=shown)
-
-
-@dataclass(frozen=True)
-class _Seen:
-    label: str
-    ok: bool
-    primary: Signal | None
-    secondary: tuple[Signal, ...]
-    warnings: tuple[str, ...]
-
-
-class _GuardedRunner:
-    """Wraps the runner so that no caller can ignore a stop signal or leak `-v` stderr.
-
-    A stop signal becomes a cooldown plus `BatchStopError` right here, before any caller's except clause
-    could turn it into an escalation. Only classified signals and warnings are kept, never stderr.
-    """
-
-    def __init__(self, inner: YtDlpRunner, clock: Callable[[], datetime]) -> None:
-        self._inner = inner
-        self._clock = clock
-        self.seen: list[_Seen] = []
-
-    def run(self, args: Sequence[str], *, cookies: Path | None, timeout_s: float, label: str) -> YtDlpResult:
-        try:
-            result = self._inner.run(args, cookies=cookies, timeout_s=timeout_s, label=label)
-        except YtDlpError as exc:
-            self.seen.append(_Seen(label, False, exc.primary, exc.secondary, ()))
-            stops = exc.primary in STOP_STATES and not (exc.primary is Signal.HTTP_429 and label == _CAPTIONS_LABEL)
-            if exc.primary is not None and stops:
-                until = start_cooldown(exc.primary, self._clock())
-                raise BatchStopError(exc.primary, until) from None
-            if "-v" in args:
-                # `from None`: the original's message holds the debug lines, which echo argv.
-                raise _without_debug(exc) from None
-            raise
-        self.seen.append(_Seen(label, True, result.primary, result.secondary, result.warnings))
-        return result
-
-    def last(self, label: str) -> _Seen | None:
-        return next((seen for seen in reversed(self.seen) if seen.label == label), None)
-
-
-def _without_debug(exc: YtDlpError) -> YtDlpError:
-    # Only ERROR and WARNING lines survive: the preview is cut mid-line, so a debug fragment need not start
-    # with "[debug]".
-    kept = "\n".join(line for line in exc.preview.splitlines() if line.startswith(("ERROR:", "WARNING:")))
-    return YtDlpError(exc.primary, exc.secondary, kept, exc.returncode)
 
 
 class VideoStatus(StrEnum):
@@ -274,8 +142,8 @@ class BatchReport:
     videos: tuple[VideoOutcome, ...]
     stopped: BatchStopError | None = None
     capped: bool = False
-    started_at: datetime = field(default_factory=_utcnow)
-    finished_at: datetime = field(default_factory=_utcnow)
+    started_at: datetime = field(default_factory=utcnow)
+    finished_at: datetime = field(default_factory=utcnow)
 
     @property
     def exit_code(self) -> int:
@@ -353,7 +221,9 @@ class FetchSession:
     """Fetches videos one at a time under the auth policy.
 
     `fetch_video` records per-video failures in its outcome. It raises `BatchStopError`, and
-    `DependencyError` for a missing tool, because both would fail every later video too.
+    `DependencyError` for a missing tool, because both would fail every later video too. A stop signal on a
+    successful call lets that video finish; check `pending_stop` after each video, since the next
+    `fetch_video` raises it.
     """
 
     def __init__(
@@ -364,9 +234,9 @@ class FetchSession:
         out: Path,
         options: FetchOptions,
         sleep: Callable[[float], None] = time.sleep,
-        clock: Callable[[], datetime] = _utcnow,
+        clock: Callable[[], datetime] = utcnow,
     ) -> None:
-        self._runner = _GuardedRunner(runner, clock)
+        self._runner = GuardedRunner(runner, clock)
         self._source = source
         self._out = out
         self._options = options
@@ -374,7 +244,14 @@ class FetchSession:
         self._source_failure: AuthError | None = None
         self._ytdlp_version: str | None = None
 
+    def pending_stop(self) -> BatchStopError | None:
+        """Return the stop that arrived on a successful call: that video finished, but no later one may start."""
+        stop = self._runner.stop
+        return BatchStopError(stop.signal, stop.until) if stop is not None else None
+
     def fetch_video(self, video_id: str, *, cookies_first: bool = False) -> VideoOutcome:
+        if (stop := self.pending_stop()) is not None:
+            raise stop
         vdir = paths.video_dir(video_id, self._out)
         self._runner.seen.clear()
         try:
@@ -478,7 +355,11 @@ class FetchSession:
 
     def _login_verdict(self, cause: Signal) -> AuthError:
         """Tell "not a member" from "the login did not work" with one fresh `:ytfav` probe (A1)."""
-        report = preflight.preflight(self._source, self._runner, refresh=True)
+        report = preflight.preflight(
+            self._source, self._runner, refresh=True, ignore_cooldown=self._options.ignore_cooldown
+        )
+        if report.cooldown is not None:
+            raise BatchStopError(report.cooldown.signal, report.cooldown.until)
         if report.state is AuthState.OK:
             if cause is Signal.MEMBERS_ONLY:
                 return AuthError(AuthState.NOT_MEMBER, "YouTube accepted the login but refused this members video")
@@ -524,7 +405,7 @@ class FetchSession:
         )
 
     def _captions_completed(self) -> bool:
-        seen = self._runner.last(_CAPTIONS_LABEL)
+        seen = self._runner.last(CAPTIONS_LABEL)
         # No call at all means no wanted track exists, which is complete; a failed call (429) is not.
         return seen is None or seen.ok
 
@@ -599,7 +480,8 @@ def _auth_source_kind(source: CookieSource | None) -> AuthSourceKind:
         case CookieFileSource():
             return "cookie-file"
         case BrowserSource(browser=browser):
-            return _BROWSER_KINDS[browser]
+            # Access validates the literal, so an unsupported browser still fails loud.
+            return cast("AuthSourceKind", browser)
 
 
 def _clean_warnings(warnings: Iterable[str]) -> tuple[str, ...]:
@@ -769,7 +651,7 @@ def fetch(
     options: FetchOptions | None = None,
     runner_factory: Callable[[Sequence[str]], YtDlpRunner] = _default_runner,
     sleep: Callable[[float], None] = time.sleep,
-    clock: Callable[[], datetime] = _utcnow,
+    clock: Callable[[], datetime] = utcnow,
     on_video: Callable[[VideoOutcome], None] | None = None,
 ) -> BatchReport:
     """Fetch every video behind `targets` into `<out>/<id>/` and write `<out>/batch_report.json`.
@@ -785,7 +667,10 @@ def fetch(
     if options.policy == "always" and source is None:
         raise AuthError(AuthState.NO_SOURCE, "--policy always needs an auth source")
 
-    videos, capped = plan_videos(_GuardedRunner(runner_factory(()), clock), targets, source=source, options=options)
+    planner = GuardedRunner(runner_factory(()), clock)
+    videos, capped = plan_videos(planner, targets, source=source, options=options)
+    if planner.stop is not None:
+        raise BatchStopError(planner.stop.signal, planner.stop.until)
     session = FetchSession(
         runner_factory(sleep_args(len(videos))), source=source, out=out, options=options, sleep=sleep, clock=clock
     )
@@ -803,6 +688,8 @@ def fetch(
                 outcome = VideoOutcome(
                     planned.video_id, VideoStatus.ERROR, error=exc.signal.value, fix=stop_fix(exc.signal, exc.until)
                 )
+            else:
+                stopped = session.pending_stop()
             outcomes.append(outcome)
             if on_video is not None:
                 on_video(outcome)

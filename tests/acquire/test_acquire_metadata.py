@@ -100,11 +100,29 @@ def test_fetch_info_runs_one_extraction_and_saves_the_raw_json(fakes, tmp_path: 
     assert call.args[-1] == f"https://www.youtube.com/watch?v={VIDEO_ID}"
     assert (call.cookies, call.label) == (cookies, "metadata")
     saved = metadata.info_path(tmp_path / "stage")
-    assert saved.read_text(encoding="utf-8") == raw
+    assert json.loads(saved.read_text(encoding="utf-8")) == info_dict()
     assert stat.S_IMODE(saved.stat().st_mode) == 0o600
     assert metadata.load_metadata(tmp_path / "stage") == meta
     assert "--get-comments" not in call.args
     assert meta.creator_note is None
+
+
+def test_saved_info_json_drops_cookie_values(fakes, tmp_path: Path) -> None:
+    secret = "PREF=fake-cookie-value; Domain=.youtube.com"
+    info = {
+        **info_dict(),
+        "cookies": secret,
+        "formats": [{"format_id": "251", "cookies": secret}, {"format_id": "140"}],
+        "requested_formats": [{"format_id": "251", "cookies": secret}],
+    }
+    runner = fakes.runner(lambda _args, _label: fakes.ok(json.dumps(info)))
+    metadata.fetch_info(runner, VIDEO_ID, tmp_path, cookies=tmp_path / "cookies.txt")
+    text = metadata.info_path(tmp_path).read_text(encoding="utf-8")
+    assert "fake-cookie-value" not in text
+    saved = json.loads(text)
+    assert "cookies" not in saved
+    assert saved["formats"] == [{"format_id": "251"}, {"format_id": "140"}]
+    assert saved["title"] == info["title"]
 
 
 PINNED = {"is_pinned": True, "author_is_uploader": True, "text": "Correction: 12%.", "author": "@example"}

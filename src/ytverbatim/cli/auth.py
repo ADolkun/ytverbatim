@@ -35,14 +35,20 @@ def auth() -> None:
     """Configure and check the browser login used for members-only and Premium videos."""
 
 
+_IGNORE_COOLDOWN = click.option(
+    "--ignore-cooldown", is_flag=True, help="Probe YouTube even though a bot or rate-limit cooldown is active."
+)
+
+
 @auth.command()
 @click.option("--json", "as_json", is_flag=True, help="Print the report as one JSON object.")
 @click.option("--refresh", is_flag=True, help="Ignore the one-hour cache and probe YouTube again.")
-def status(*, as_json: bool, refresh: bool) -> None:
+@_IGNORE_COOLDOWN
+def status(*, as_json: bool, refresh: bool, ignore_cooldown: bool) -> None:
     """Show whether YouTube accepts the configured login (snapshot plus one :ytfav probe)."""
     try:
         source = resolve_source()
-        report = preflight(source, SubprocessRunner(), refresh=refresh)
+        report = preflight(source, SubprocessRunner(), refresh=refresh, ignore_cooldown=ignore_cooldown)
     except AuthError as exc:
         _fail_auth(exc)
     except YtverbatimError as exc:
@@ -61,6 +67,8 @@ def _print_report(report: AuthReport) -> None:
     else:
         click.echo(f"✗ {report.state.value}: {report.detail}" if report.detail else f"✗ {report.state.value}")
         click.echo(f"  Fix: {report.fix}")
+    if report.probe_skipped:
+        click.echo("  (--ignore-cooldown probes anyway, at the account's risk.)")
     profile = f" · profile {report.profile}" if report.profile else ""
     click.echo(f"  source: {report.source}{profile}")
     if report.counts:
@@ -72,10 +80,11 @@ def _print_report(report: AuthReport) -> None:
 
 
 @auth.command()
-def doctor() -> None:
+@_IGNORE_COOLDOWN
+def doctor(*, ignore_cooldown: bool) -> None:
     """Check every dependency of authenticated fetching, one line each with its fix."""
     try:
-        checks = run_doctor(SubprocessRunner())
+        checks = run_doctor(SubprocessRunner(), ignore_cooldown=ignore_cooldown)
     except YtverbatimError as exc:
         _fail_other(exc)
     for check in checks:

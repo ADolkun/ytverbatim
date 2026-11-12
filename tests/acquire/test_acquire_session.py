@@ -202,6 +202,86 @@ def test_http_429_on_metadata_or_audio_stops_but_on_captions_only_drops_them(ses
     assert not paths.cooldown_file().exists()
 
 
+def test_stop_signal_among_secondary_signals_never_escalates(session_kit) -> None:
+    yt = session_kit.yt()
+    yt.failures[("metadata", False)] = [session_kit.fail(Signal.MEMBERS_ONLY, Signal.BOT_CHECK)]
+    report = run(session_kit, yt, [MEMBERS, PUBLIC])
+    first, second = report.videos
+    assert report.exit_code == 3 and report.stopped is not None and report.stopped.signal is Signal.BOT_CHECK
+    assert first.error == "bot_check" and second.status is VideoStatus.NOT_ATTEMPTED
+    assert session_kit.snapshots.taken == [] and yt.labels("metadata", cookied=True) == []
+    assert json.loads(paths.cooldown_file().read_text())["signal"] == "bot_check"
+
+
+def test_a_429_among_secondary_signals_stops_except_on_captions(session_kit) -> None:
+    yt = session_kit.yt()
+    yt.failures[("metadata", False)] = [session_kit.fail(Signal.LOGIN_REQUIRED, Signal.HTTP_429)]
+    assert run(session_kit, yt, [MEMBERS]).exit_code == 3
+    assert session_kit.snapshots.taken == []
+
+    paths.cooldown_file().unlink()
+    yt = session_kit.yt()
+    yt.failures[("captions", False)] = [session_kit.fail(Signal.HTTP_429, Signal.CAPTCHA)]
+    assert run(session_kit, yt, [PUBLIC_2]).exit_code == 3
+
+
+def test_stop_signal_on_a_successful_call_finishes_the_video_then_stops(session_kit) -> None:
+    yt = session_kit.yt()
+    yt.secondary[("metadata", False)] = (Signal.RATE_LIMITED,)
+    yt.secondary[("audio", False)] = (Signal.BOT_CHECK,)
+    report = run(session_kit, yt, [PUBLIC, PUBLIC_2])
+    first, second = report.videos
+    assert first.status is VideoStatus.OK and first.audio_s is not None
+    assert second.status is VideoStatus.NOT_ATTEMPTED
+    assert report.exit_code == 3 and report.stopped is not None and report.stopped.signal is Signal.RATE_LIMITED
+    assert [c.video_id for c in yt.labels("metadata")] == [PUBLIC]
+    cooldown = json.loads(paths.cooldown_file().read_text())
+    assert cooldown["signal"] == "rate_limited" and cooldown["hours"] == 1
+    assert json.loads((session_kit.out / "batch_report.json").read_text())["stopped"]["signal"] == "rate_limited"
+
+
+def test_a_429_on_a_successful_captions_call_does_not_stop(session_kit) -> None:
+    yt = session_kit.yt()
+    yt.secondary[("captions", False)] = (Signal.HTTP_429,)
+    report = run(session_kit, yt, [PUBLIC, PUBLIC_2])
+    assert report.exit_code == 0 and report.stopped is None
+    assert not paths.cooldown_file().exists()
+
+
+def test_stop_signal_while_expanding_stops_before_any_video(session_kit) -> None:
+    yt = session_kit.yt()
+    yt.playlist = [PUBLIC]
+    yt.secondary[("expand", False)] = (Signal.BOT_CHECK,)
+    with pytest.raises(BatchStopError):
+        run(session_kit, yt, ["https://www.youtube.com/playlist?list=PLsynthetic"])
+    assert yt.labels("metadata") == []
+    assert paths.cooldown_file().exists()
+
+
+def test_stop_signal_on_the_login_probe_stops_the_batch(session_kit) -> None:
+    yt = session_kit.yt()
+    yt.failures[("metadata", False)] = [session_kit.fail(Signal.MEMBERS_ONLY)]
+    yt.failures[("metadata", True)] = [session_kit.fail(Signal.MEMBERS_ONLY)]
+    yt.failures[("auth-probe", True)] = [session_kit.fail(Signal.BOT_CHECK)]
+    report = run(session_kit, yt, [MEMBERS, PUBLIC])
+    assert report.exit_code == 3 and report.videos[1].status is VideoStatus.NOT_ATTEMPTED
+    assert json.loads(paths.cooldown_file().read_text())["hours"] == 1
+
+
+def test_auth_uncertain_is_one_videos_failure_not_the_sources(session_kit) -> None:
+    yt = session_kit.yt()
+    yt.availability["memVideo002"] = "subscriber_only"
+    yt.failures[("metadata", False)] = [session_kit.fail(Signal.MEMBERS_ONLY) for _ in range(2)]
+    yt.failures[("metadata", True)] = [session_kit.fail(Signal.MEMBERS_ONLY)]
+    yt.failures[("auth-probe", True)] = [session_kit.fail(None)]
+    report = run(session_kit, yt, [MEMBERS, "memVideo002"])
+    first, second = report.videos
+    assert first.error == AuthState.AUTH_UNCERTAIN.value
+    assert second.status is VideoStatus.OK, second
+    assert second.access is not None and second.access.member is True
+    assert len(yt.labels("metadata", cookied=True)) == 2
+
+
 def test_cooldown_refuses_to_start_unless_ignored(session_kit) -> None:
     session.start_cooldown(Signal.RATE_LIMITED, NOW)
     yt = session_kit.yt()
@@ -218,11 +298,11 @@ def test_cooldown_doubles_on_repeats_and_is_capped(session_kit) -> None:
     now = NOW
     durations: list[float] = []
     for _ in range(7):
-        until = session.start_cooldown(Signal.BOT_CHECK, now)
+        until = session.start_cooldown(Signal.BOT_CHECK, now).until
         durations.append((until - now) / timedelta(hours=1))
         now = until + timedelta(minutes=5)
     assert durations == [1, 2, 4, 8, 16, 24, 24]
-    reset = session.start_cooldown(Signal.BOT_CHECK, now + timedelta(hours=25))
+    reset = session.start_cooldown(Signal.BOT_CHECK, now + timedelta(hours=25)).until
     assert reset - (now + timedelta(hours=25)) == timedelta(hours=1)
     assert set(json.loads(paths.cooldown_file().read_text())) >= {"until", "signal"}
 
