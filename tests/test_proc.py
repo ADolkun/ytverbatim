@@ -298,14 +298,14 @@ def test_background_kills_the_whole_group_on_a_normal_exit(script: Path, tmp_pat
         leader, helper = _pids(pid_file)
         assert server.pid == leader
         assert server.alive()
-        _until(lambda: server.peak_footprint_bytes is not None)
+        # The first sample can land right after exec, before the interpreter has grown past a few hundred KB.
+        _until(lambda: (server.peak_footprint_bytes or 0) > MIB)
     # The helper ignores SIGTERM, so it is gone only because SIGKILL follows the leader's clean exit.
     assert _all_gone(leader, helper)
     assert not server.alive()
     assert server.returncode == -15
     assert log.read_text(encoding="utf-8").splitlines() == ["listening", "warming up"]
-    assert server.peak_footprint_bytes is not None
-    assert server.peak_footprint_bytes > MIB
+    assert (server.peak_footprint_bytes or 0) > MIB
 
 
 def test_background_kills_the_whole_group_when_the_block_raises(script: Path, tmp_path: Path) -> None:
