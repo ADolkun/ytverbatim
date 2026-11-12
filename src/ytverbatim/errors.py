@@ -81,6 +81,10 @@ class BusyError(YtverbatimError):
     pass
 
 
+class ContractError(YtverbatimError):
+    """A `context.json` that cannot be read: bad JSON, an unsupported version, or a contract violation."""
+
+
 def stderr_preview(text: str, *, head: int = 800, tail: int = 800) -> str:
     """Head and tail of long output; yt-dlp prints the cause at the top and the exit detail at the bottom."""
     text = text.strip()
