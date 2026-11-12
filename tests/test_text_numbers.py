@@ -1,3 +1,6 @@
+import random
+from itertools import product
+
 import pytest
 
 from ytverbatim.text.numbers import itn, quantity_tokens
@@ -120,6 +123,59 @@ def test_itn_rewrites_tokens_only() -> None:
 def test_stacked_magnitudes_are_one_multiplier(text: str, value: str) -> None:
     (token,) = quantity_tokens(text)
     assert (token.surface, token.value_itn) == (text, value)
+
+
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [
+        ("一亿五", "150000000"),
+        ("三亿二", "320000000"),
+        ("十一亿三", "1130000000"),
+        ("五百亿一", "50010000000"),
+        ("十亿五", "1050000000"),
+        ("两万亿五", "2500000000000"),
+        ("一万亿五", "1500000000000"),
+        ("三亿五美元", "$350000000"),
+        ("三亿零五", "300000005"),
+        ("一亿二千万", "120000000"),
+        ("一万五", "15000"),
+        ("十万五", "105000"),
+        ("一百十五", "115"),
+        ("一千十", "1010"),
+        ("两百十", "210"),
+        ("十三万六", "136000"),
+        ("一百二十五万三", "1253000"),
+        ("十五", "15"),
+        ("二十五万三", "253000"),
+        ("一点五亿", "150000000"),
+        ("十点五万亿", "10500000000000"),
+    ],
+)
+def test_chinese_shorthand_and_compound_numerals(text: str, value: str) -> None:
+    (token,) = quantity_tokens(text)
+    assert (token.surface, token.value_itn) == (text, value)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["七十六十五", "十六十四", "六十六十六", "七百九十九十七", "一万十五", "零十五", "亿三", "一亿亿五", "三亿二亿"],
+)
+def test_runs_that_are_not_one_number_keep_their_surface(text: str) -> None:
+    (token,) = quantity_tokens(text)
+    assert (token.surface, token.value_itn) == (text, text)
+    assert itn(f"约{text}左右") == f"约{text}左右"
+
+
+_NUMERAL_ALPHABET = "零一二两三四五六七八九十百千万亿点"
+
+
+def test_quantity_tokens_never_raise_on_numeral_runs() -> None:
+    exhaustive = ("".join(chars) for length in range(1, 4) for chars in product(_NUMERAL_ALPHABET, repeat=length))
+    rng = random.Random(20260101)
+    sampled = ("".join(rng.choices(_NUMERAL_ALPHABET, k=rng.randint(4, 8))) for _ in range(5000))
+    for text in (*exhaustive, *sampled):
+        quantity_tokens(text)
+        itn(text)
 
 
 @pytest.mark.parametrize("text", ["两三个", "三五个", "一一对应", "五五开", "三三两两", "四五十个", "三四百", "九七年"])
