@@ -10,6 +10,7 @@ from ytverbatim.asr import worker
 from ytverbatim.asr.chunks import Chunk, Region
 from ytverbatim.asr.models import (
     ERROR_FILE,
+    FINGERPRINT_FILE,
     HYPOTHESES_FILE,
     METRICS_FILE,
     ChunkHypothesis,
@@ -132,12 +133,79 @@ def test_resume_refuses_another_hypothesis_and_corrupt_lines(tmp_path: Path, wav
     job = FileJob(id="f1", wav=str(wav), chunks=(Chunk(0.0, 2.0),))
     worker.run_request(request(tmp_path, job))
     path = tmp_path / "out" / HYPOTHESES_FILE
-    other = EngineDef(_renamed(definition().spec), "fake_engine.create", {})
-    with pytest.raises(EngineError, match="not 'other'"):
+    other = EngineDef(_renamed(definition().spec), "fake_engine.create", {"language": "pass"})
+    with pytest.raises(EngineError, match=r"different request \(engine changed\)"):
         worker.run_request(request(tmp_path, job, engine=other))
     path.write_text("{not json}\n", encoding="utf-8")
     with pytest.raises(EngineError, match="line 1 is corrupt"):
         worker.run_request(request(tmp_path, job))
+
+
+@pytest.mark.parametrize(
+    ("change", "field"),
+    [
+        ({"engine": definition(calls_log="elsewhere")}, "engine"),
+        ({"quality_guard": False}, "quality_guard"),
+        ({"language": "zh"}, "files"),
+        ({"context": AsrContext(system_prompt="other")}, "files"),
+    ],
+)
+def test_resume_refuses_a_request_that_differs_beyond_the_output_location(
+    tmp_path: Path, wav: Path, change: dict[str, object], field: str
+) -> None:
+    job = FileJob(id="f1", wav=str(wav), language="en", chunks=(Chunk(0.0, 2.0),))
+    worker.run_request(request(tmp_path, job))
+    before = (tmp_path / "out" / HYPOTHESES_FILE).read_bytes()
+    job_change = {k: v for k, v in change.items() if k in ("language", "context")}
+    changed = WorkerRequest(
+        engine=change.get("engine", definition()),  # type: ignore[arg-type]
+        out_dir=str(tmp_path / "out"),
+        files=(job.model_copy(update=job_change),),
+        quality_guard=change.get("quality_guard", True),  # type: ignore[arg-type]
+    )
+    with pytest.raises(EngineError, match=rf"\({field} changed\).*fresh output directory"):
+        worker.run_request(changed)
+    assert (tmp_path / "out" / HYPOTHESES_FILE).read_bytes() == before
+
+
+def test_resume_ignores_where_the_weights_are_cached(tmp_path: Path, wav: Path) -> None:
+    job = FileJob(id="f1", wav=str(wav), chunks=(Chunk(0.0, 2.0),))
+    worker.run_request(request(tmp_path, job))
+    moved = request(tmp_path, job).model_copy(update={"hf_hub_cache": "/example/hub"})
+    assert worker.run_request(moved).chunks_skipped == 1
+    stored = json.loads((tmp_path / "out" / FINGERPRINT_FILE).read_text(encoding="utf-8"))
+    assert "out_dir" not in stored
+    assert "hf_hub_cache" not in stored
+
+
+def test_hypotheses_without_a_fingerprint_are_not_resumed(tmp_path: Path, wav: Path) -> None:
+    job = FileJob(id="f1", wav=str(wav), chunks=(Chunk(0.0, 2.0),))
+    worker.run_request(request(tmp_path, job))
+    (tmp_path / "out" / FINGERPRINT_FILE).unlink()
+    with pytest.raises(EngineError, match=r"no fingerprint\.json"):
+        worker.run_request(request(tmp_path, job))
+
+
+@pytest.mark.parametrize(("policy", "heard"), [("pass", "zh+en"), ("auto", "auto")])
+def test_the_language_policy_decides_what_the_engine_hears(tmp_path: Path, wav: Path, policy: str, heard: str) -> None:
+    job = FileJob(id="f1", wav=str(wav), language="zh+en", chunks=(Chunk(0.0, 1.0),))
+    seen: list[str | None] = []
+
+    def guard(engine: Engine, chunk: ChunkInput, raw: RawChunk) -> GuardedChunk:
+        seen.append(chunk.language)
+        return GuardedChunk(raw)
+
+    worker.run_request(request(tmp_path, job, engine=definition(language=policy)), guard=guard)
+    assert rows(tmp_path)[0].text.startswith(f"{heard}:")
+    assert seen == [None if policy == "auto" else "zh+en"]
+
+
+@pytest.mark.parametrize("policy", [None, "detect", True])
+def test_a_request_without_a_valid_language_policy_is_refused(tmp_path: Path, wav: Path, policy: object) -> None:
+    spec = definition().spec
+    variant = {} if policy is None else {"language": policy}
+    with pytest.raises(ValidationError, match="'auto' or 'pass'"):
+        request(tmp_path, FileJob(id="f1", wav=str(wav)), engine=EngineDef(spec, "fake_engine.create", variant))  # type: ignore[arg-type]
 
 
 def _renamed(spec: EngineSpec) -> EngineSpec:

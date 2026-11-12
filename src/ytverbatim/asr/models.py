@@ -1,6 +1,6 @@
 from typing import Annotated, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from ytverbatim.asr.chunks import Chunk
 from ytverbatim.asr.protocol import AsrContext, ChunkFlag, EngineDef
@@ -10,6 +10,7 @@ HYPOTHESES_FILE = "hypotheses.jsonl"
 METRICS_FILE = "metrics.json"
 ERROR_FILE = "error.json"
 REQUEST_FILE = "request.json"
+FINGERPRINT_FILE = "fingerprint.json"
 
 Seconds = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 
@@ -56,7 +57,11 @@ class RunMetrics(_Model):
 
 
 class FileJob(_Model):
-    """One WAV to transcribe. Without `chunks` the worker plans them with the VAD."""
+    """One WAV to transcribe. Without `chunks` the worker plans them with the VAD.
+
+    `language` is the metadata language, as production would pass it; the engine's language policy decides whether
+    the engine sees it.
+    """
 
     id: str
     wav: str
@@ -80,7 +85,12 @@ class WorkerRequest(_Model):
             raise ValueError("file ids must be unique within a request")
         if self.engine.spec.max_chunk_s is None and any(job.chunks is not None for job in self.files):
             raise ValueError(f"{self.engine.spec.id} decodes whole files and cannot take a chunk plan")
+        self.engine.language_policy()
         return self
+
+    def fingerprint(self) -> dict[str, JsonValue]:
+        """Everything that decides the decoded text; where the output and the weights live does not."""
+        return self.model_dump(mode="json", exclude={"out_dir", "hf_hub_cache"})
 
 
 class WorkerError(_Model):

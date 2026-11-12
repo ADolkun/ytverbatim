@@ -8,6 +8,7 @@ inconsistently, so every separator is dropped before matching.
 
 import re
 import unicodedata
+import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -15,6 +16,8 @@ from typing import Literal
 from ytverbatim.contract.models import Word
 
 DEFAULT_MAX_GAP_S = 30.0
+# Whisper's own fallback threshold: text that zlib shrinks this much is a loop, not speech.
+COMPRESSION_RATIO_THRESHOLD = 2.4
 NONLEXICAL_DENSE_MIN_RECORDS = 10
 NONLEXICAL_DENSE_MIN_SECONDS = 5.0
 
@@ -64,6 +67,12 @@ class NonlexicalRun:
 
 def has_lexical_content(text: str) -> bool:
     return any(character.isalnum() for character in text)
+
+
+def compression_ratio(text: str) -> float:
+    """UTF-8 bytes over zlib-compressed bytes, exactly as Whisper computes it."""
+    data = text.encode("utf-8")
+    return len(data) / len(zlib.compress(data))
 
 
 def is_cjk_text(text: str) -> bool:

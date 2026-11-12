@@ -1,3 +1,4 @@
+import contextlib
 import fcntl
 import logging
 import os
@@ -5,6 +6,7 @@ import stat
 import subprocess
 import sys
 import threading
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
@@ -62,6 +64,39 @@ def test_the_error_report_travels_to_the_parent(tmp_path: Path) -> None:
     with pytest.raises(EngineError, match=r"fake worker failed \(EngineError\):.*f1 chunk 1.*fake decoder exploded"):
         runner.run_worker(request)
     assert (tmp_path / "out" / ERROR_FILE).is_file()
+
+
+def test_a_stale_error_report_is_not_blamed_on_the_next_worker(tmp_path: Path) -> None:
+    stale = tmp_path / "out" / ERROR_FILE
+    stale.parent.mkdir()
+    stale.write_text('{"type": "OldError", "message": "from an earlier run", "traceback": ""}', encoding="utf-8")
+    stub = tmp_path / "stub.sh"
+    stub.write_text("#!/bin/sh\necho oom killed >&2\nexit 3\n", encoding="utf-8")
+    stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+    with pytest.raises(EngineError, match="left no error report") as caught:
+        runner.run_worker(make_request(tmp_path), python=str(stub))
+    assert "earlier run" not in str(caught.value)
+
+
+def test_the_request_is_written_only_once_the_lock_is_held(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    request = make_request(tmp_path)
+    request_path = tmp_path / "out" / REQUEST_FILE
+    seen: list[bool] = []
+
+    @contextlib.contextmanager
+    def spy_lock() -> Generator[None, None, None]:
+        seen.append(request_path.exists())
+        yield
+
+    def fake_run(argv: list[str], *, timeout_s: float) -> proc.ProcResult:
+        seen.append(request_path.exists())
+        return proc.ProcResult(1, "", "", 0.0)
+
+    monkeypatch.setattr(runner, "worker_lock", spy_lock)
+    monkeypatch.setattr(runner.proc, "run", fake_run)
+    with pytest.raises(EngineError):
+        runner.run_worker(request)
+    assert seen == [False, True]
 
 
 def test_a_worker_that_dies_without_a_report_still_raises(tmp_path: Path) -> None:

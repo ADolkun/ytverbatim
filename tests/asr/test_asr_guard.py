@@ -1,4 +1,5 @@
 import json
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -12,9 +13,12 @@ from ytverbatim.asr.chunks import Chunk
 from ytverbatim.asr.guard import MIN_REDECODE_S, QualityGuard, Trigger, triggers
 from ytverbatim.asr.models import HYPOTHESES_FILE, ChunkHypothesis, FileJob, WorkerRequest
 from ytverbatim.asr.protocol import AsrContext, ChunkInput, EngineDef, EngineSpec, RawChunk
+from ytverbatim.asr.quality import COMPRESSION_RATIO_THRESHOLD, compression_ratio
 from ytverbatim.contract.models import Word
 
 DURATION = 10.0
+# Compresses past Whisper's 2.4 when repeated four times, yet is too few repeats for the repetition detectors.
+PHRASE = "the market rallied on strong earnings, "
 
 
 def tone(seconds: float, *, quiet: tuple[float, float] | None = None) -> NDArray[np.float32]:
@@ -42,23 +46,52 @@ def collapsed(count: int = 12) -> tuple[Word, ...]:
         (RawChunk("fine", generated_tokens=64, max_tokens=64), DURATION, ("token_cap",)),
         (RawChunk("fine", generated_tokens=64), DURATION, ()),
         (RawChunk("fine", max_tokens=64), DURATION, ()),
-        (RawChunk(LOOP_TEXT), DURATION, ("repetition_loop",)),
-        (RawChunk("风险限制" * 8), DURATION, ("repetition_loop",)),
-        (RawChunk("。。。"), DURATION, ("nonlexical_output",)),
-        (RawChunk(""), DURATION, ("nonlexical_output",)),
+        (RawChunk(LOOP_TEXT), DURATION, ("repetition_loop", "compression_ratio")),
+        (RawChunk("风险限制" * 8), DURATION, ("repetition_loop", "compression_ratio")),
+        (RawChunk(PHRASE * 4), DURATION, ("compression_ratio",)),
+        (RawChunk("收益率曲线倒挂意味着衰退风险" * 4), DURATION, ("compression_ratio",)),
+        (RawChunk("。。。"), DURATION, ("empty_output",)),
+        (RawChunk(""), DURATION, ("empty_output",)),
         (RawChunk("。。。"), MIN_REDECODE_S - 0.1, ()),
+        (RawChunk(""), MIN_REDECODE_S - 0.1, ()),
         (RawChunk("fine", words=collapsed()), DURATION, ("word_timing_collapse",)),
         (RawChunk("fine", words=collapsed(9)), DURATION, ()),
         (RawChunk("damaged � text"), DURATION, ("replacement_character",)),
         (
             RawChunk(LOOP_TEXT, generated_tokens=64, max_tokens=64, words=collapsed()),
             DURATION,
-            ("token_cap", "repetition_loop", "word_timing_collapse"),
+            ("token_cap", "repetition_loop", "compression_ratio", "word_timing_collapse"),
         ),
     ],
 )
 def test_trigger_matrix(raw: RawChunk, duration: float, expected: tuple[Trigger, ...]) -> None:
     assert triggers(raw, duration=duration) == expected
+
+
+def test_compression_ratio_matches_whisper() -> None:
+    text = "风险限制" * 8
+    data = text.encode("utf-8")
+    assert compression_ratio(text) == len(data) / len(zlib.compress(data))
+
+
+def spoken(texts: list[str], *, seconds_each: float) -> tuple[Word, ...]:
+    return tuple(Word(text=text, start=i * seconds_each, end=(i + 1) * seconds_each) for i, text in enumerate(texts))
+
+
+def test_a_long_decode_is_measured_per_thirty_second_window_of_its_words() -> None:
+    # Ten distinct 12 s sentences: each window compresses poorly, though the whole text repeats enough to cross 2.4.
+    sentences = [f"{PHRASE.strip()} number {i} " for i in range(10)]
+    whole = RawChunk("".join(sentences) * 3, words=spoken(sentences * 3, seconds_each=12.0))
+    assert compression_ratio(whole.text) > COMPRESSION_RATIO_THRESHOLD
+    assert "compression_ratio" not in triggers(whole, duration=360.0)
+    looped = (*sentences, *[PHRASE] * 8, *sentences)
+    assert "compression_ratio" in triggers(
+        RawChunk("".join(looped), words=spoken(list(looped), seconds_each=3.0)), duration=3.0 * len(looped)
+    )
+
+
+def test_a_long_decode_without_word_times_is_not_measured_whole() -> None:
+    assert "compression_ratio" not in triggers(RawChunk(PHRASE * 40), duration=360.0)
 
 
 def test_dense_punctuation_words_trigger_even_when_the_text_has_letters() -> None:
@@ -162,6 +195,34 @@ def test_the_attempt_with_fewer_failures_is_kept() -> None:
     assert guarded.raw.text.endswith("a sound decode")
 
 
+def test_empty_output_is_decoded_again_and_flagged_apart_from_decoder_failures() -> None:
+    engine = ScriptedEngine([RawChunk("")])
+    guarded = QualityGuard()(engine, chunk_input(tone(DURATION)), RawChunk(""))
+    assert len(engine.heard) == 2
+    assert guarded.flags == ("redecoded", "empty_output")
+    rescued = QualityGuard()(ScriptedEngine([sound("left"), sound("right")]), chunk_input(tone(DURATION)), RawChunk(""))
+    assert (rescued.raw.text, rescued.flags) == ("left right", ("redecoded",))
+
+
+def test_a_short_empty_chunk_is_left_alone() -> None:
+    engine = ScriptedEngine([sound()])
+    guarded = QualityGuard()(engine, chunk_input(tone(MIN_REDECODE_S - 0.1)), RawChunk(""))
+    assert (engine.heard, guarded.flags) == ([], ())
+
+
+def test_without_redecode_a_failed_decode_is_only_flagged() -> None:
+    engine = ScriptedEngine([sound()])
+    raw = looping()
+    guarded = QualityGuard(redecode=False)(engine, chunk_input(tone(DURATION)), raw)
+    assert engine.heard == []
+    assert guarded.raw is raw
+    assert guarded.flags == ("decoder_anomaly", "token_cap_hit")
+    empty = QualityGuard(redecode=False)(engine, chunk_input(tone(DURATION)), RawChunk(""))
+    assert (engine.heard, empty.flags) == ([], ("empty_output",))
+    sound_decode = sound()
+    assert QualityGuard(redecode=False)(engine, chunk_input(tone(DURATION)), sound_decode).raw is sound_decode
+
+
 def test_text_beats_silence_when_both_attempts_fail() -> None:
     original = looping()
     guarded = QualityGuard()(ScriptedEngine([RawChunk(""), RawChunk("")]), chunk_input(tone(DURATION)), original)
@@ -184,7 +245,7 @@ def test_a_chunk_too_short_to_split_is_flagged_without_decoding_again() -> None:
 
 def request(tmp_path: Path, wav: Path, *, always: bool = False, guard: bool = True) -> WorkerRequest:
     spec = EngineSpec("scripted", "fake", "example/fake", "0" * 40, 30.0, False, False, False, RATE)
-    definition = EngineDef(spec, "scripted_engine.create", {"always": always})
+    definition = EngineDef(spec, "scripted_engine.create", {"always": always, "language": "pass"})
     job = FileJob(id="f1", wav=str(wav), language="en", chunks=(Chunk(0.0, 6.0), Chunk(7.0, 9.0)))
     return WorkerRequest(engine=definition, out_dir=str(tmp_path / "out"), files=(job,), quality_guard=guard)
 
@@ -217,6 +278,19 @@ def test_run_request_flags_a_chunk_that_keeps_looping(tmp_path: Path, wav: Path)
     assert [r.flags for r in rows(tmp_path)] == [("token_cap_hit", "redecoded", "decoder_anomaly")] * 2
     # Per chunk: the first decode plus one re-decode of two halves, however badly the halves fare.
     assert len(engine.heard) == 2 * (1 + 2)
+
+
+def test_main_only_flags_a_whole_file_hypothesis_so_the_control_stays_production(tmp_path: Path, wav: Path) -> None:
+    spec = EngineSpec("scripted-whole", "fake", "example/fake", "0" * 40, None, False, False, False, RATE)
+    definition = EngineDef(spec, "scripted_engine.create", {"always": False, "language": "pass"})
+    req = WorkerRequest(engine=definition, out_dir=str(tmp_path / "out"), files=(FileJob(id="f1", wav=str(wav)),))
+    path = tmp_path / "request.json"
+    path.write_text(req.model_dump_json(), encoding="utf-8")
+    assert worker.main([str(path)]) == 0
+    (only,) = rows(tmp_path)
+    assert only.text == LOOP_TEXT
+    assert only.flags == ("token_cap_hit", "decoder_anomaly")
+    assert worker.default_guard(req) is not None
 
 
 def test_main_guards_by_default_and_the_request_can_opt_out(tmp_path: Path, wav: Path) -> None:
