@@ -20,7 +20,20 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio :: Speech",
     "Typing :: Typed",
 ]
-dependencies = ["click>=8.1"]
+dependencies = [
+    "click>=8.1",
+    "cn2an>=0.5.24",
+    "opencc>=1.4.2",
+    "pydantic>=2.14",
+    "rapidfuzz>=3.14",
+    "yt-dlp[default]>=2026.10.26",
+]
+
+[project.optional-dependencies]
+# Exact pins: mlx-audio ships often and engine behaviour changes between releases; bump with a live engine smoke.
+asr = ["mlx-audio[stt]==0.6.5"]
+# The Whisper control engine; it pulls in torch, so it stays out of the core and the asr extra.
+whisper = ["mlx-whisper==0.4.3"]
 
 [project.urls]
 Homepage = "https://github.com/ADolkun/ytverbatim"
@@ -39,6 +52,15 @@ dev = [
     "pytest",
     "ruff",
 ]
+eval = [
+    "jiwer>=4.0",
+    "whisper-normalizer>=1.0.1",
+]
+
+[tool.uv]
+default-groups = ["dev", "eval"]
+# MLX only runs on Apple Silicon macOS.
+environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
 
 [tool.ruff]
 line-length = 120
