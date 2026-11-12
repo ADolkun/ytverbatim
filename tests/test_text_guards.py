@@ -173,6 +173,18 @@ def test_near_acronym_fix_is_accepted_and_reported(original: str, fixed: str, be
     assert fixed[change.char_start : change.char_end] == after
 
 
+@pytest.mark.parametrize(
+    ("original", "fixed"),
+    [
+        ("按照SAP准则计算", "按照GAAP准则计算"),
+        ("the GDP print", "the GAAP print"),
+        ("AI chips", "EV chips"),
+    ],
+)
+def test_acronym_changes_beyond_one_edit_are_rejected(original: str, fixed: str) -> None:
+    assert rejected_by(original, fixed) is not None
+
+
 def test_unchanged_symbols_report_no_change() -> None:
     assert check_fix("NVDA 适应率 2024", "NVDA 市盈率 2024").entity_changes == ()
 
