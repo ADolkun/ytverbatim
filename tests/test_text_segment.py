@@ -394,6 +394,27 @@ def test_a_word_is_not_matched_across_a_space_between_latin_characters() -> None
     assert timing(tokens) == [("SO", False), (" XX", False), (" rose", True)]
 
 
+@pytest.mark.parametrize(
+    ("language", "text", "parts", "spaced"),
+    [
+        ("en", "AT & T", [" AT&T"], "AT & T"),
+        ("en", "S & P", [" S&P"], "S & P"),
+        ("zh", "标S & P数", ["标", "S&P", "数"], "S & P"),
+        ("en", "the U. S.", [" the", " U.S."], "U. S."),
+        ("en", "a 50 / 50", [" a", " 50/50"], "50 / 50"),
+        ("en", "at 10 : 30", [" at", " 10:30"], "10 : 30"),
+        ("zh", "成1, 500手", ["成", "1,500", "手"], "1, 500"),
+    ],
+)
+def test_a_word_with_punctuation_between_its_runs_matches_spaced_text(
+    language: str, text: str, parts: list[str], spaced: str
+) -> None:
+    tokens, complete = align(text, parts, language)
+    assert complete
+    assert all(token.timed for token in tokens)
+    assert spaced in [token.text.strip() for token in tokens]
+
+
 def test_a_word_that_reaches_into_the_next_text_run_leaves_both_runs_untimed() -> None:
     tokens, complete = align("买XLP QQQ吧", ["买", "XL", "PQ", "QQ", "吧"], "zh")
     assert not complete
