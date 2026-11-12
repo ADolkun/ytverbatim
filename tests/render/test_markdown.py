@@ -216,6 +216,11 @@ def test_escaping_is_minimal_and_leaves_cjk_tickers_and_numbers_alone(make_doc, 
     assert expected in body
 
 
+def test_tildes_cannot_strike_text_through(make_doc, seg) -> None:
+    body = render_markdown(make_doc([seg("涨幅~~3%~~ and ~5~ points", 0.0, 1.0)]))
+    assert "涨幅\\~\\~3%\\~\\~ and \\~5\\~ points" in body
+
+
 def test_newlines_in_text_do_not_start_block_syntax(make_doc, seg, flag) -> None:
     text = "intro\n# not a heading\n- not a list"
     f = flag("low_confidence", text, "heading")
