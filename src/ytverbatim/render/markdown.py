@@ -166,5 +166,10 @@ def _before_text(segment: Segment, flag: Flag) -> str | None:
     if stage is None:
         return None
     span = segment.text[flag.char_start : flag.char_end]
-    matches = [edit.before for edit in segment.edits if edit.stage == stage and edit.after == span and edit.before]
+    # Edits carry no offsets, and a changed run can be narrower than the flagged span (十五→五十 inside 五十个百分点),
+    # so an edit whose text lies inside the span, or contains it, counts; an exact match wins over a partial one.
+    edits = [edit for edit in segment.edits if edit.stage == stage and edit.before]
+    exact = [edit.before for edit in edits if edit.after == span]
+    overlapping = [edit.before for edit in edits if edit.after and (edit.after in span or span in edit.after)]
+    matches = exact or overlapping
     return matches[-1] if matches else None

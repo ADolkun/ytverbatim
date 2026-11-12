@@ -64,6 +64,7 @@ MERGE_GAP_S = 3.0
 _MIN_ANCHOR_RATIO = 0.4
 _MIN_ANCHOR_UNITS = 4
 _MAX_OUTPUT_TOKENS = 4096
+_MAX_REASON_CHARS = 200
 _MARK_OPEN, _MARK_CLOSE = "⟦", "⟧"
 NO_LLM_NOTE = "independent readings disagree and no LLM was configured to choose among them; re-verify"
 
@@ -689,7 +690,7 @@ def _verdicts(
 def _resolve(span: _Span, verdict: _Verdict | None, *, malformed: bool) -> _Decision:
     if verdict is None:
         return _Decision(None, "LLM reply malformed; re-verify" if malformed else "LLM gave no verdict; re-verify")
-    reason = verdict.reason.strip()[:200]
+    reason = _clip(verdict.reason.strip(), _MAX_REASON_CHARS)
     if verdict.value is None or verdict.confidence != "high":
         return _Decision(None, reason or "LLM could not tell the readings apart")
     chosen = _match_option(verdict.value, span.options())
@@ -705,6 +706,21 @@ def _resolve(span: _Span, verdict: _Verdict | None, *, malformed: bool) -> _Deci
     if _magnitude_only(mine, chosen.token):
         return _Decision(None, f"LLM chose {chosen.surface!r}, which differs only in magnitude; re-verify")
     return _Decision(_restyle(mine, chosen.token.value_itn) or chosen.surface, reason)
+
+
+def _clip(text: str, limit: int) -> str:
+    """Cut `text` to about `limit` characters at a word boundary (anywhere between CJK characters), marking the cut."""
+    if len(text) <= limit:
+        return text
+    cut = limit
+    if _is_word_char(text[cut - 1]) and _is_word_char(text[cut]):
+        space = text.rfind(" ", 0, cut)
+        cut = space if space > 0 else cut
+    return text[:cut].rstrip() + "…"
+
+
+def _is_word_char(char: str) -> bool:
+    return char.isalnum() and not _CJK.match(char)
 
 
 def _match_option(proposed: str, options: list[_Option]) -> _Option | None:
