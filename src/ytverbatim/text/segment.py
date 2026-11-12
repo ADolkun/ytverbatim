@@ -44,8 +44,8 @@ _CJK_CHAR = re.compile(f"[{_CJK}]")
 _ZH_PSEUDO_TOKEN = re.compile(f"\\s*(?:[{_CJK}]|[0-9A-Za-z]+(?:[.,'’][0-9A-Za-z]+)*|\\S)")
 _EN_PSEUDO_TOKEN = re.compile(r"\s*\S+")
 _COMMAS = ",，、"
-# What word alignment compares: a CJK character, or a run of other letters and digits.
-_ALIGN_UNITS = re.compile(f"[{_CJK}]|[^\\W_{_CJK}]+")
+# What word alignment compares: a CJK character, or a run of other letters and digits (a "run").
+_ALIGN_RUNS = re.compile(f"[{_CJK}]|[^\\W_{_CJK}]+")
 # Punctuation between two aligned words goes to the word before it, except opening marks, which lead the next word.
 _OPENERS = "“‘(（「『《【〔["
 # A period inside a word ("example.com") is no break. Inside a sentence range a period before a lowercase word is an
@@ -154,24 +154,30 @@ def aligned_tokens(
 ) -> tuple[list[Token], bool]:
     """Tokens of `text` timed by the engine's `words` wherever a sequence diff matches them; True when all matched.
 
-    Letters and digits are compared casefolded, so punctuation and spacing differences do not matter. A word matches
-    when every unit of it lines up with consecutive text; its token takes the text's spelling and the word's times,
-    clamped to `[start, end]`. Text that no word matches is spread over the gap between the timed words around it, and
-    those tokens are not `timed`.
+    Letters and digits are compared casefolded, one character at a time, so punctuation, spacing and where a Latin or
+    digit run is split into pieces do not matter. A word matches when every one of its characters lines up with
+    consecutive text; its token takes the text's spelling and the word's times, clamped to `[start, end]`. Pieces of one
+    run ("X" and "LP", or "171" and "6" around a decimal point) become one token timed from the first piece to the last.
+    Text that no word matches is spread over the gap between the timed words around it, and those tokens are not
+    `timed`.
     """
     text = text.strip()
-    text_units = [(m.start(), m.end()) for m in _ALIGN_UNITS.finditer(text)]
+    text_runs = [m.span() for m in _ALIGN_RUNS.finditer(text)]
+    text_units = [(i, i + 1) for a, b in text_runs for i in range(a, b)]
     word_units: list[str] = []
+    word_run_sizes: list[int] = []
     owners: list[int] = []
     for index, word in enumerate(words):
-        for unit in _ALIGN_UNITS.findall(word.text):
-            word_units.append(unit.casefold())
-            owners.append(index)
-    matcher = difflib.SequenceMatcher(None, [text[a:b].casefold() for a, b in text_units], word_units, autojunk=False)
+        for run in _ALIGN_RUNS.findall(word.text):
+            word_run_sizes.append(len(run))
+            word_units += (char.casefold() for char in run)
+            owners += [index] * len(run)
+    pairs = _matched_units(
+        [text[a:b].casefold() for a, b in text_units], [b - a for a, b in text_runs], word_units, word_run_sizes
+    )
     hits: dict[int, list[int]] = {}
-    for block in matcher.get_matching_blocks():
-        for k in range(block.size):
-            hits.setdefault(owners[block.b + k], []).append(block.a + k)
+    for text_unit, word_unit in pairs:
+        hits.setdefault(owners[word_unit], []).append(text_unit)
     sizes = [0] * len(words)
     for owner in owners:
         sizes[owner] += 1
@@ -180,6 +186,7 @@ def aligned_tokens(
     complete = True
     cursor = 0
     left = start
+    joinable = False
     for index, word in enumerate(words):
         units = hits.get(index, [])
         if not units or len(units) != sizes[index] or units[-1] - units[0] != len(units) - 1:
@@ -187,10 +194,17 @@ def aligned_tokens(
         first, last = text_units[units[0]][0], text_units[units[-1]][1]
         word_start = min(max(word.start, start), end)
         word_end = min(max(word.end, word_start), end)
-        lead, interpolated = _fill(tokens, text[cursor:first], left, word_start, language, origin)
-        complete = complete and not interpolated
-        tokens.append(Token(lead + text[first:last], word_start, word_end, word.conf, origin=origin))
-        cursor, left = last, word_end
+        if joinable and _continues_run(text, cursor, first):
+            previous = tokens[-1]
+            conf = [c for c in (previous.conf, word.conf) if c is not None]
+            tokens[-1] = replace(
+                previous, text=previous.text + text[cursor:last], end=word_end, conf=min(conf) if conf else None
+            )
+        else:
+            lead, interpolated = _fill(tokens, text[cursor:first], left, word_start, language, origin)
+            complete = complete and not interpolated
+            tokens.append(Token(lead + text[first:last], word_start, word_end, word.conf, origin=origin))
+        cursor, left, joinable = last, word_end, True
     rest, interpolated = _fill(tokens, text[cursor:], left, end, language, origin)
     if rest and tokens:
         tokens[-1] = replace(tokens[-1], text=tokens[-1].text + rest)
@@ -198,6 +212,56 @@ def aligned_tokens(
         # Text without a letter or digit, which nothing can be matched against.
         return pseudo_tokens(rest, start, end, language=language, origin=origin), False
     return tokens, complete and not interpolated
+
+
+def _matched_units(
+    a: Sequence[str], a_runs: Sequence[int], b: Sequence[str], b_runs: Sequence[int]
+) -> list[tuple[int, int]]:
+    """Index pairs of equal units in order. `a_runs` and `b_runs` are the lengths of the runs the units fall in.
+
+    Whole runs are diffed first, which is cheap and anchors the alignment. Characters are then diffed only in the
+    stretches between anchors that hold unmatched runs on both sides, so a misheard word cannot take characters from
+    its neighbours and the character diff never sees more than a few words.
+    """
+    a_at, b_at = _starts(a_runs), _starts(b_runs)
+    a_keys = [tuple(a[a_at[i] : a_at[i + 1]]) for i in range(len(a_runs))]
+    b_keys = [tuple(b[b_at[i] : b_at[i + 1]]) for i in range(len(b_runs))]
+    pairs: list[tuple[int, int]] = []
+    done_a = done_b = 0
+    for block in difflib.SequenceMatcher(None, a_keys, b_keys, autojunk=False).get_matching_blocks():
+        lo_a, hi_a, lo_b, hi_b = a_at[done_a], a_at[block.a], b_at[done_b], b_at[block.b]
+        if hi_a > lo_a and hi_b > lo_b:
+            for inner in difflib.SequenceMatcher(
+                None, a[lo_a:hi_a], b[lo_b:hi_b], autojunk=False
+            ).get_matching_blocks():
+                pairs += ((lo_a + inner.a + k, lo_b + inner.b + k) for k in range(inner.size))
+        length = a_at[block.a + block.size] - a_at[block.a]
+        pairs += ((a_at[block.a] + k, b_at[block.b] + k) for k in range(length))
+        done_a, done_b = block.a + block.size, block.b + block.size
+    return pairs
+
+
+def _starts(lengths: Sequence[int]) -> list[int]:
+    starts = [0]
+    for length in lengths:
+        starts.append(starts[-1] + length)
+    return starts
+
+
+def _continues_run(text: str, cursor: int, first: int) -> bool:
+    """Whether the two matched pieces around `text[cursor:first]` are parts of one run.
+
+    That holds with nothing between them, a point or comma between digits, or an apostrophe between letters.
+    """
+    before, after = text[cursor - 1], text[first]
+    if _CJK_CHAR.match(before) or _CJK_CHAR.match(after):
+        return False
+    gap = text[cursor:first]
+    if not gap:
+        return True
+    if gap in (".", ","):
+        return before.isdigit() and after.isdigit()
+    return gap in ("'", "’") and before.isalpha() and after.isalpha()
 
 
 def _fill(tokens: list[Token], stretch: str, left: float, right: float, language: str, origin: int) -> tuple[str, bool]:
