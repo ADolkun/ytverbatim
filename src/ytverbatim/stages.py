@@ -46,6 +46,8 @@ from ytverbatim.errors import ContractError
 from ytverbatim.text import clean, offsets
 from ytverbatim.text import segment as seg
 
+# Part of every stage key that runs this module's code, and of the context record: bump it on any logic change.
+VERSION = "stages-v1"
 UNDETERMINED_LANGUAGE = "und"
 CAPTION_MANUAL = "caption_manual"
 
@@ -207,18 +209,21 @@ def with_results(
     texts: Sequence[str],
     edits: Sequence[Sequence[Edit]],
     flags: Sequence[Sequence[Flag]] = (),
+    *,
+    record: bool = True,
 ) -> tuple[Stretch, ...]:
-    """Apply one text stage's per-stretch results: earlier flags follow the edits, the stage's own flags are added."""
+    """Apply one text stage's per-stretch results: earlier flags follow the edits, the stage's own flags are added.
+
+    With `record=False` the edits only move the flags and are not kept: punctuation changes no word, the guard proves
+    it, and hundreds of inserted commas per video would bury the edits a reader needs.
+    """
     out: list[Stretch] = []
     for index, stretch in enumerate(stretches):
         new_edits = tuple(edits[index])
         moved = offsets.remap_flags(stretch.flags, ((edit.before, edit.after) for edit in new_edits))
         added = tuple(flags[index]) if flags else ()
-        out.append(
-            stretch.model_copy(
-                update={"text": texts[index], "flags": moved + added, "edits": stretch.edits + new_edits}
-            )
-        )
+        kept = stretch.edits + new_edits if record else stretch.edits
+        out.append(stretch.model_copy(update={"text": texts[index], "flags": moved + added, "edits": kept}))
     return tuple(out)
 
 
@@ -226,7 +231,7 @@ def stretch_flag(stretch: Stretch, kind: str, note: str) -> Flag:
     return Flag.model_validate({"kind": kind, "char_start": 0, "char_end": len(stretch.text), "note": note})
 
 
-def build_document(
+def build_document(  # noqa: PLR0913
     *,
     metadata: VideoMetadata,
     tags: Sequence[str],
@@ -236,10 +241,11 @@ def build_document(
     chapters: bool,
     created_at: datetime,
     correction_llm: str | None = None,
+    llm_punctuated: bool = False,
     warnings: Sequence[str] = (),
     llm_usage: Sequence[LLMUsage] = (),
 ) -> ContextDocument:
-    """Assemble and validate the document from the final stretches.
+    """Assemble and validate the document from the final stretches; `llm_punctuated` says an LLM added punctuation.
 
     Raises `ContractError` when the inputs cannot make a valid document, such as a chapter that ends before it starts.
     """
@@ -253,6 +259,7 @@ def build_document(
             chapters=chapters,
             created_at=created_at,
             correction_llm=correction_llm,
+            llm_punctuated=llm_punctuated,
             warnings=warnings,
             llm_usage=llm_usage,
         )
@@ -305,7 +312,7 @@ class _Layout:
         return tokens[-1].sentence
 
 
-def _build(
+def _build(  # noqa: PLR0913
     metadata: VideoMetadata,
     tags: Sequence[str],
     access: Access,
@@ -315,6 +322,7 @@ def _build(
     chapters: bool,
     created_at: datetime,
     correction_llm: str | None,
+    llm_punctuated: bool,
     warnings: Sequence[str],
     llm_usage: Sequence[LLMUsage],
 ) -> ContextDocument:
@@ -380,7 +388,7 @@ def _build(
             language=language,
             script=script,
             runs=(run,),
-            punctuation=_punctuation(text, language, run, segments),
+            punctuation=_punctuation(text, language, run, llm_punctuated=llm_punctuated),
             correction_llm=correction_llm,
         ),
         chapters=chapter_list,
@@ -462,11 +470,11 @@ def _placed_edits(layout: _Layout, stretch: int, edits: Sequence[Edit]) -> list[
 
 
 def _punctuation(
-    text: str, language: str, run: TranscriptRun, segments: Sequence[Segment]
+    text: str, language: str, run: TranscriptRun, *, llm_punctuated: bool
 ) -> Literal["engine", "llm", "caption", "none"]:
     if not seg.is_punctuated(text, language):
         return "none"
-    if any(edit.stage == "punctuation" for segment in segments for edit in segment.edits):
+    if llm_punctuated:
         return "llm"
     return "caption" if run.kind != "asr" else "engine"
 

@@ -35,7 +35,7 @@ def digest(value: JsonValue | BaseModel) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def input_hash(stage: str, version: int, inputs: Mapping[str, JsonValue]) -> str:
+def input_hash(stage: str, version: str, inputs: Mapping[str, JsonValue]) -> str:
     return digest({"stage": stage, "version": version, "inputs": dict(inputs)})
 
 
@@ -49,7 +49,7 @@ class StageStore:
     def work_dir(self, stage: str) -> Path:
         return self.root / stage
 
-    def load[M: BaseModel](self, stage: str, version: int, key: str, model: type[M]) -> M | None:
+    def load[M: BaseModel](self, stage: str, version: str, key: str, model: type[M]) -> M | None:
         """Return the stored output if this stage version made it from these inputs, else None."""
         path = self.path(stage)
         try:
@@ -70,13 +70,13 @@ class StageStore:
             log.warning("ignoring a stage checkpoint %s that no longer validates: %s", path.name, exc)
             return None
 
-    def save(self, stage: str, version: int, key: str, output: BaseModel) -> None:
+    def save(self, stage: str, version: str, key: str, output: BaseModel) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         record = {"stage_version": version, "input_hash": key, "output": output.model_dump(mode="json")}
         atomic.write_json(self.path(stage), record)
 
     def run[M: BaseModel](
-        self, stage: str, version: int, key: str, model: type[M], compute: Callable[[], M]
+        self, stage: str, version: str, key: str, model: type[M], compute: Callable[[], M]
     ) -> tuple[M, bool]:
         """Return the stored output, or compute and store it; the flag says whether it was reused."""
         stored = self.load(stage, version, key, model)
@@ -85,6 +85,9 @@ class StageStore:
         output = compute()
         self.save(stage, version, key, output)
         return output, False
+
+    def discard(self, stage: str) -> None:
+        self.path(stage).unlink(missing_ok=True)
 
     def clear(self) -> None:
         shutil.rmtree(self.root, ignore_errors=True)

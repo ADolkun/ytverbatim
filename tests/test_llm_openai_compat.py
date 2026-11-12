@@ -175,7 +175,9 @@ def test_constructor_requires_base_url_and_model() -> None:
         OpenAICompatClient(base_url="", model="m")
     with pytest.raises(ConfigError, match="model"):
         OpenAICompatClient(base_url=BASE, model="")
-    assert OpenAICompatClient(base_url=BASE, model="m").id == "openai-compat:m"
+    assert OpenAICompatClient(base_url=BASE, model="m").id == "openai-compat:m@127.0.0.1:8080"
+    hosted = OpenAICompatClient(base_url="https://user:secret@api.example.com/v1", model="m")
+    assert hosted.id == "openai-compat:m@api.example.com", "never credentials or path"
 
 
 def test_readiness_gets_models_without_generating(monkeypatch: pytest.MonkeyPatch) -> None:
