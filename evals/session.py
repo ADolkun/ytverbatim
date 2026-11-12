@@ -189,9 +189,27 @@ def build_session(
                 f"{hypothesis} is not complete for {len(missing)} of {len(manifest.videos)} files "
                 f"({', '.join(missing[:3])}); finish it with `asr --hyp {hypothesis}` first"
             )
-    spans = [s for s in collect_spans(layout, manifest, [control, challenger], pivot=control) if not s.format_only]
+    spans = collect_spans(layout, manifest, [control, challenger], pivot=control)
+    return session_from_spans(spans, manifest, control, challenger, n=n, seed=seed, numeric_share=numeric_share)
+
+
+def session_from_spans(
+    spans: Sequence[Span],
+    manifest: Manifest,
+    control: str,
+    challenger: str,
+    *,
+    n: int = DEFAULT_N,
+    seed: int = 0,
+    numeric_share: float = NUMERIC_SHARE,
+) -> tuple[list[ShownSpan], SessionKey]:
+    """Sample ``spans`` into a session; spans that differ only in written form are set aside first.
+
+    Every span must carry a reading for both ``control`` and ``challenger``.
+    """
+    spans = [s for s in spans if not s.format_only]
     if not spans:
-        raise ConfigError(f"no disputes between {control} and {challenger}; are both runs complete on the same files?")
+        raise ConfigError(f"no audible disputes between {control} and {challenger}; check that both runs are complete")
     population: dict[str, int] = defaultdict(int)
     for span in spans:
         population[cell_name(span.file, stratum(span))] += 1

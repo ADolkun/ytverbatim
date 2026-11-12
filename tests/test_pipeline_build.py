@@ -1,10 +1,12 @@
 import subprocess
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
 
+from ytverbatim.acquire.creator_note import CreatorNote
 from ytverbatim.acquire.metadata import Chapter, VideoMetadata
 from ytverbatim.asr import registry
 from ytverbatim.asr.models import ChunkHypothesis
@@ -397,3 +399,24 @@ def test_importing_the_package_loads_neither_the_pipeline_nor_its_heavy_dependen
     probe = "import sys, ytverbatim; print(sorted({'ytverbatim.pipeline', 'yt_dlp', 'pydantic'} & set(sys.modules)))"
     result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
     assert result.stdout.strip() == "[]"
+
+
+def test_correction_context_caps_the_glossary_at_twenty_terms_and_carries_the_creator_note() -> None:
+    from ytverbatim.pipeline import correction_context
+
+    note = CreatorNote(text="市盈率 not 适应率", author="Example Channel", like_count=3, published="20300101")
+    tags = tuple(f"term{i}" for i in range(25))
+    context = correction_context(replace(metadata(), creator_note=note), tags)
+    assert context.glossary == tags[:20]
+    assert context.creator_note == "市盈率 not 适应率"
+    bare = correction_context(metadata(), ())
+    assert (bare.glossary, bare.creator_note) == ((), None)
+
+
+def test_info_tags_keeps_only_string_tags_of_a_raw_extraction() -> None:
+    from ytverbatim.pipeline import info_tags
+
+    assert info_tags({"tags": ["GAAP", 3, "市盈率", None]}) == ("GAAP", "市盈率")
+    assert info_tags({"tags": "GAAP"}) == ()
+    assert info_tags({}) == ()
+    assert info_tags(["tags"]) == ()

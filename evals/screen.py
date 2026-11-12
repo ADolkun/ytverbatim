@@ -134,9 +134,21 @@ def file_spans(
     spans: list[Span] = []
     for window, (start, end) in enumerate(plan.windows):
         in_window: dict[str, list[TimedUnit]] = {name: window_units(u, start, end) for name, u in units.items()}
-        for dispute in find_disputes(in_window, language, families=families, pivot=pivot):
-            spans.append(_span(video, language, window, dispute))
+        spans += window_spans(video, language, window, in_window, families=families, pivot=pivot)
     return spans
+
+
+def window_spans(
+    video: Video,
+    language: Language,
+    window: int,
+    units: Mapping[str, Sequence[TimedUnit]],
+    *,
+    families: Mapping[str, str] | None = None,
+    pivot: str | None = None,
+) -> list[Span]:
+    """Disputes among the hypotheses' units of one alignment window; ``window`` only numbers the span ids."""
+    return [_span(video, language, window, d) for d in find_disputes(units, language, families=families, pivot=pivot)]
 
 
 def _span(video: Video, language: Language, window: int, dispute: Dispute) -> Span:

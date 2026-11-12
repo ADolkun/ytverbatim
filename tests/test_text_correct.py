@@ -274,3 +274,24 @@ class TestSecondPass:
     def test_confidence_must_cover_every_segment(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="confidence"):
             run(list(self.TEXTS), FakeClient(), tmp_path, confidence=[[0.1]])
+
+
+def test_batches_count_both_passes_and_checkpoint_reuses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(correct, "BATCH_CHARS", 6)
+    texts = ["一二三四", "五六七八", "甲乙", "丙丁"]
+    confidence: list[list[float] | None] = [[0.1], None, [0.2], [0.9]]
+    first = FakeClient(respond=lambda request: fixed())
+    result = run(texts, first, tmp_path, confidence=confidence)
+    assert len(first.requests) == 3
+    assert result.batches == 3
+    again = FakeClient()
+    reused = run(texts, again, tmp_path, confidence=confidence)
+    assert again.requests == []
+    assert reused.batches == 3
+
+
+def test_a_retried_batch_is_one_batch_but_two_calls(tmp_path: Path) -> None:
+    client = FakeClient(["not json", fixed()])
+    result = run(["动态适应率"], client, tmp_path)
+    assert len(client.requests) == 2
+    assert result.batches == 1

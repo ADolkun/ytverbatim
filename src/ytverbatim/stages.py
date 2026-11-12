@@ -227,6 +227,12 @@ def with_results(
     return tuple(out)
 
 
+def word_confidence(stretches: Sequence[Stretch]) -> list[list[float] | None] | None:
+    """Per-stretch word probabilities, or None when no word carries one (an engine that reports none)."""
+    confidence = [[word.conf for word in stretch.words if word.conf is not None] or None for stretch in stretches]
+    return confidence if any(confidence) else None
+
+
 def stretch_flag(stretch: Stretch, kind: str, note: str) -> Flag:
     return Flag.model_validate({"kind": kind, "char_start": 0, "char_end": len(stretch.text), "note": note})
 

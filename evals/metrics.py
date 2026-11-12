@@ -277,7 +277,7 @@ def _pooled(counts: Sequence[ErrorCounts], picks: Sequence[int]) -> float:
     return sum(counts[i].errors for i in picks) / reference if reference else 0.0
 
 
-def _percentile_index(quantile: float, resamples: int) -> int:
+def percentile_index(quantile: float, resamples: int) -> int:
     # The q-th percentile of R sorted values is the ceil(q * R)-th smallest, at index ceil(q * R) - 1; the epsilon
     # keeps float noise such as 1950.0000000000002 from moving it one rank up.
     return min(resamples - 1, max(0, math.ceil(quantile * resamples - 1e-9) - 1))
@@ -310,6 +310,6 @@ def paired_bootstrap(
     tail = (1 - confidence) / 2
     return Bootstrap(
         _pooled(a, every) - _pooled(b, every),
-        differences[_percentile_index(tail, resamples)],
-        differences[_percentile_index(1 - tail, resamples)],
+        differences[percentile_index(tail, resamples)],
+        differences[percentile_index(1 - tail, resamples)],
     )

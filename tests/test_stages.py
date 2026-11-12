@@ -14,6 +14,7 @@ from ytverbatim.stages import (
     from_captions,
     normalize,
     with_results,
+    word_confidence,
 )
 
 ACCESS = Access(
@@ -168,3 +169,17 @@ def test_a_manual_caption_track_is_a_source_of_its_own() -> None:
     assert all(s.words is None and s.flags == () for s in doc.segments)
     assert doc.transcript.punctuation == "caption" and doc.segments[0].start == 1.0
     assert "Transcript: manual captions" in render_markdown(doc)
+
+
+def test_word_confidence_is_none_when_no_word_has_a_probability() -> None:
+    plain = (Word(text="估值", start=0.0, end=1.0), Word(text="很高", start=1.0, end=2.0))
+    assert word_confidence(source_of([row("估值很高", 0.0, 2.0, plain)]).stretches) is None
+    assert word_confidence(source_of([row("估值很高", 0.0, 2.0)]).stretches) is None
+
+
+def test_word_confidence_lists_the_probabilities_each_stretch_has() -> None:
+    scored = (Word(text="估值", start=0.0, end=1.0, conf=0.9), Word(text="很高", start=1.0, end=2.0, conf=0.3))
+    unscored = (Word(text="然后", start=3.0, end=4.0),)
+    source = source_of([row("估值很高", 0.0, 2.0, scored), row("然后", 3.0, 4.0, unscored)])
+    assert len(source.stretches) == 2
+    assert word_confidence(source.stretches) == [[0.9, 0.3], None]

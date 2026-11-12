@@ -698,8 +698,7 @@ class _VideoRun:
         llm = self.settings.llm if self.settings.text.correct else None
         if llm is None:
             return _TextResult(stretches=previous.stretches), None
-        note = metadata.creator_note.text if metadata.creator_note is not None else None
-        context = CorrectionContext(glossary=_tags(self.vdir)[:_GLOSSARY_MAX_TERMS], creator_note=note)
+        context = correction_context(metadata, _tags(self.vdir))
         inputs: dict[str, JsonValue] = {
             "text": _text_key(previous.stretches),
             "llm": self.settings.llm_id,
@@ -715,7 +714,7 @@ class _VideoRun:
                 language=language,
                 context=context,
                 checkpoint_dir=self.store.work_dir("correct"),
-                confidence=_confidence(stretches),
+                confidence=stages.word_confidence(stretches),
             )
             return _TextResult(
                 stretches=with_results(stretches, result.texts, result.edits, result.flags), usage=result.usage
@@ -820,11 +819,6 @@ def _timed(stretches: Sequence[Stretch]) -> list[numeric.TimedText]:
     return [numeric.TimedText(stretch.text, stretch.start, stretch.end) for stretch in stretches]
 
 
-def _confidence(stretches: Sequence[Stretch]) -> list[list[float] | None] | None:
-    confidence = [[word.conf for word in stretch.words if word.conf is not None] or None for stretch in stretches]
-    return confidence if any(confidence) else None
-
-
 def _manual_track(tracks: Sequence[CaptionTrack], language: str | None) -> tuple[CaptionTrack | None, str]:
     """Pick the manual track to transcribe from; without one, say why there is none."""
     manual = [track for track in tracks if track.kind is CaptionKind.MANUAL]
@@ -870,11 +864,20 @@ def _read_rows(path: Path, video_id: str) -> list[ChunkHypothesis]:
     return sorted((row for row in rows if row.file == video_id), key=lambda row: row.chunk)
 
 
+def correction_context(metadata: VideoMetadata, tags: Sequence[str]) -> CorrectionContext:
+    note = metadata.creator_note.text if metadata.creator_note is not None else None
+    return CorrectionContext(glossary=tuple(tags[:_GLOSSARY_MAX_TERMS]), creator_note=note)
+
+
+def info_tags(raw: object) -> tuple[str, ...]:
+    tags = raw.get("tags") if isinstance(raw, dict) else None
+    return tuple(tag for tag in tags if isinstance(tag, str)) if isinstance(tags, list) else ()
+
+
 def _tags(vdir: Path) -> tuple[str, ...]:
     # VideoMetadata does not keep tags, but the raw extraction does.
     try:
         raw: object = json.loads(info_path(vdir).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return ()
-    tags = raw.get("tags") if isinstance(raw, dict) else None
-    return tuple(tag for tag in tags if isinstance(tag, str)) if isinstance(tags, list) else ()
+    return info_tags(raw)

@@ -6,7 +6,7 @@ Whisper control and other projects' models.
 
 import importlib
 import shutil
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
@@ -23,6 +23,8 @@ REPO_BYTES: Mapping[str, int] = {
     "mlx-community/MiMo-V2.5-ASR-MLX": 4_530_000_000,
     "mlx-community/MiMo-Audio-Tokenizer": 2_580_000_000,
     "mlx-community/whisper-large-v3-mlx": 2_900_000_000,
+    "mlx-community/Qwen3.5-9B-8bit": 10_450_000_000,
+    "mlx-community/Qwen3-8B-8bit": 8_720_000_000,
 }
 
 # The Whisper adapter reads its weights from the default cache and never downloads; nothing of it may be deleted.
@@ -65,7 +67,14 @@ def check_disk(definition: EngineDef, cache: Path, *, free: Callable[[Path], int
     """Raise unless the missing weights fit with headroom; return the bytes still to download."""
     if definition.spec.family in DEFAULT_CACHE_FAMILIES:
         return 0
-    missing = [item for item in weights(definition) if not present(cache, item)]
+    return check_weights(weights(definition), cache, definition.spec.id, free=free)
+
+
+def check_weights(
+    items: Sequence[Weights], cache: Path, label: str, *, free: Callable[[Path], int] = free_bytes
+) -> int:
+    """Raise unless the missing ``items`` fit with headroom; return the bytes still to download."""
+    missing = [item for item in items if not present(cache, item)]
     if not missing:
         return 0
     unknown = [item.repo for item in missing if item.repo not in REPO_BYTES]
@@ -75,7 +84,7 @@ def check_disk(definition: EngineDef, cache: Path, *, free: Callable[[Path], int
     available = free(cache)
     if available < needed + GATE_HEADROOM_BYTES:
         raise ConfigError(
-            f"{definition.spec.id} needs {_gb(needed)} of weights plus {_gb(GATE_HEADROOM_BYTES)} headroom, but only "
+            f"{label} needs {_gb(needed)} of weights plus {_gb(GATE_HEADROOM_BYTES)} headroom, but only "
             f"{_gb(available)} is free on the volume of {cache}; free space or clean up a finished hypothesis first"
         )
     return needed
