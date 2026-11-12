@@ -255,6 +255,22 @@ class TestSecondPass:
         ]
         assert result.flags == ((Flag(kind="entity_corrected", char_start=13, char_end=17, note="GAP → GAAP"),),)
 
+    @staticmethod
+    def two_steps(first: str, second: str) -> Callable[[LLMRequest], str]:
+        return lambda request: fixed((0, second if "LOW-CONFIDENCE" in request.system else first))
+
+    def test_two_allowed_steps_cannot_add_up_to_a_forbidden_change(self, tmp_path: Path) -> None:
+        client = FakeClient(respond=self.two_steps("按照GAP准则计算", "按照GAAP准则计算"))
+        result = run(["按照GP准则计算"], client, tmp_path, confidence=[[0.1]])
+        assert result.texts == ("按照GAP准则计算",)
+        assert result.rejections == (Rejection(0, "low_confidence", "按照GAP准则计算", "按照GAAP准则计算", "symbols"),)
+
+    def test_sap_to_gaap_is_refused_across_both_passes(self, tmp_path: Path) -> None:
+        client = FakeClient(respond=self.two_steps("按照GAP准则计算", "按照GAAP准则计算"))
+        result = run(["按照SAP准则计算"], client, tmp_path, confidence=[[0.1]])
+        assert result.texts == ("按照SAP准则计算",)
+        assert [r.reason for r in result.rejections] == ["symbols", "symbols"]
+
     def test_confidence_must_cover_every_segment(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="confidence"):
             run(list(self.TEXTS), FakeClient(), tmp_path, confidence=[[0.1]])

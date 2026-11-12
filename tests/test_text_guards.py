@@ -1,6 +1,6 @@
 import pytest
 
-from ytverbatim.text.guards import EntityChange, check_fix, osa_distance, symbol_changes
+from ytverbatim.text.guards import EntityChange, check_fix, symbol_changes
 
 
 def rejected_by(original: str, fixed: str) -> str | None:
@@ -44,11 +44,13 @@ def rejected_by(original: str, fixed: str) -> str | None:
         ("the buy2 label is here", "the buy2 label is here."),
         ("the _sell_ label is here", "the _sell_ label is here."),
         ("the market is volatil", "the market is volatile"),
-        # Loosened: words that merely contain a numeral character.
+        # A fix next to a numeral that keeps every numeral in place.
         ("他一致在说这个问题", "他一直在说这个问题"),
-        ("这两个公司的情况依样", "这两个公司的情况一样"),
-        ("这个价格是分合理的", "这个价格十分合理的"),
-        ("万以出现亏损怎么办", "万一出现亏损怎么办"),
+        # Direction words may be added or dropped; only a turn-over is refused.
+        ("这家公司的利润很都", "这家公司的利润很多"),
+        ("股票长了", "股票涨了"),
+        ("it went up and then down", "it went up and then down."),
+        ("prices rose then fell", "prices rose, then fell"),
     ],
 )
 def test_safe_fix_is_accepted(original: str, fixed: str) -> None:
@@ -70,6 +72,33 @@ def test_safe_fix_is_accepted(original: str, fixed: str) -> None:
         ("我们有三个方案", "我们有四个方案", "cjk_numerals"),
         ("这是第一个问题", "这是第二个问题", "cjk_numerals"),
         ("今天买三送一的活动", "今天买四送一的活动", "cjk_numerals"),
+        ("买三送一", "买送一", "cjk_numerals"),
+        ("买三送一", "买三送", "cjk_numerals"),
+        ("买三送一", "买伞送一", "cjk_numerals"),
+        # Accepted cost of comparing the numeral sequence: a fix that introduces a numeral is refused too.
+        ("这两个公司的情况依样", "这两个公司的情况一样", "cjk_numerals"),
+        ("这个价格是分合理的", "这个价格十分合理的", "cjk_numerals"),
+        ("万以出现亏损怎么办", "万一出现亏损怎么办", "cjk_numerals"),
+        ("上涨了", "下跌了", "direction"),
+        ("股价涨了", "股价跌了", "direction"),
+        ("指数升了", "指数降了", "direction"),
+        ("收入增加了", "收入减少了", "direction"),
+        ("收入增了", "收入减了", "direction"),
+        ("我们做多", "我们做空", "direction"),
+        ("市场多头", "市场空头", "direction"),
+        ("今年盈了", "今年亏了", "direction"),
+        ("这是利好", "这是利空", "direction"),
+        ("牛市来了", "熊市来了", "direction"),
+        ("先涨后跌", "先跌后涨", "direction"),
+        ("it is up", "it is down", "direction"),
+        ("prices rose today", "prices fell today", "direction"),
+        ("prices are rising", "prices are falling", "direction"),
+        ("we are long here", "we are short here", "direction"),
+        ("it closed higher", "it closed lower", "direction"),
+        ("I am bullish", "I am bearish", "direction"),
+        ("a big gain", "a big loss", "direction"),
+        ("sales increased", "sales decreased", "direction"),
+        ("Rates Went Up", "Rates Went Down", "direction"),
         ("returns fell to -10% this year", "returns fell to 10% this year", "numeric_spans"),
         ("the yield is 10% right now", "the yield is 10 right now", "numeric_spans"),
         ("the price is € 100 right now", "the price is 100 right now", "quantities"),
@@ -163,6 +192,7 @@ def test_ported_unsafe_fixes_stay_rejected(original: str, fixed: str) -> None:
         ("under GAP rules the margin fell", "under GAAP rules the margin fell", "GAP", "GAAP"),
         ("这只股票被纳入SMCI指数", "这只股票被纳入MSCI指数", "SMCI", "MSCI"),
         ("the GDP print and the GAP filing", "the GDP print and the GAAP filing", "GAP", "GAAP"),
+        ("under GAAP rules", "under GAP rules", "GAAP", "GAP"),
     ],
 )
 def test_near_acronym_fix_is_accepted_and_reported(original: str, fixed: str, before: str, after: str) -> None:
@@ -179,9 +209,14 @@ def test_near_acronym_fix_is_accepted_and_reported(original: str, fixed: str, be
         ("按照SAP准则计算", "按照GAAP准则计算"),
         ("the GDP print", "the GAAP print"),
         ("AI chips", "EV chips"),
+        # A substituted letter names a different security or indicator, at any length.
+        ("buy MS today", "buy GS today"),
+        ("the CPI print", "the PPI print"),
+        ("GE results", "GM results"),
+        ("NVDA results", "NVDB results"),
     ],
 )
-def test_acronym_changes_beyond_one_edit_are_rejected(original: str, fixed: str) -> None:
+def test_acronym_changes_beyond_one_insertion_deletion_or_transposition_are_rejected(original: str, fixed: str) -> None:
     assert rejected_by(original, fixed) is not None
 
 
@@ -199,21 +234,3 @@ def test_symbol_changes_point_into_the_corrected_text() -> None:
 def test_symbol_changes_refuse_a_changed_count() -> None:
     with pytest.raises(ValueError, match="symbol count"):
         symbol_changes("NVDA and AMD", "NVDA")
-
-
-@pytest.mark.parametrize(
-    ("a", "b", "distance"),
-    [
-        ("", "", 0),
-        ("GAP", "GAP", 0),
-        ("GAP", "GAAP", 1),
-        ("SMCI", "MSCI", 1),
-        ("CA", "ABC", 3),
-        ("NVDA", "", 4),
-        ("AAPL", "NVDA", 4),
-        ("GDP", "GAAP", 2),
-    ],
-)
-def test_osa_distance(a: str, b: str, distance: int) -> None:
-    assert osa_distance(a, b) == distance
-    assert osa_distance(b, a) == distance
