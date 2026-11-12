@@ -509,12 +509,59 @@ def test_dollar_spellings_agree_and_magnitudes_dispute(tmp_path: Path) -> None:
     disputed = run(
         [TimedText("Revenue reached $15 billion this year", 0.0, 3.0)],
         Evidence(PRIMARY, captions=(manual((0.0, 3.0, "revenue reached $15 million this year")),)),
-        FakeClient([verdicts((0, "$15 million", "high"))]),
+        FakeClient([verdicts((0, "$15 million", "low"))]),
         tmp_path / "b",
         language="en",
     )
-    assert disputed.stats == NumericStats(disputed=1, fixed=1)
-    assert disputed.texts == ("Revenue reached $0.015 billion this year",)
+    assert disputed.stats == NumericStats(disputed=1)
+
+
+@pytest.mark.parametrize(
+    ("asr", "caption", "mine", "theirs", "language"),
+    [
+        (
+            "Revenue reached $15 billion this year",
+            "revenue reached $15 million this year",
+            "$15 billion",
+            "$15 million",
+            "en",
+        ),
+        (
+            "Revenue reached $15 million this year",
+            "revenue reached $15 billion this year",
+            "$15 million",
+            "$15 billion",
+            "en",
+        ),
+        ("规模达到1.5万亿左右", "规模达到1.5亿左右", "1.5万亿", "1.5亿", "zh"),
+        ("规模达到1.5亿左右", "规模达到1.5万亿左右", "1.5亿", "1.5万亿", "zh"),
+        ("They have 15K users today", "they have 15M users today", "15K", "15M", "en"),
+        ("They have 15M users today", "they have 15K users today", "15M", "15K", "en"),
+    ],
+)
+def test_a_magnitude_only_change_is_never_auto_fixed(
+    asr: str, caption: str, mine: str, theirs: str, language: str, tmp_path: Path
+) -> None:
+    client = FakeClient([verdicts((0, theirs, "high"))])
+    captions = manual((0.0, 3.0, caption))
+    result = run(
+        [TimedText(asr, 0.0, 3.0)], Evidence(PRIMARY, captions=(captions,)), client, tmp_path, language=language
+    )
+    assert result.texts == (asr,)
+    assert result.edits == ((),)
+    (flag,) = result.flags[0]
+    assert flag.kind == "numeric_disputed"
+    assert "magnitude" in flag.note
+    assert flag.readings == (Reading(source=PRIMARY, text=mine), Reading(source="caption_manual", text=theirs))
+    assert result.stats == NumericStats(disputed=1)
+
+
+def test_a_same_magnitude_change_written_with_a_scale_keeps_the_transcripts_form(tmp_path: Path) -> None:
+    client = FakeClient([verdicts((0, "4亿", "high"))])
+    captions = manual((0.0, 3.0, "规模达到4亿左右"))
+    result = run([TimedText("规模达到3.5亿左右", 0.0, 3.0)], Evidence(PRIMARY, captions=(captions,)), client, tmp_path)
+    assert result.texts == ("规模达到4亿左右",)
+    assert [f.kind for f in result.flags[0]] == ["numeric_fixed"]
 
 
 def chinese_words(pieces: list[str], start: float, step: float, conf: dict[str, float] | None = None) -> list[Word]:
