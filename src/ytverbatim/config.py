@@ -27,6 +27,9 @@ class YtdlpOptions:
 class AsrOptions:
     engine: str = "w-prod"
     source: Literal["asr", "captions"] = "asr"
+    # The ASR worker is killed above this physical footprint, so a runaway model cannot take down the Mac.
+    # None means half of physical memory.
+    memory_cap_gib: float | None = None
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from ytverbatim.auth.state import AuthState
 from ytverbatim.ytdlp.types import Signal
@@ -25,6 +25,43 @@ class ProcTimeout(YtverbatimError):  # noqa: N818
         super().__init__(f"{command} did not finish within {timeout_s:g}s and was killed")
         self.command = command
         self.timeout_s = timeout_s
+
+
+MemoryTrigger = Literal["footprint", "available"]
+_GIB = 1 << 30
+
+
+class ProcMemoryExceeded(YtverbatimError):  # noqa: N818
+    """A child killed by the memory watch: its own footprint passed the cap, or the machine ran short of memory."""
+
+    def __init__(
+        self,
+        command: str,
+        trigger: MemoryTrigger,
+        *,
+        footprint_bytes: int | None,
+        cap_bytes: int,
+        available_percent: int,
+        floor_percent: int,
+    ) -> None:
+        used = "unknown" if footprint_bytes is None else f"{footprint_bytes / _GIB:.2f} GiB"
+        if trigger == "footprint":
+            detail = (
+                f"its physical footprint reached {used}, over the {cap_bytes / _GIB:.2f} GiB cap "
+                f"(system memory available: {available_percent}%, floor {floor_percent}%)"
+            )
+        else:
+            detail = (
+                f"system memory available fell to {available_percent}%, under the {floor_percent}% floor "
+                f"(its physical footprint: {used}, cap {cap_bytes / _GIB:.2f} GiB)"
+            )
+        super().__init__(f"{command} was killed: {detail}")
+        self.command = command
+        self.trigger: MemoryTrigger = trigger
+        self.footprint_bytes = footprint_bytes
+        self.cap_bytes = cap_bytes
+        self.available_percent = available_percent
+        self.floor_percent = floor_percent
 
 
 class YtDlpError(YtverbatimError):

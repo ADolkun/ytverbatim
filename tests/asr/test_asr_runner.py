@@ -12,11 +12,11 @@ from pathlib import Path
 import pytest
 from fake_engine import definition, write_silence
 
-from ytverbatim import paths, proc
+from ytverbatim import config, paths, proc
 from ytverbatim.asr import runner
 from ytverbatim.asr.chunks import Chunk
 from ytverbatim.asr.models import ERROR_FILE, HYPOTHESES_FILE, REQUEST_FILE, ChunkHypothesis, FileJob, WorkerRequest
-from ytverbatim.errors import EngineError, MediaValidationError
+from ytverbatim.errors import ConfigError, EngineError, MediaValidationError, ProcMemoryExceeded
 
 HERE = Path(__file__).parent
 
@@ -88,7 +88,7 @@ def test_the_request_is_written_only_once_the_lock_is_held(tmp_path: Path, monke
         seen.append(request_path.exists())
         yield
 
-    def fake_run(argv: list[str], *, timeout_s: float) -> proc.ProcResult:
+    def fake_run(argv: list[str], **_: object) -> proc.ProcResult:
         seen.append(request_path.exists())
         return proc.ProcResult(1, "", "", 0.0)
 
@@ -119,7 +119,7 @@ def test_timeout_is_three_times_the_audio_plus_half_an_hour(tmp_path: Path, monk
     assert runner.timeout_s(100.0) == 2100.0
     seen: list[float] = []
 
-    def fake_run(argv: list[str], *, timeout_s: float) -> proc.ProcResult:
+    def fake_run(argv: list[str], *, timeout_s: float, **_: object) -> proc.ProcResult:
         seen.append(timeout_s)
         return proc.ProcResult(1, "", "", 0.0)
 
@@ -127,6 +127,77 @@ def test_timeout_is_three_times_the_audio_plus_half_an_hour(tmp_path: Path, monk
     with pytest.raises(EngineError):
         runner.run_worker(make_request(tmp_path, seconds=10.0))
     assert seen == [pytest.approx(3 * 10.0 + 1800.0)]
+
+
+GIB = 1 << 30
+
+
+def test_every_worker_runs_under_a_memory_watch_defaulting_to_half_the_ram(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    watches: list[proc.MemoryWatch] = []
+
+    def fake_run(argv: list[str], *, memory_watch: proc.MemoryWatch, **_: object) -> proc.ProcResult:
+        watches.append(memory_watch)
+        return proc.ProcResult(1, "", "", 0.0)
+
+    monkeypatch.setattr(runner.proc, "run", fake_run)
+    monkeypatch.setattr(runner.sysmem, "physical_memory_bytes", lambda: 24 * GIB)
+    with pytest.raises(EngineError):
+        runner.run_worker(make_request(tmp_path))
+    with pytest.raises(EngineError):
+        runner.run_worker(make_request(tmp_path).model_copy(update={"memory_cap_bytes": 3 * GIB}))
+    assert [(w.cap_bytes, w.floor_percent) for w in watches] == [(12 * GIB, 10), (3 * GIB, 10)]
+    written = WorkerRequest.model_validate_json((tmp_path / "out" / REQUEST_FILE).read_text(encoding="utf-8"))
+    assert written.memory_cap_bytes == 3 * GIB
+
+
+@pytest.mark.parametrize(
+    ("trigger", "fix"),
+    [("footprint", "use a smaller engine, or raise asr.memory_cap_gib"), ("available", "close memory-heavy apps")],
+)
+def test_a_memory_kill_becomes_an_engine_error_with_the_fix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trigger: str, fix: str
+) -> None:
+    def fake_run(argv: list[str], **_: object) -> proc.ProcResult:
+        raise ProcMemoryExceeded(
+            "python3",
+            trigger,  # type: ignore[arg-type]
+            footprint_bytes=9 * GIB,
+            cap_bytes=8 * GIB,
+            available_percent=40 if trigger == "footprint" else 6,
+            floor_percent=10,
+        )
+
+    monkeypatch.setattr(runner.proc, "run", fake_run)
+    with pytest.raises(EngineError) as caught:
+        runner.run_worker(make_request(tmp_path))
+    message = str(caught.value)
+    assert message.startswith("fake worker stopped to protect the machine: python3 was killed")
+    assert "9.00 GiB" in message
+    assert "8.00 GiB" in message
+    assert fix in message
+    assert "next run resumes" in message
+    assert isinstance(caught.value.__cause__, ProcMemoryExceeded)
+
+
+def test_the_cap_setting_is_converted_and_checked(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text("[asr]\nmemory_cap_gib = 8\n", encoding="utf-8")
+    assert config.load_options(config_file).asr.memory_cap_gib == 8.0
+    assert config.load_options(tmp_path / "absent.toml").asr.memory_cap_gib is None
+    assert runner.memory_cap_bytes(None) is None
+    assert runner.memory_cap_bytes(8) == 8 * GIB
+    assert runner.memory_cap_bytes(0.5) == GIB // 2
+    for bad in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ConfigError, match="memory_cap_gib"):
+            runner.memory_cap_bytes(bad)
+
+
+def test_the_peak_footprint_is_reported(tmp_path: Path) -> None:
+    result = runner.run_worker(make_request(tmp_path, sleep_s=0.7))
+    assert result.peak_footprint_bytes is not None
+    assert result.peak_footprint_bytes > 0
 
 
 def test_an_unreadable_wav_is_refused_before_spawning(tmp_path: Path) -> None:

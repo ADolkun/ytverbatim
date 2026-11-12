@@ -1,5 +1,6 @@
 """Deterministic stand-in engine, named by dotted path (`fake_engine.create`) so the worker imports it lazily."""
 
+import time
 import wave
 from collections.abc import Mapping
 from pathlib import Path
@@ -44,6 +45,9 @@ class FakeEngine:
         samples = len(audio)  # type: ignore[arg-type]
         self._log(f"transcribe {samples}")
         self.calls += 1
+        pause = self.variant.get("sleep_s")
+        if isinstance(pause, float):
+            time.sleep(pause)
         if self.variant.get("fail_on_call") == self.calls:
             raise RuntimeError("fake decoder exploded")
         cap = bool(self.variant.get("hit_cap"))

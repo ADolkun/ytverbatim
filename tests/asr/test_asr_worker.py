@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,81 @@ def rows(tmp_path: Path) -> list[ChunkHypothesis]:
 @pytest.fixture
 def wav(tmp_path: Path) -> Path:
     return write_silence(tmp_path / "-dash.wav", 10.0)
+
+
+class FakeMlx:
+    """Records allocator calls into the fake engine's call log, so their order against load and decode shows."""
+
+    def __init__(self, log: Path | None = None) -> None:
+        self.log = log
+        self.calls: list[str] = []
+
+    def _record(self, call: str) -> None:
+        self.calls.append(call)
+        if self.log is not None:
+            with self.log.open("a", encoding="utf-8") as handle:
+                handle.write(call + "\n")
+
+    def set_cache_limit(self, limit: int) -> int:
+        self._record(f"cache_limit {limit}")
+        return 0
+
+    def set_memory_limit(self, limit: int) -> int:
+        self._record(f"memory_limit {limit}")
+        return 0
+
+    def clear_cache(self) -> None:
+        self._record("clear_cache")
+
+    def get_peak_memory(self) -> int:
+        return 7
+
+
+@pytest.fixture(autouse=True)
+def fake_mlx(monkeypatch: pytest.MonkeyPatch) -> FakeMlx:
+    """Stands in for `mlx.core`, so `main` never changes the real allocator of the test process."""
+    fake = FakeMlx()
+    monkeypatch.setitem(sys.modules, "mlx.core", fake)
+    return fake
+
+
+def test_the_allocator_is_bounded_before_load_and_emptied_after_every_chunk(tmp_path: Path, wav: Path) -> None:
+    log = tmp_path / "calls.log"
+    job = FileJob(id="f1", wav=str(wav), chunks=(Chunk(0.0, 2.0), Chunk(3.0, 5.0)))
+    req = request(tmp_path, job, engine=definition(calls_log=str(log))).model_copy(update={"memory_cap_bytes": 8 << 30})
+    worker.run_request(req, mlx=FakeMlx(log))
+    assert log.read_text(encoding="utf-8").splitlines() == [
+        f"cache_limit {worker.CACHE_LIMIT_BYTES}",
+        f"memory_limit {8 << 30}",
+        "load",
+        f"transcribe {2 * RATE}",
+        "clear_cache",
+        f"transcribe {2 * RATE}",
+        "clear_cache",
+    ]
+
+
+def test_without_a_cap_only_the_cache_is_bounded(tmp_path: Path, wav: Path) -> None:
+    mlx = FakeMlx()
+    worker.run_request(request(tmp_path, FileJob(id="f1", wav=str(wav), chunks=(Chunk(0.0, 2.0),))), mlx=mlx)
+    assert mlx.calls == [f"cache_limit {worker.CACHE_LIMIT_BYTES}", "clear_cache"]
+
+
+def test_main_bounds_the_mlx_allocator(tmp_path: Path, wav: Path, fake_mlx: FakeMlx) -> None:
+    req = request(tmp_path, FileJob(id="f1", wav=str(wav), chunks=(Chunk(0.0, 2.0),))).model_copy(
+        update={"memory_cap_bytes": 1 << 30}
+    )
+    req_path = tmp_path / "req.json"
+    req_path.write_text(req.model_dump_json(), encoding="utf-8")
+    assert worker.main([str(req_path)]) == 0
+    assert fake_mlx.calls == [f"cache_limit {worker.CACHE_LIMIT_BYTES}", f"memory_limit {1 << 30}", "clear_cache"]
+    metrics = RunMetrics.model_validate_json((tmp_path / "out" / METRICS_FILE).read_text(encoding="utf-8"))
+    assert metrics.peak_memory_bytes == 7
+
+
+def test_the_memory_cap_does_not_change_the_fingerprint(tmp_path: Path, wav: Path) -> None:
+    req = request(tmp_path, FileJob(id="f1", wav=str(wav)))
+    assert req.model_copy(update={"memory_cap_bytes": 1 << 30}).fingerprint() == req.fingerprint()
 
 
 def test_chunks_become_flushed_lines_with_absolute_times(tmp_path: Path, wav: Path) -> None:
