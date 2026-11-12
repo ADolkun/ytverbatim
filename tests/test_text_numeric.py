@@ -180,6 +180,21 @@ def test_unconfident_or_unchanged_verdicts_stay_disputed(reply: str, tmp_path: P
     assert span_text(result, 0, result.flags[0][0]) == "十五个百分点"
 
 
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("abcdefghij " * 40, "abcdefghij " * 17 + "abcdefghij…"),
+        ("一二三四五六七八九十" * 30, "一二三四五六七八九十" * 20 + "…"),
+        ("short reason", "short reason"),
+    ],
+    ids=["latin-word-boundary", "cjk-between-characters", "short-untouched"],
+)
+def test_a_long_verdict_note_is_cut_at_a_word_boundary(reason: str, expected: str, tmp_path: Path) -> None:
+    reply = json.dumps({"verdicts": [{"id": 0, "value": None, "confidence": "low", "reason": reason}]})
+    result = run(DISPUTED, Evidence(PRIMARY, captions=(DISPUTED_CAPTIONS,)), FakeClient([reply]), tmp_path)
+    assert result.flags[0][0].note == expected
+
+
 def test_malformed_output_degrades_to_disputed_and_is_not_checkpointed(tmp_path: Path) -> None:
     client = FakeClient(["not json", '{"verdicts": "nope"}'])
     result = run(DISPUTED, Evidence(PRIMARY, captions=(DISPUTED_CAPTIONS,)), client, tmp_path)

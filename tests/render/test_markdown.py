@@ -178,6 +178,21 @@ def test_entity_corrected_and_numeric_fixed_footnotes_show_the_before_text(make_
     assert "00:00 — numeric_fixed: n; was 115" in body
 
 
+def test_the_before_text_shows_when_the_edit_is_narrower_than_the_flagged_span(make_doc, seg, flag) -> None:
+    text = "涨了五十个百分点"
+    edits = [Edit(stage="numeric", before="十五", after="五十", llm=None)]
+    flags = [flag("numeric_fixed", text, "五十个百分点", note="十五个百分点 → 五十个百分点")]
+    body = render_markdown(make_doc([seg(text, 0.0, 2.0, flags=flags, edits=edits)]))
+    assert "numeric_fixed: 十五个百分点 → 五十个百分点; was 十五" in body
+
+
+def test_an_edit_outside_the_flagged_span_shows_no_before_text(make_doc, seg, flag) -> None:
+    text = "Nvidia hit 150 today"
+    edits = [Edit(stage="correction", before="Envidia", after="Nvidia", llm=None)]
+    body = render_markdown(make_doc([seg(text, 0.0, 2.0, flags=[flag("entity_corrected", text, "150")], edits=edits)]))
+    assert "was" not in body
+
+
 def test_footnote_lists_readings_with_sources(make_doc, seg, flag) -> None:
     text = "price is 150"
     f = flag("numeric_disputed", text, "150", note="n", readings=[("asr:x", "150"), ("caption_auto", "115")])
