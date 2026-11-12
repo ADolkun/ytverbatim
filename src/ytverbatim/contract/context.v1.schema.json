@@ -1,0 +1,867 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "Access": {
+      "additionalProperties": false,
+      "properties": {
+        "auth_source": {
+          "enum": [
+            "none",
+            "chrome",
+            "cookie-file"
+          ],
+          "title": "Auth Source",
+          "type": "string"
+        },
+        "cookies_used": {
+          "title": "Cookies Used",
+          "type": "boolean"
+        },
+        "logged_in": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Logged In"
+        },
+        "premium": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Premium"
+        },
+        "member": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Member"
+        },
+        "availability": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Availability"
+        },
+        "ytdlp_version": {
+          "title": "Ytdlp Version",
+          "type": "string"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Warnings",
+          "type": "array"
+        }
+      },
+      "required": [
+        "auth_source",
+        "cookies_used",
+        "logged_in",
+        "premium",
+        "member",
+        "availability",
+        "ytdlp_version",
+        "warnings"
+      ],
+      "title": "Access",
+      "type": "object"
+    },
+    "Chapter": {
+      "additionalProperties": false,
+      "properties": {
+        "index": {
+          "minimum": 0,
+          "title": "Index",
+          "type": "integer"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "start": {
+          "minimum": 0,
+          "title": "Start",
+          "type": "number"
+        },
+        "end": {
+          "minimum": 0,
+          "title": "End",
+          "type": "number"
+        },
+        "source": {
+          "enum": [
+            "youtube",
+            "llm"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "first_segment": {
+          "minimum": 0,
+          "title": "First Segment",
+          "type": "integer"
+        },
+        "last_segment": {
+          "minimum": 0,
+          "title": "Last Segment",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "index",
+        "title",
+        "start",
+        "end",
+        "source",
+        "first_segment",
+        "last_segment"
+      ],
+      "title": "Chapter",
+      "type": "object"
+    },
+    "Edit": {
+      "additionalProperties": false,
+      "properties": {
+        "stage": {
+          "enum": [
+            "punctuation",
+            "correction",
+            "numeric"
+          ],
+          "title": "Stage",
+          "type": "string"
+        },
+        "before": {
+          "title": "Before",
+          "type": "string"
+        },
+        "after": {
+          "title": "After",
+          "type": "string"
+        },
+        "llm": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Llm"
+        }
+      },
+      "required": [
+        "stage",
+        "before",
+        "after",
+        "llm"
+      ],
+      "title": "Edit",
+      "type": "object"
+    },
+    "Flag": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "numeric_disputed",
+            "numeric_fixed",
+            "numeric_single_source",
+            "entity_corrected",
+            "low_confidence",
+            "decoder_anomaly",
+            "timing_interpolated",
+            "punctuation_failed"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "char_start": {
+          "minimum": 0,
+          "title": "Char Start",
+          "type": "integer"
+        },
+        "char_end": {
+          "minimum": 0,
+          "title": "Char End",
+          "type": "integer"
+        },
+        "note": {
+          "title": "Note",
+          "type": "string"
+        },
+        "readings": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Reading"
+          },
+          "title": "Readings",
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "char_start",
+        "char_end",
+        "note"
+      ],
+      "title": "Flag",
+      "type": "object"
+    },
+    "Generator": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "version": {
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "title": "Generator",
+      "type": "object"
+    },
+    "JsonValue": {},
+    "LLMUsage": {
+      "additionalProperties": false,
+      "properties": {
+        "stage": {
+          "title": "Stage",
+          "type": "string"
+        },
+        "client": {
+          "title": "Client",
+          "type": "string"
+        },
+        "calls": {
+          "minimum": 0,
+          "title": "Calls",
+          "type": "integer"
+        },
+        "input_tokens": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Input Tokens"
+        },
+        "output_tokens": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Output Tokens"
+        }
+      },
+      "required": [
+        "stage",
+        "client",
+        "calls",
+        "input_tokens",
+        "output_tokens"
+      ],
+      "title": "LLMUsage",
+      "type": "object"
+    },
+    "Paragraph": {
+      "additionalProperties": false,
+      "properties": {
+        "index": {
+          "minimum": 0,
+          "title": "Index",
+          "type": "integer"
+        },
+        "start": {
+          "minimum": 0,
+          "title": "Start",
+          "type": "number"
+        },
+        "end": {
+          "minimum": 0,
+          "title": "End",
+          "type": "number"
+        },
+        "first_segment": {
+          "minimum": 0,
+          "title": "First Segment",
+          "type": "integer"
+        },
+        "last_segment": {
+          "minimum": 0,
+          "title": "Last Segment",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "index",
+        "start",
+        "end",
+        "first_segment",
+        "last_segment"
+      ],
+      "title": "Paragraph",
+      "type": "object"
+    },
+    "Quality": {
+      "additionalProperties": false,
+      "properties": {
+        "speech_seconds": {
+          "minimum": 0,
+          "title": "Speech Seconds",
+          "type": "number"
+        },
+        "transcribed_seconds": {
+          "minimum": 0,
+          "title": "Transcribed Seconds",
+          "type": "number"
+        },
+        "decoder_anomalies": {
+          "minimum": 0,
+          "title": "Decoder Anomalies",
+          "type": "integer"
+        },
+        "flags_by_kind": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Flags By Kind",
+          "type": "object"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Warnings",
+          "type": "array"
+        }
+      },
+      "required": [
+        "speech_seconds",
+        "transcribed_seconds",
+        "decoder_anomalies",
+        "flags_by_kind",
+        "warnings"
+      ],
+      "title": "Quality",
+      "type": "object"
+    },
+    "Reading": {
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "title": "Source",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "text"
+      ],
+      "title": "Reading",
+      "type": "object"
+    },
+    "Segment": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "minimum": 0,
+          "title": "Id",
+          "type": "integer"
+        },
+        "start": {
+          "minimum": 0,
+          "title": "Start",
+          "type": "number"
+        },
+        "end": {
+          "minimum": 0,
+          "title": "End",
+          "type": "number"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "words": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Word"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Words"
+        },
+        "source": {
+          "$ref": "#/$defs/SourceRef"
+        },
+        "edits": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Edit"
+          },
+          "title": "Edits",
+          "type": "array"
+        },
+        "flags": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Flag"
+          },
+          "title": "Flags",
+          "type": "array"
+        },
+        "paragraph": {
+          "minimum": 0,
+          "title": "Paragraph",
+          "type": "integer"
+        },
+        "chapter": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Chapter"
+        }
+      },
+      "required": [
+        "id",
+        "start",
+        "end",
+        "text",
+        "source",
+        "paragraph"
+      ],
+      "title": "Segment",
+      "type": "object"
+    },
+    "SourceRef": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "asr",
+            "caption_manual",
+            "caption_auto"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "run": {
+          "title": "Run",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "run"
+      ],
+      "title": "SourceRef",
+      "type": "object"
+    },
+    "Transcript": {
+      "additionalProperties": false,
+      "properties": {
+        "language": {
+          "title": "Language",
+          "type": "string"
+        },
+        "script": {
+          "enum": [
+            "zh-Hans",
+            "zh-Hant",
+            "n/a"
+          ],
+          "title": "Script",
+          "type": "string"
+        },
+        "runs": {
+          "items": {
+            "$ref": "#/$defs/TranscriptRun"
+          },
+          "title": "Runs",
+          "type": "array"
+        },
+        "punctuation": {
+          "enum": [
+            "engine",
+            "llm",
+            "caption",
+            "none"
+          ],
+          "title": "Punctuation",
+          "type": "string"
+        },
+        "correction_llm": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Correction Llm"
+        }
+      },
+      "required": [
+        "language",
+        "script",
+        "runs",
+        "punctuation",
+        "correction_llm"
+      ],
+      "title": "Transcript",
+      "type": "object"
+    },
+    "TranscriptRun": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "asr",
+            "caption_manual",
+            "caption_auto"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "engine": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Engine"
+        },
+        "model_repo": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Model Repo"
+        },
+        "model_revision": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Model Revision"
+        },
+        "params": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Params",
+          "type": "object"
+        },
+        "vad": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Vad"
+        },
+        "chunking": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Chunking"
+        },
+        "aligner": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Aligner"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "engine",
+        "model_repo",
+        "model_revision",
+        "params",
+        "vad",
+        "chunking",
+        "aligner"
+      ],
+      "title": "TranscriptRun",
+      "type": "object"
+    },
+    "Video": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "url": {
+          "title": "Url",
+          "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "channel": {
+          "title": "Channel",
+          "type": "string"
+        },
+        "channel_id": {
+          "title": "Channel Id",
+          "type": "string"
+        },
+        "upload_date": {
+          "anyOf": [
+            {
+              "format": "date",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Upload Date"
+        },
+        "duration_s": {
+          "minimum": 0,
+          "title": "Duration S",
+          "type": "number"
+        },
+        "description": {
+          "title": "Description",
+          "type": "string"
+        },
+        "language": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Language"
+        },
+        "tags": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Tags",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "url",
+        "title",
+        "channel",
+        "channel_id",
+        "upload_date",
+        "duration_s",
+        "description",
+        "language",
+        "tags"
+      ],
+      "title": "Video",
+      "type": "object"
+    },
+    "Word": {
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "start": {
+          "minimum": 0,
+          "title": "Start",
+          "type": "number"
+        },
+        "end": {
+          "minimum": 0,
+          "title": "End",
+          "type": "number"
+        },
+        "conf": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Conf"
+        }
+      },
+      "required": [
+        "text",
+        "start",
+        "end"
+      ],
+      "title": "Word",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "generator": {
+      "$ref": "#/$defs/Generator"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "video": {
+      "$ref": "#/$defs/Video"
+    },
+    "access": {
+      "$ref": "#/$defs/Access"
+    },
+    "transcript": {
+      "$ref": "#/$defs/Transcript"
+    },
+    "chapters": {
+      "items": {
+        "$ref": "#/$defs/Chapter"
+      },
+      "title": "Chapters",
+      "type": "array"
+    },
+    "paragraphs": {
+      "items": {
+        "$ref": "#/$defs/Paragraph"
+      },
+      "title": "Paragraphs",
+      "type": "array"
+    },
+    "segments": {
+      "items": {
+        "$ref": "#/$defs/Segment"
+      },
+      "title": "Segments",
+      "type": "array"
+    },
+    "quality": {
+      "$ref": "#/$defs/Quality"
+    },
+    "llm_usage": {
+      "items": {
+        "$ref": "#/$defs/LLMUsage"
+      },
+      "title": "Llm Usage",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "generator",
+    "created_at",
+    "video",
+    "access",
+    "transcript",
+    "chapters",
+    "paragraphs",
+    "segments",
+    "quality",
+    "llm_usage"
+  ],
+  "title": "ContextDocument",
+  "type": "object"
+}
