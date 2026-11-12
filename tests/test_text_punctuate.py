@@ -61,6 +61,30 @@ def test_density_flags_a_lowercase_english_intro_but_not_the_punctuated_rest() -
     assert not needs_punctuation(EN_FINE, "en")
 
 
+def test_a_lowercase_english_stretch_that_already_ends_in_periods_needs_recasing() -> None:
+    assert needs_punctuation("hey everyone welcome back to the channel. today we cover the q4 2026 results.", "en")
+
+
+def test_cased_english_and_short_lowercase_fragments_are_left_alone() -> None:
+    assert not needs_punctuation("Hey everyone, welcome back to the channel. Today we cover the q4 2026 results.", "en")
+    assert not needs_punctuation("so we go.", "en")
+    assert not needs_punctuation("1 2 3 4 5 6 7 8 9 10.", "en")
+
+
+def test_zh_text_with_marks_is_unaffected_by_the_case_check() -> None:
+    assert not needs_punctuation("大家好，欢迎回来。今天我们聊聊个股的估值问题。", "zh")
+
+
+def test_a_lowercase_punctuated_english_stretch_is_sent_to_the_llm(tmp_path: Path) -> None:
+    text = "hey everyone welcome back to the channel. today we cover the q4 2026 results."
+    fixed = "Hey everyone welcome back to the channel. Today we cover the Q4 2026 results."
+    client = FakeClient([reply((0, fixed))])
+    result = run([text, EN_FINE], client, tmp_path, "en")
+    assert [item["i"] for item in asked(client.requests[0])] == [0]
+    assert result.texts == (fixed, EN_FINE)
+    assert "even when the text already ends in a period" in client.requests[0].system
+
+
 def test_density_ignores_blank_text() -> None:
     assert not needs_punctuation("   ", "en")
     assert not needs_punctuation("", "zh")

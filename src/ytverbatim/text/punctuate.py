@@ -1,12 +1,12 @@
 """LLM pass that restores punctuation where an ASR stretch has none.
 
 Whisper large-v3 often returns Mandarin with no punctuation at all (sometimes with a space at each pause), and English
-with an unpunctuated, lowercase first stretch. Stretches that already carry enough sentence-final marks pass through
-untouched. For the rest, the LLM may add or replace punctuation, turn pause spaces into punctuation and capitalise
-English sentence starts; it may not add, drop or change a letter, CJK character or digit. `guard_violation` enforces
-that on every reply: a violating item is retried once with the diff, and when it fails again the original text is kept
-and its index is reported in `PunctuationResult.failed`. A reply that is not the expected JSON raises `LLMOutputError`
-rather than shipping unpunctuated text as if it had been handled.
+with an unpunctuated, lowercase first stretch. Stretches that already carry enough sentence-final marks and, in Latin
+script, some capitals pass through untouched. For the rest, the LLM may add or replace punctuation, turn pause spaces
+into punctuation and capitalise English sentence starts; it may not add, drop or change a letter, CJK character
+or digit. `guard_violation` enforces that on every reply: a violating item is retried once with the diff, and when it
+fails again the original text is kept and its index is reported in `PunctuationResult.failed`. A reply that is not the
+expected JSON raises `LLMOutputError` rather than shipping unpunctuated text as if it had been handled.
 
 Each batch that passes the guard is checkpointed, so a resume never pays twice for a finished batch.
 """
@@ -34,8 +34,11 @@ from ytverbatim.text.segment import is_punctuated, uses_zh_rules
 _log = logging.getLogger(__name__)
 
 # Part of every checkpoint and stage key: bump it on any prompt, guard or logic change so stored results are redone.
-PROMPT_VERSION = "punctuation-v2"
+PROMPT_VERSION = "punctuation-v3"
 BATCH_CHARS = 1500
+# A Latin stretch this long without one capital is Whisper's lowercase decoding, not a chat fragment or a lone
+# lowercase brand: real prose of this length carries at least a sentence start or an "I".
+_UNCASED_MIN_WORDS = 8
 STAGE = "punctuation"
 
 # Replies echo their input, and the claude CLI also counts thinking tokens here.
@@ -62,8 +65,9 @@ _STYLE_RULES: dict[Style, str] = {
         "numbers stays. Leave the case of Latin letters as given. "
     ),
     "en": (
-        "Use ASCII punctuation. Capitalise the first letter of each sentence, and proper nouns and acronyms that are "
-        "unmistakable (the I pronoun, NVDA, Fed); change nothing else about the letters. "
+        "Use ASCII punctuation. Capitalise the first letter of each sentence, even when the text already ends in a "
+        "period, and capitalise proper nouns and acronyms that are unmistakable (the I pronoun, NVDA, Fed, Q4). Only "
+        "ever turn a lowercase letter into its capital; never add, drop, respell or change a word. "
     ),
 }
 _SYSTEM = (
@@ -109,7 +113,15 @@ class _Rejected:
 
 
 def needs_punctuation(text: str, language: str) -> bool:
-    return bool(text.strip()) and not is_punctuated(text, language)
+    return bool(text.strip()) and (not is_punctuated(text, language) or _is_uncased(text, language))
+
+
+def _is_uncased(text: str, language: str) -> bool:
+    """Latin-script text long enough to have capitals that has none, even when it already ends in periods."""
+    if uses_zh_rules(text, language) or len(text.split()) < _UNCASED_MIN_WORDS:
+        return False
+    letters = [char for char in text if char.isalpha()]
+    return any(char.isascii() for char in letters) and not any(char.isupper() for char in letters)
 
 
 @dataclass(frozen=True, slots=True)
