@@ -66,6 +66,31 @@ def zh_rows(request: WorkerRequest) -> list[ChunkHypothesis]:
     ]
 
 
+# Whisper's usual English failure: the opening stretch lowercase and unpunctuated, the rest punctuated.
+EN_OPENING = (
+    "so today we are going to talk about how the market reacts when the fed changes its mind about rates "
+    "and why that matters for anyone who holds stocks or bonds right now because the next few months could be "
+    "very different from the last few"
+)
+EN_REST = "Markets rose today. Then they fell sharply. Nobody was surprised by that outcome at all."
+
+
+def en_rows(request: WorkerRequest) -> list[ChunkHypothesis]:
+    texts = (EN_OPENING, EN_REST)
+    return [
+        ChunkHypothesis(
+            hypothesis=request.engine.spec.id,
+            file=request.files[0].id,
+            chunk=index,
+            start=10.0 * index,
+            end=10.0 * index + 8.0,
+            text=text,
+            language="en",
+        )
+        for index, text in enumerate(texts)
+    ]
+
+
 @dataclass
 class FakeWorker:
     calls: list[WorkerRequest] = field(default_factory=list[WorkerRequest])
@@ -74,7 +99,7 @@ class FakeWorker:
         self.calls.append(request)
         out = Path(request.out_dir)
         out.mkdir(parents=True, exist_ok=True)
-        rows = zh_rows(request)
+        rows = en_rows(request) if request.files[0].id == EN else zh_rows(request)
         (out / HYPOTHESES_FILE).write_text("".join(row.model_dump_json() + "\n" for row in rows), encoding="utf-8")
         metrics = RunMetrics(
             hypothesis=request.engine.spec.id,
@@ -108,7 +133,7 @@ class FakeLLM:
             raise LLMUnavailableError(f"{self.id}: synthetic outage")
         if "SEGMENTS:" in request.user and '"items"' in request.user:
             items = json.loads(request.user.split("SEGMENTS:\n", 1)[1])
-            reply: object = {"items": [{"i": it["i"], "text": it["text"].replace(" ", "，") + "。"} for it in items]}
+            reply: object = {"items": [{"i": it["i"], "text": _punctuated(it["text"])} for it in items]}
         elif "SEGMENTS:" in request.user:
             reply = {"fixed": []}
         else:
@@ -126,6 +151,12 @@ class FakeLLM:
             "numeric" if "ITEMS:" in r.user else "punctuate" if '"items"' in r.user else "correct"
             for r in self.requests
         ]
+
+
+def _punctuated(text: str) -> str:
+    if text.isascii():
+        return text[:1].upper() + text[1:] + "."
+    return text.replace(" ", "，") + "。"
 
 
 @pytest.fixture(autouse=True)
@@ -365,3 +396,14 @@ def test_render_rewrites_the_markdown_from_context_json(session_kit, worker, mon
     assert printed.output == expected
     (vdir / "broken.json").write_text("{}", encoding="utf-8")
     assert CliRunner().invoke(main, ["render", str(vdir / "broken.json")]).exit_code == 1
+
+
+def test_only_the_unpunctuated_stretch_of_a_punctuated_video_goes_to_the_llm(session_kit, worker) -> None:
+    llm = FakeLLM()
+    _, results, _ = run(session_kit, session_kit.yt(), [EN], llm=llm)
+    doc = only_document(results)
+    (asked,) = [r for r in llm.requests if '"items"' in r.user]
+    sent = [item["text"] for item in json.loads(asked.user.split("SEGMENTS:\n", 1)[1])]
+    assert len(sent) >= 2 and " ".join(sent) in EN_OPENING, "only the unpunctuated opening is sent"
+    assert doc.segments[0].text.startswith("So today") and doc.transcript.punctuation == "llm"
+    assert [s.text for s in doc.segments[-2:]] == ["Then they fell sharply.", EN_REST[44:]]
