@@ -11,6 +11,7 @@ import pytest
 
 from ytverbatim import proc, sysmem
 from ytverbatim.errors import DependencyError, ProcMemoryExceeded, ProcTimeout
+from ytverbatim.sysmem import Footprint
 
 MIB = 1 << 20
 
@@ -51,6 +52,25 @@ def script(tmp_path: Path) -> Path:
                 for _ in range(15):
                     held.append(b"x" * (100 << 20))
                     time.sleep(0.05)
+                time.sleep(60)
+            if mode in ("serve", "stubborn"):
+                import signal, subprocess
+                if mode == "stubborn":
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                ready = sys.argv[2] + ".helper"
+                helper = subprocess.Popen([
+                    sys.executable,
+                    "-c",
+                    "import signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                    "open(sys.argv[1], 'w').close(); time.sleep(60)",
+                    ready,
+                ])
+                while not os.path.exists(ready):
+                    time.sleep(0.01)
+                print("listening", flush=True)
+                print("warming up", file=sys.stderr, flush=True)
+                open(sys.argv[2] + ".tmp", "w").write(f"{os.getpid()} {helper.pid}")
+                os.replace(sys.argv[2] + ".tmp", sys.argv[2])
                 time.sleep(60)
             """
         ),
@@ -248,3 +268,142 @@ def test_a_child_that_exits_as_a_trigger_fires_is_collected_not_reported_killed(
         result = proc.run([sys.executable, str(script), "echo", "0"], timeout_s=30, memory_watch=watch)
     assert (result.returncode, result.stdout) == (0, "out:")
     assert len(waits) == 2
+
+
+def _until(condition: Callable[[], bool], within_s: float = 10) -> None:
+    deadline = time.monotonic() + within_s
+    while not condition():
+        assert time.monotonic() < deadline, "condition not met in time"
+        time.sleep(0.02)
+
+
+def _pids(pid_file: Path) -> tuple[int, int]:
+    _until(pid_file.exists)
+    leader, helper = map(int, pid_file.read_text(encoding="utf-8").split())
+    return leader, helper
+
+
+def _all_gone(leader: int, helper: int) -> bool:
+    return _group_gone(leader) and _gone(lambda: os.kill(helper, 0))
+
+
+def _serve(script: Path, pid_file: Path, mode: str = "serve") -> list[str]:
+    return [sys.executable, str(script), mode, str(pid_file)]
+
+
+def test_background_kills_the_whole_group_on_a_normal_exit(script: Path, tmp_path: Path) -> None:
+    pid_file, log = tmp_path / "pids", tmp_path / "server.log"
+    watch = proc.MemoryWatch(1 << 40, poll_s=0.05, available_percent=_plenty)
+    with proc.background(_serve(script, pid_file), log=log, memory_watch=watch) as server:
+        leader, helper = _pids(pid_file)
+        assert server.pid == leader
+        assert server.alive()
+        _until(lambda: server.peak_footprint_bytes is not None)
+    # The helper ignores SIGTERM, so it is gone only because SIGKILL follows the leader's clean exit.
+    assert _all_gone(leader, helper)
+    assert not server.alive()
+    assert server.returncode == -15
+    assert log.read_text(encoding="utf-8").splitlines() == ["listening", "warming up"]
+    assert server.peak_footprint_bytes is not None
+    assert server.peak_footprint_bytes > MIB
+
+
+def test_background_kills_the_whole_group_when_the_block_raises(script: Path, tmp_path: Path) -> None:
+    pid_file = tmp_path / "pids"
+    watch = proc.MemoryWatch(1 << 40, poll_s=0.05, available_percent=_plenty)
+    with (
+        pytest.raises(RuntimeError, match="body failed"),
+        proc.background(_serve(script, pid_file), log=tmp_path / "log", memory_watch=watch),
+    ):
+        leader, helper = _pids(pid_file)
+        raise RuntimeError("body failed")
+    assert _all_gone(leader, helper)
+
+
+def test_background_escalates_to_sigkill_after_the_grace(script: Path, tmp_path: Path) -> None:
+    pid_file = tmp_path / "pids"
+    watch = proc.MemoryWatch(1 << 40, poll_s=0.05, available_percent=_plenty)
+    started = time.monotonic()
+    with proc.background(
+        _serve(script, pid_file, "stubborn"), log=tmp_path / "log", memory_watch=watch, term_grace_s=0.3
+    ) as server:
+        leader, helper = _pids(pid_file)
+    assert time.monotonic() - started < 10
+    assert server.returncode == -9
+    assert _all_gone(leader, helper)
+
+
+def test_a_footprint_breach_kills_the_group_and_is_raised_chained_to_the_block_error(
+    script: Path, tmp_path: Path
+) -> None:
+    pid_file = tmp_path / "pids"
+    over = {"now": False}
+
+    def footprint(_pid: int) -> Footprint:
+        return Footprint(current=2 << 30, peak=3 << 30) if over["now"] else Footprint(MIB, MIB)
+
+    watch = proc.MemoryWatch(1 << 30, poll_s=0.05, footprint=footprint, available_percent=_plenty)
+    with (
+        pytest.raises(ProcMemoryExceeded) as info,
+        proc.background(_serve(script, pid_file), log=tmp_path / "log", memory_watch=watch) as server,
+    ):
+        leader, helper = _pids(pid_file)
+        over["now"] = True
+        _until(lambda: not server.alive(), within_s=5)
+        raise ConnectionRefusedError("server went away")
+    assert server.returncode == -9
+    assert info.value.trigger == "footprint"
+    assert (info.value.footprint_bytes, info.value.cap_bytes) == (2 << 30, 1 << 30)
+    assert isinstance(info.value.__cause__, ConnectionRefusedError)
+    assert server.peak_footprint_bytes == 3 << 30
+    assert _all_gone(leader, helper)
+
+
+def test_an_available_memory_breach_is_raised_at_a_clean_exit(script: Path, tmp_path: Path) -> None:
+    pid_file = tmp_path / "pids"
+    short = {"now": False}
+    watch = proc.MemoryWatch(1 << 40, poll_s=0.05, available_percent=lambda: 4 if short["now"] else 50)
+    with (
+        pytest.raises(ProcMemoryExceeded) as info,
+        proc.background(_serve(script, pid_file), log=tmp_path / "log", memory_watch=watch) as server,
+    ):
+        leader, helper = _pids(pid_file)
+        short["now"] = True
+        _until(lambda: not server.alive(), within_s=5)
+    assert (info.value.trigger, info.value.available_percent) == ("available", 4)
+    assert info.value.__cause__ is None
+    assert _all_gone(leader, helper)
+
+
+def test_a_child_that_exits_on_its_own_is_not_alive_and_exits_cleanly(script: Path, tmp_path: Path) -> None:
+    watch = proc.MemoryWatch(1 << 40, poll_s=0.05, available_percent=_plenty)
+    with proc.background(
+        [sys.executable, str(script), "echo", "3"], log=tmp_path / "log", memory_watch=watch
+    ) as server:
+        _until(lambda: not server.alive())
+        assert server.returncode == 3
+    # stdout and stderr share the log; which lands first depends on the child's buffering.
+    assert (tmp_path / "log").read_text(encoding="utf-8") in {"out:err", "errout:"}
+
+
+def test_a_watch_that_cannot_read_memory_stops_the_child_and_fails_loud(script: Path, tmp_path: Path) -> None:
+    def unreadable(_pid: int) -> Footprint:
+        raise DependencyError("cannot read the footprint")
+
+    pid_file = tmp_path / "pids"
+    watch = proc.MemoryWatch(1 << 40, poll_s=0.05, footprint=unreadable, available_percent=_plenty)
+    with (
+        pytest.raises(DependencyError, match="cannot read"),
+        proc.background(_serve(script, pid_file), log=tmp_path / "log", memory_watch=watch) as server,
+    ):
+        _until(lambda: not server.alive(), within_s=5)
+    assert server.returncode == -9
+
+
+def test_background_reports_a_missing_binary(tmp_path: Path) -> None:
+    watch = proc.MemoryWatch(1 << 40, available_percent=_plenty)
+    with (
+        pytest.raises(DependencyError, match="ytverbatim-no-such-binary"),
+        proc.background(["ytverbatim-no-such-binary"], log=tmp_path / "log", memory_watch=watch),
+    ):
+        pass
