@@ -82,7 +82,7 @@ STAGE_VERSIONS: dict[str, int] = {
     "captions": 1,
     "second_opinion": 1,
     "normalize": 1,
-    "punctuate": 1,
+    "punctuate": 2,
     "correct": 1,
     "numeric": 1,
     "context": 1,
@@ -641,10 +641,11 @@ class _VideoRun:
         def compute() -> _TextResult:
             stretches = previous.stretches
             texts = [stretch.text for stretch in stretches]
-            if not needs_punctuation(" ".join(texts), language):
+            # Per stretch: Whisper often leaves only the opening minute unpunctuated in an otherwise punctuated video.
+            if not any(needs_punctuation(text, language) for text in texts):
                 return _TextResult(stretches=stretches)
             if llm is None:
-                notice = "punctuation not restored: the transcript has few sentence marks and no LLM is configured"
+                notice = "punctuation not restored: some stretches have few sentence marks and no LLM is configured"
                 return _TextResult(stretches=stretches, notice=notice)
             result = punctuate(texts, language=language, client=llm, checkpoint_dir=self.store.work_dir("punctuate"))
             failed = set(result.failed)
