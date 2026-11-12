@@ -178,7 +178,15 @@ def process_many(  # noqa: PLR0913
         max_videos=options.ytdlp.max_videos_per_run,
         ignore_cooldown=ignore_cooldown,
     )
-    settings = _Settings(definition, out, force, options.text.chapters == "youtube", progress or _no_progress, clock)
+    settings = _Settings(
+        definition,
+        out,
+        force,
+        options.text.chapters == "youtube",
+        progress or _no_progress,
+        clock,
+        asr_runner.memory_cap_bytes(options.asr.memory_cap_gib),
+    )
     hook = _RunHook(settings)
 
     def emit(outcome: VideoOutcome) -> None:
@@ -211,6 +219,7 @@ class _Settings:
     chapters: bool
     emit: Callable[[ProgressEvent], None]
     clock: Callable[[], datetime]
+    memory_cap_bytes: int | None
 
 
 def _definition(options: config.Options) -> EngineDef:
@@ -325,6 +334,7 @@ def _transcribe(vdir: Path, access: Access, settings: _Settings) -> ContextDocum
         engine=definition,
         out_dir=str(asr_dir),
         files=(FileJob(id=video_id, wav=str(vdir / WAV_NAME), language=metadata.language),),
+        memory_cap_bytes=settings.memory_cap_bytes,
     )
     result = asr_runner.run_worker(request)
     rows = _read_rows(result.hypotheses, video_id)

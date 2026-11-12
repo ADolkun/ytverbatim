@@ -51,7 +51,7 @@ from evals.store import (
     write_json,
     write_rows,
 )
-from ytverbatim import atomic, paths
+from ytverbatim import atomic, config, paths
 from ytverbatim.acquire.captions import CaptionKind, parse_json3
 from ytverbatim.acquire.metadata import trim_info
 from ytverbatim.asr import registry
@@ -59,7 +59,7 @@ from ytverbatim.asr.chunks import DEFAULT_MAX_CHUNK_S, Region, alignment_windows
 from ytverbatim.asr.context import context_from_metadata
 from ytverbatim.asr.models import ChunkHypothesis, FileJob, WorkerRequest
 from ytverbatim.asr.protocol import EngineDef
-from ytverbatim.asr.runner import WorkerResult, run_worker, worker_lock
+from ytverbatim.asr.runner import WorkerResult, memory_cap_bytes, run_worker, worker_lock
 from ytverbatim.contract.models import Word
 from ytverbatim.errors import ConfigError, YtverbatimError
 from ytverbatim.llm import ClaudeCLIClient
@@ -140,6 +140,7 @@ def run_hypothesis(
     definition: EngineDef | None = None,
     worker: Worker = run_worker,
     free: Callable[[Path], int] = disk.free_bytes,
+    memory_cap: int | None = None,
 ) -> AsrOutcome:
     definition = definition or registry.get(hypothesis)
     done = rows_by_file(store, hypothesis)
@@ -163,6 +164,7 @@ def run_hypothesis(
             out_dir=str(store.file_run_dir(hypothesis, video.id)),
             files=(file_job(store, video, definition, require_plan(store, video.id)),),
             hf_hub_cache=str(cache),
+            memory_cap_bytes=memory_cap,
         )
         result = worker(request)
         append_history(
@@ -304,7 +306,8 @@ def vad(files: str | None, hf_cache: Path | None) -> None:
 def asr(hypothesis: str, files: str | None, hf_cache: Path | None) -> None:
     """Decode the selected files with one hypothesis (resumes per chunk)."""
     store, manifest = layout(), load_manifest()
-    outcome = run_hypothesis(store, manifest, hypothesis, _files(files), hf_cache or default_hf_cache())
+    cap = memory_cap_bytes(config.load_options().asr.memory_cap_gib)
+    outcome = run_hypothesis(store, manifest, hypothesis, _files(files), hf_cache or default_hf_cache(), memory_cap=cap)
     if not outcome.results:
         click.echo(f"{hypothesis}: complete for all {len(outcome.skipped_files)} selected files")
         return

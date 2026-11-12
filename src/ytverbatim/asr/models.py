@@ -75,6 +75,8 @@ class WorkerRequest(_Model):
     out_dir: str
     files: tuple[FileJob, ...]
     hf_hub_cache: str | None = None
+    # The parent kills the worker above this footprint; the worker also hands it to MLX as its memory limit.
+    memory_cap_bytes: Annotated[int, Field(gt=0)] | None = None
     # Off only for diagnostics: the guard hides an engine's raw failure rate by re-decoding what failed.
     quality_guard: bool = True
 
@@ -89,8 +91,8 @@ class WorkerRequest(_Model):
         return self
 
     def fingerprint(self) -> dict[str, JsonValue]:
-        """Everything that decides the decoded text; where the output and the weights live does not."""
-        return self.model_dump(mode="json", exclude={"out_dir", "hf_hub_cache"})
+        """Everything that decides the decoded text; where the output and the weights live and the memory cap do not."""
+        return self.model_dump(mode="json", exclude={"out_dir", "hf_hub_cache", "memory_cap_bytes"})
 
 
 class WorkerError(_Model):

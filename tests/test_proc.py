@@ -1,13 +1,17 @@
 import os
+import subprocess
 import sys
 import textwrap
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from ytverbatim import proc
-from ytverbatim.errors import DependencyError, ProcTimeout
+from ytverbatim import proc, sysmem
+from ytverbatim.errors import DependencyError, ProcMemoryExceeded, ProcTimeout
+
+MIB = 1 << 20
 
 
 @pytest.fixture
@@ -26,6 +30,19 @@ def script(tmp_path: Path) -> Path:
                 print(os.environ.get("YTV_TEST_VAR", "<unset>"), os.getcwd())
             if mode == "sleep":
                 open(sys.argv[2], "w").write(str(os.getpid()))
+                time.sleep(60)
+            if mode == "slow-echo":
+                time.sleep(0.6)
+                data = sys.stdin.read()
+                sys.stdout.write(f"{len(data)}:{data[:3]}")
+            if mode == "hog":
+                import subprocess
+                helper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+                open(sys.argv[2], "w").write(f"{os.getpid()} {helper.pid}")
+                held = []
+                for _ in range(15):
+                    held.append(b"x" * (100 << 20))
+                    time.sleep(0.05)
                 time.sleep(60)
             """
         ),
@@ -100,3 +117,89 @@ def test_non_executable_file_is_a_dependency_error(tmp_path: Path) -> None:
 def test_missing_cwd_is_not_reported_as_a_missing_binary(script: Path, tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         proc.run([sys.executable, str(script), "env"], timeout_s=5, cwd=tmp_path / "absent")
+
+
+def _plenty() -> int:
+    return 50
+
+
+def _group_gone(pgid: int) -> bool:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_memory_watch_kills_a_hog_and_its_whole_group(script: Path, tmp_path: Path) -> None:
+    pid_file = tmp_path / "pids"
+    watch = proc.MemoryWatch(600 * MIB, poll_s=0.1, available_percent=_plenty)
+    with pytest.raises(ProcMemoryExceeded) as info:
+        proc.run([sys.executable, str(script), "hog", str(pid_file)], timeout_s=60, memory_watch=watch)
+    error = info.value
+    assert error.trigger == "footprint"
+    assert error.footprint_bytes is not None
+    assert 600 * MIB < error.footprint_bytes < 1400 * MIB
+    assert (error.cap_bytes, error.available_percent, error.floor_percent) == (600 * MIB, 50, 10)
+    assert "physical footprint reached" in str(error)
+    assert "over the 0.59 GiB cap" in str(error)
+    hog, helper = map(int, pid_file.read_text(encoding="utf-8").split())
+    assert _group_gone(hog)
+    with pytest.raises(ProcessLookupError):
+        os.kill(helper, 0)
+
+
+def test_memory_watch_stops_the_child_when_the_machine_runs_short(script: Path, tmp_path: Path) -> None:
+    pid_file = tmp_path / "pid"
+    watch = proc.MemoryWatch(1 << 40, poll_s=0.1, available_percent=lambda: 7)
+    started = time.monotonic()
+    with pytest.raises(ProcMemoryExceeded) as info:
+        proc.run([sys.executable, str(script), "sleep", str(pid_file)], timeout_s=60, memory_watch=watch)
+    assert time.monotonic() - started < 30
+    assert info.value.trigger == "available"
+    assert info.value.available_percent == 7
+    assert "fell to 7%, under the 10% floor" in str(info.value)
+    assert _group_gone(int(pid_file.read_text(encoding="utf-8")))
+
+
+def test_memory_watch_keeps_feeding_stdin_and_collects_output(script: Path) -> None:
+    payload = "héllo" * 200_000
+    watch = proc.MemoryWatch(1 << 40, poll_s=0.1, available_percent=_plenty)
+    result = proc.run([sys.executable, str(script), "slow-echo"], timeout_s=30, stdin=payload, memory_watch=watch)
+    assert (result.returncode, result.stdout) == (0, f"{len(payload)}:hél")
+    assert result.peak_footprint_bytes is not None
+    assert result.peak_footprint_bytes > 0
+
+
+def test_memory_watch_still_times_out(script: Path, tmp_path: Path) -> None:
+    pid_file = tmp_path / "pid"
+    watch = proc.MemoryWatch(1 << 40, poll_s=0.4, available_percent=_plenty)
+    started = time.monotonic()
+    with pytest.raises(ProcTimeout):
+        proc.run([sys.executable, str(script), "sleep", str(pid_file)], timeout_s=1.0, memory_watch=watch)
+    assert time.monotonic() - started < 10
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text(encoding="utf-8")), 0)
+
+
+def test_without_a_watch_nothing_polls(script: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    timeouts: list[float | None] = []
+    original = subprocess.Popen.communicate
+
+    def spy(self: subprocess.Popen[str], input: Any = None, timeout: float | None = None) -> Any:
+        timeouts.append(timeout)
+        return original(self, input, timeout)
+
+    def unexpected(*_: object) -> None:
+        raise AssertionError("memory read without a watch")
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", spy)
+    monkeypatch.setattr(sysmem, "footprint", unexpected)
+    monkeypatch.setattr(sysmem, "available_percent", unexpected)
+    result = proc.run([sys.executable, str(script), "slow-echo"], timeout_s=30, stdin="abc")
+    assert result.stdout == "3:abc"
+    assert result.peak_footprint_bytes is None
+    assert timeouts == [30]

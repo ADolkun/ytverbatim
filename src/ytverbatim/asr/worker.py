@@ -4,6 +4,7 @@ Everything that needs MLX happens here, never in the parent. `-P` keeps the work
 checkout in the current directory cannot shadow the installed package.
 """
 
+import importlib
 import json
 import math
 import os
@@ -39,17 +40,33 @@ from ytverbatim.errors import EngineError
 EXIT_FAILED = 1
 EXIT_BAD_REQUEST = 2
 _PLAN_TOLERANCE_S = 1e-3
+# Measured on f-aed: a 1 or 2 GiB freed-buffer cache decoded no faster than none (about 9.6-9.8 s per chunk either
+# way) and only added its own size to the footprint.
+CACHE_LIMIT_BYTES = 0
 
 
 class _MlxCore(Protocol):
     def get_peak_memory(self) -> int: ...
 
 
-def run_request(request: WorkerRequest, *, engine: Engine | None = None, guard: Guard | None = None) -> RunMetrics:
+class MlxAllocator(Protocol):
+    def set_memory_limit(self, limit: int) -> int: ...
+    def set_cache_limit(self, limit: int) -> int: ...
+    def clear_cache(self) -> None: ...
+
+
+def run_request(
+    request: WorkerRequest,
+    *,
+    engine: Engine | None = None,
+    guard: Guard | None = None,
+    mlx: MlxAllocator | None = None,
+) -> RunMetrics:
     """Decode every file, appending one flushed JSONL line per chunk and skipping chunks already on disk.
 
     `engine` replaces the one built from the request, for in-process tests. `guard` is the hook for the quality
-    checks: it sees every decoded chunk and may decode again before the line is written.
+    checks: it sees every decoded chunk and may decode again before the line is written. `mlx` is the allocator to
+    bound before anything loads and to empty after every chunk; `main` passes `mlx.core`.
     """
     spec = request.engine.spec
     out = Path(request.out_dir)
@@ -58,7 +75,9 @@ def run_request(request: WorkerRequest, *, engine: Engine | None = None, guard: 
     sink_path = out / HYPOTHESES_FILE
     _claim_output(out, request)
     done = _read_done(sink_path, spec.id)
-    session = _Session(request.engine, engine, guard)
+    if mlx is not None:
+        bound_allocator(mlx, request.memory_cap_bytes)
+    session = _Session(request.engine, engine, guard, mlx)
     decoded = skipped = 0
     audio_s = 0.0
     with sink_path.open("a", encoding="utf-8") as sink:
@@ -93,10 +112,13 @@ def run_request(request: WorkerRequest, *, engine: Engine | None = None, guard: 
 class _Session:
     """Builds and loads the engine on the first chunk that needs decoding, so a fully resumed run loads nothing."""
 
-    def __init__(self, definition: EngineDef, engine: Engine | None, guard: Guard | None) -> None:
+    def __init__(
+        self, definition: EngineDef, engine: Engine | None, guard: Guard | None, mlx: MlxAllocator | None
+    ) -> None:
         self._definition = definition
         self._engine = engine
         self._guard = guard
+        self._mlx = mlx
         self._loaded = False
         self.load_s = 0.0
         self.decode_s = 0.0
@@ -118,6 +140,8 @@ class _Session:
             raise EngineError(f"{hypothesis} failed on {where}: {exc}") from exc
         finally:
             self.decode_s += time.perf_counter() - started
+        if self._mlx is not None:
+            self._mlx.clear_cache()
         return _row(hypothesis, job.id, index, chunk, guarded)
 
     def _ready(self) -> Engine:
@@ -236,9 +260,29 @@ def _require_same_chunk(existing: ChunkHypothesis, chunk: Chunk) -> None:
         )
 
 
+def bound_allocator(mlx: MlxAllocator, memory_cap_bytes: int | None) -> None:
+    """Keep MLX's freed-buffer cache small and steer its scheduling under the cap.
+
+    MLX defaults both limits to about the whole of RAM, so without this the cache alone can grow until the machine
+    stops. The memory limit only makes MLX wait for queued work before allocating more; the parent's watch is the
+    hard stop.
+    """
+    mlx.set_cache_limit(CACHE_LIMIT_BYTES)
+    if memory_cap_bytes is not None:
+        mlx.set_memory_limit(memory_cap_bytes)
+
+
+def _mlx_allocator() -> MlxAllocator | None:
+    # Without MLX installed no engine can allocate through it, and the engine's own load reports the missing extra.
+    try:
+        return cast(MlxAllocator, importlib.import_module("mlx.core"))
+    except ImportError:
+        return None
+
+
 def _peak_memory_bytes() -> int | None:
-    # Only a process that already ran an MLX engine or the VAD has the module; importing it here would defeat a
-    # fake-engine run, and there is no peak to report without it.
+    # The module is loaded only where MLX is installed and `main` bounded it or an engine used it; importing it here
+    # would fail an in-process run without MLX, which has no peak to report.
     core = sys.modules.get("mlx.core")
     return None if core is None else cast(_MlxCore, core).get_peak_memory()
 
@@ -257,7 +301,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # huggingface_hub reads this when it is first imported, which only happens inside an adapter.
         os.environ["HF_HUB_CACHE"] = request.hf_hub_cache
     try:
-        run_request(request, guard=default_guard(request))
+        run_request(request, guard=default_guard(request), mlx=_mlx_allocator())
     except Exception as exc:
         error = WorkerError(type=type(exc).__name__, message=str(exc), traceback=traceback.format_exc())
         out = Path(request.out_dir)

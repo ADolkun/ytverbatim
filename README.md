@@ -18,6 +18,13 @@ When YouTube answers with a bot check or a rate limit, the batch stops and a coo
 
 The default engine, `w-prod`, is mlx-whisper large-v3 and needs the `whisper` extra (`uv sync --extra whisper`); the other engines need the `asr` extra. `run` checks for the engine's extra before it downloads anything.
 
+ASR runs in a separate worker process under a memory watch, so a runaway model cannot take down the Mac. The worker is killed if its physical footprint passes `memory_cap_gib` (default: half of physical memory) or if the system's available memory falls below 10%. The error names which one fired, and the next run resumes from the chunks already finished. To change the cap, set it in `~/.config/ytverbatim/config.toml`:
+
+```toml
+[asr]
+memory_cap_gib = 8
+```
+
 ## Planned for v1
 
 - Auth status and a `doctor` command that explain problems with clear fixes
