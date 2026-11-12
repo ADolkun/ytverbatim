@@ -11,8 +11,8 @@ from ytverbatim.asr.models import ChunkHypothesis
 from ytverbatim.asr.protocol import ChunkFlag
 from ytverbatim.contract import Access, ContextDocument, Word, dump_document, load_document
 from ytverbatim.errors import ContractError
-from ytverbatim.pipeline import build_document
 from ytverbatim.render import render_markdown
+from ytverbatim.stages import build_document, from_asr_rows
 
 ACCESS = Access(
     auth_source="none",
@@ -85,12 +85,14 @@ def build(
     chapters: bool = True,
     meta: VideoMetadata | None = None,
 ) -> ContextDocument:
+    meta = meta or metadata()
+    source = from_asr_rows(rows, registry.get(engine), meta)
     return build_document(
-        metadata=meta or metadata(),
+        metadata=meta,
         tags=("synthetic",),
         access=ACCESS,
-        definition=registry.get(engine),
-        rows=rows,
+        source=source,
+        stretches=source.stretches,
         chapters=chapters,
         created_at=NOW,
     )
@@ -266,7 +268,8 @@ def test_decoder_anomaly_flags_the_segments_of_that_chunk_only() -> None:
     assert (loops.flags[0].char_start, loops.flags[0].char_end) == (0, len(loops.text))
     assert "0:07-0:13" in loops.flags[0].note
     assert doc.quality.decoder_anomalies == 1
-    assert doc.quality.flags_by_kind == {"decoder_anomaly": 1, "forced_cut": 1, "token_cap_hit": 1}
+    # The document's flags by kind (two segments carry the anomaly), plus the chunk diagnostics.
+    assert doc.quality.flags_by_kind == {"decoder_anomaly": 2, "forced_cut": 1, "token_cap_hit": 1}
     assert "decoder_anomaly" in render_markdown(doc)
 
 
@@ -383,9 +386,10 @@ def test_the_library_surface_is_exported_lazily() -> None:
     assert ytverbatim.process.__module__ == "ytverbatim.pipeline"
     assert ytverbatim.ContextDocument is ContextDocument
     assert ytverbatim.Options.__module__ == "ytverbatim.config"
+    assert ytverbatim.LLMClient.__module__ == "ytverbatim.llm.protocol"
     with pytest.raises(AttributeError):
         _ = ytverbatim.nonexistent  # type: ignore[attr-defined]
-    assert {"process", "Options", "ContextDocument", "__version__"} <= set(dir(ytverbatim))
+    assert {"process", "Options", "ContextDocument", "LLMClient", "__version__"} <= set(dir(ytverbatim))
     assert "process" in vars(ytverbatim), "a resolved name is cached in the module"
 
 

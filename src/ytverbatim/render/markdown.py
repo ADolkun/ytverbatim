@@ -19,6 +19,8 @@ _ESCAPE = re.compile(
 
 # The edit stage that records the replaced text for flags whose footnote shows a "was" value.
 _BEFORE_STAGE = {"entity_corrected": "correction", "numeric_fixed": "numeric"}
+# Timing provenance for programs; it says nothing a reader of the text can act on.
+_JSON_ONLY = frozenset({"timing_interpolated"})
 
 
 def render_markdown(doc: ContextDocument) -> str:
@@ -151,8 +153,11 @@ def _visible_flags(segment: Segment) -> list[Flag]:
     return [
         flag
         for flag in segment.flags
-        if flag.kind != "numeric_single_source"
-        or any(flag.char_start < low.char_end and low.char_start < flag.char_end for low in low_confidence)
+        if flag.kind not in _JSON_ONLY
+        and (
+            flag.kind != "numeric_single_source"
+            or any(flag.char_start < low.char_end and low.char_start < flag.char_end for low in low_confidence)
+        )
     ]
 
 

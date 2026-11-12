@@ -6,12 +6,10 @@ whole batch and starts a cooldown instead of being retried, least of all with co
 """
 
 import contextlib
-import fcntl
 import json
 import logging
-import os
 import time
-from collections.abc import Callable, Generator, Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -21,7 +19,14 @@ from typing import Literal, Protocol, cast
 
 from ytverbatim import atomic, ids, paths
 from ytverbatim.acquire.audio import INFO_MAX_AGE_S, WAV_NAME, fetch_audio, find_audio, to_wav16k, validate_audio
-from ytverbatim.acquire.captions import DEFAULT_LANGUAGES, CaptionsResult, fetch_captions
+from ytverbatim.acquire.captions import (
+    DEFAULT_LANGUAGES,
+    CaptionKind,
+    CaptionsResult,
+    CaptionTrack,
+    fetch_captions,
+    load_track,
+)
 from ytverbatim.acquire.captions import FILE_STEM as CAPTIONS_STEM
 from ytverbatim.acquire.expand import expand_target
 from ytverbatim.acquire.metadata import VideoMetadata, fetch_info, info_path, load_metadata
@@ -54,6 +59,7 @@ from ytverbatim.errors import (
     YtDlpError,
     YtverbatimError,
 )
+from ytverbatim.store import lock as video_lock
 from ytverbatim.ytdlp import version
 from ytverbatim.ytdlp.runner import SLEEP_PRESET, SubprocessRunner, redact
 from ytverbatim.ytdlp.signals import js_challenge_failed
@@ -77,7 +83,6 @@ METADATA_FILE = "metadata.json"
 CAPTIONS_DIR = "captions"
 TRACKS_FILE = "tracks.json"
 REPORT_FILE = "batch_report.json"
-LOCK_NAME = ".lock"
 _REPORT_VERSION = 1
 
 # Any other AuthError is about the auth source itself: once one happens, every later cookied request in the
@@ -254,7 +259,8 @@ class FetchSession:
         stop = self._runner.stop
         return BatchStopError(stop.signal, stop.until) if stop is not None else None
 
-    def fetch_video(self, video_id: str, *, cookies_first: bool = False) -> VideoOutcome:
+    def fetch_video(self, video_id: str, *, cookies_first: bool = False, audio: bool = True) -> VideoOutcome:
+        """Fetch one video; `audio=False` skips the audio stages for a caller that already has what audio gives."""
         if (stop := self.pending_stop()) is not None:
             raise stop
         vdir = paths.video_dir(video_id, self._out)
@@ -262,7 +268,7 @@ class FetchSession:
         try:
             with contextlib.ExitStack() as stack:
                 snaps = stack.enter_context(_Snapshots(self._source)) if self._source is not None else None
-                return self._fetch(video_id, vdir, snaps, cookies_first=cookies_first)
+                return self._fetch(video_id, vdir, snaps, cookies_first=cookies_first, audio=audio)
         except AuthError as exc:
             if exc.state not in _PER_VIDEO_AUTH_STATES:
                 self._source_failure = exc
@@ -272,9 +278,12 @@ class FetchSession:
         except YtverbatimError as exc:
             return self._failure(video_id, exc)
 
-    def _fetch(self, video_id: str, vdir: Path, snaps: _Snapshots | None, *, cookies_first: bool) -> VideoOutcome:
+    def _fetch(
+        self, video_id: str, vdir: Path, snaps: _Snapshots | None, *, cookies_first: bool, audio: bool
+    ) -> VideoOutcome:
+        want_audio = self._options.audio and audio
         captions_done = not self._options.captions or _load_tracks(vdir) is not None
-        audio_done = not self._options.audio or _audio_ready(vdir)
+        audio_done = not want_audio or _audio_ready(vdir)
         prior = _load_prior(vdir, need_fresh=not (captions_done and audio_done))
         reused: list[str] = []
         if prior is not None:
@@ -303,7 +312,7 @@ class FetchSession:
             captions = tuple(_track_label(entry) for entry in entries)
 
         audio_s: float | None = None
-        if self._options.audio:
+        if want_audio:
             audio_s = self._audio(video_id, vdir, metadata, snaps, access.cookies_used, reused)
 
         warnings += [w for seen in self._runner.seen for w in seen.warnings]
@@ -528,6 +537,22 @@ def _track_label(entry: dict[str, object]) -> str:
     return f"{entry.get('language')} ({entry.get('kind')}, {entry.get('format')}{timings})"
 
 
+def saved_captions(vdir: Path) -> tuple[CaptionTrack, ...]:
+    """Load the caption tracks a fetch saved for this video; none when captions were skipped or never fetched."""
+    entries = _load_tracks(vdir) or []
+    tracks: list[CaptionTrack] = []
+    for entry in entries:
+        language, kind = entry.get("language"), entry.get("kind")
+        if not isinstance(language, str) or kind not in (CaptionKind.MANUAL.value, CaptionKind.AUTO.value):
+            continue
+        track, warning = load_track(vdir / CAPTIONS_DIR, language, CaptionKind(kind))
+        if track is not None:
+            tracks.append(track)
+        elif warning is not None:
+            log.warning(warning)
+    return tuple(tracks)
+
+
 def _load_tracks(vdir: Path) -> list[dict[str, object]] | None:
     """Return the recorded caption tracks, or None when the stage has to run (again)."""
     try:
@@ -588,21 +613,6 @@ def sleep_args(video_count: int) -> tuple[str, ...]:
 
 def default_runner(sleep: Sequence[str]) -> YtDlpRunner:
     return SubprocessRunner(sleep_args=sleep)
-
-
-@contextlib.contextmanager
-def video_lock(vdir: Path) -> Generator[None]:
-    """Hold the video directory exclusively, or raise `BusyError` at once; waiting could mean hours of ASR."""
-    vdir.mkdir(parents=True, exist_ok=True)
-    fd = os.open(vdir / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise BusyError(f"another ytverbatim run is processing {vdir.name}") from None
-        yield
-    finally:
-        os.close(fd)
 
 
 @dataclass(frozen=True)
@@ -779,6 +789,7 @@ __all__ = [
     "fetch",
     "plan_videos",
     "read_cooldown",
+    "saved_captions",
     "sleep_args",
     "start_cooldown",
     "stop_fix",

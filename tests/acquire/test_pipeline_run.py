@@ -185,7 +185,7 @@ def test_end_to_end_writes_a_valid_document_and_markdown(session_kit, worker: Fa
     assert request.files[0].language == "en" and request.files[0].id == PUBLIC
     assert request.files[0].wav == str(vdir / "audio.wav") and worker.seen_wav == [True]
     assert Path(request.out_dir) == vdir / ".stages" / "asr" / "w-prod"
-    assert [e.stage for e in events] == ["fetch", "asr", "write"]
+    assert [e.stage for e in events] == ["fetch", "asr", "normalize", "punctuate", "numeric", "write"]
     assert results[0].document == doc and results[0].markdown == vdir / "context.md"
     assert len(yt.labels("metadata")) == 1
 
@@ -369,10 +369,15 @@ def test_an_unknown_engine_fails_before_any_request(session_kit, worker: FakeWor
     assert yt.calls == []
 
 
-def test_captions_as_the_source_are_refused_until_they_exist(session_kit, worker: FakeWorker) -> None:
+def test_captions_as_the_source_fall_back_to_asr_without_a_manual_track(session_kit, worker: FakeWorker) -> None:
     options = config.load_options(overrides={"asr": {"source": "captions"}})
-    with pytest.raises(ConfigError, match="captions"):
-        run(session_kit, session_kit.yt(), options=options)
+    yt = session_kit.yt()
+    _, results, _ = run(session_kit, yt, options=options)
+    doc = results[0].document
+    assert doc is not None and doc.transcript.runs[0].kind == "asr" and len(worker.calls) == 1
+    assert any("no manual caption track in en" in w for w in doc.quality.warnings)
+    assert results[0].notices == ("no manual caption track in en; transcribed with ASR instead",)
+    assert len(yt.labels("audio")) == 1, "the audio is fetched only once ASR turns out to be needed"
 
 
 def test_no_captions_flag_reaches_the_fetch(session_kit, worker: FakeWorker) -> None:

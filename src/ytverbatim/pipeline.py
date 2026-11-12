@@ -1,25 +1,28 @@
-"""`ytverbatim run`: fetch, transcribe locally, segment and write `context.json` plus `context.md` per video.
+"""`ytverbatim run`: fetch, transcribe, refine the text and write `context.json` plus `context.md` per video.
 
-This is the first usable slice and has no LLM stage. Acquisition is the fetch session's job; ASR runs in the worker
-subprocess; everything between the worker's chunk rows and the contract document is `build_document`, a pure function.
+Stages, per video under its directory lock: metadata, captions and audio (the fetch session's) → asr (the worker
+subprocess, which also plans the VAD chunks) or manual captions → normalize → punctuate → correct → numeric →
+segment, chapters and assemble (`stages.build_document`) → render. Every stage from asr to numeric is checkpointed
+in the video's `StageStore`, keyed by what it read, so a rerun with changed options recomputes only the stages those
+options reach, and an interrupted run resumes where it stopped. The 16 kHz WAV is deleted once the ASR output is
+stored; the compressed audio stays.
 """
 
-import collections
+import hashlib
 import json
 import logging
-import shutil
 import time
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field, replace
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-import opencc
-from pydantic import JsonValue, ValidationError
+from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError
 
-from ytverbatim import __version__, atomic, config, ids, paths
+from ytverbatim import atomic, config, ids, paths, stages, store
 from ytverbatim.acquire.audio import WAV_NAME
+from ytverbatim.acquire.captions import CaptionKind, CaptionTrack
 from ytverbatim.acquire.metadata import VideoMetadata, info_path, load_metadata
 from ytverbatim.acquire.session import (
     BatchReport,
@@ -30,33 +33,16 @@ from ytverbatim.acquire.session import (
     VideoStatus,
     default_runner,
     fetch,
-    video_lock,
+    saved_captions,
 )
-from ytverbatim.asr import chunks, registry
+from ytverbatim.asr import registry
 from ytverbatim.asr import runner as asr_runner
 from ytverbatim.asr.models import ChunkHypothesis, FileJob, WorkerRequest
 from ytverbatim.asr.protocol import EngineDef
 from ytverbatim.auth.cooldown import utcnow
 from ytverbatim.auth.source import CookieSource, resolve_source
 from ytverbatim.auth.state import AuthState
-from ytverbatim.contract import (
-    Access,
-    Chapter,
-    ContextDocument,
-    Flag,
-    Paragraph,
-    Quality,
-    Segment,
-    SourceRef,
-    Transcript,
-    TranscriptRun,
-    Video,
-    Word,
-    dump_document,
-    load_document,
-)
-from ytverbatim.contract import Generator as GeneratorInfo
-from ytverbatim.contract.models import SCHEMA_VERSION
+from ytverbatim.contract import ContextDocument, LLMUsage, dump_document, load_document
 from ytverbatim.errors import (
     AuthError,
     BatchStopError,
@@ -66,11 +52,20 @@ from ytverbatim.errors import (
     DependencyError,
     EngineError,
     EngineMemoryError,
+    LLMError,
     MediaValidationError,
+    YtDlpError,
     YtverbatimError,
 )
+from ytverbatim.llm import client_from_options
+from ytverbatim.llm.protocol import LLMClient
 from ytverbatim.render import render_markdown
-from ytverbatim.text import segment as seg
+from ytverbatim.stages import Stretch, Transcribed, build_document, stretch_flag, with_results
+from ytverbatim.store import StageStore, input_hash
+from ytverbatim.store import lock as video_lock
+from ytverbatim.text import numeric
+from ytverbatim.text.correct import CorrectionContext, correct_segments
+from ytverbatim.text.punctuate import needs_punctuation, punctuate
 from ytverbatim.ytdlp.runner import redact
 from ytverbatim.ytdlp.types import YtDlpRunner
 
@@ -78,11 +73,33 @@ log = logging.getLogger(__name__)
 
 CONTEXT_JSON = "context.json"
 CONTEXT_MD = "context.md"
-STAGES_DIR = ".stages"
-UNDETERMINED_LANGUAGE = "und"
+STAGES_DIR = store.STAGES_DIR
 
-# Chunk flags that mark a decode the pipeline cannot vouch for; the others only describe how the audio was cut.
-_ANOMALY_FLAG = "decoder_anomaly"
+# Bump a stage's version when its code changes what it outputs for the same input; only that stage and the stages
+# its output feeds are recomputed.
+STAGE_VERSIONS: dict[str, int] = {
+    "asr": 1,
+    "captions": 1,
+    "second_opinion": 1,
+    "normalize": 1,
+    "punctuate": 1,
+    "correct": 1,
+    "numeric": 1,
+    "context": 1,
+}
+_GLOSSARY_MAX_TERMS = 20
+
+__all__ = [
+    "CONTEXT_JSON",
+    "CONTEXT_MD",
+    "ProgressEvent",
+    "StageTiming",
+    "VideoResult",
+    "build_document",
+    "process",
+    "process_many",
+    "video_lock",
+]
 
 
 @dataclass(frozen=True)
@@ -93,6 +110,13 @@ class ProgressEvent:
 
 
 @dataclass(frozen=True)
+class StageTiming:
+    stage: str
+    seconds: float
+    reused: bool
+
+
+@dataclass(frozen=True)
 class VideoResult:
     outcome: VideoOutcome
     document: ContextDocument | None = None
@@ -100,12 +124,16 @@ class VideoResult:
     elapsed_s: float = 0.0
     # The exception behind a failed outcome when the pipeline caught one, so `process` can raise it unchanged.
     error: Exception | None = None
+    # Stages that could not run as asked (no LLM for punctuation, no manual captions); also in `quality.warnings`.
+    notices: tuple[str, ...] = ()
+    timings: tuple[StageTiming, ...] = ()
 
 
 def process(
     url: str,
     options: config.Options | None = None,
     *,
+    llm: LLMClient | None = None,
     out: Path | None = None,
     auth: str | None = None,
     captions: bool = True,
@@ -113,11 +141,13 @@ def process(
     progress: Callable[[ProgressEvent], None] | None = None,
     runner_factory: Callable[[Sequence[str]], YtDlpRunner] = default_runner,
 ) -> ContextDocument:
-    """Produce the context document for one video, reusing it when `context.json` already exists from this engine.
+    """Produce the context document for one video, reusing it when nothing it depends on has changed.
 
-    Raises the video's own error (`AuthError`, `EngineError`, `ContractError`, ...), or `BatchStopError` when
-    YouTube asked us to back off before the video was done. `auth` is an auth spec as for `--auth`; without it
-    the configured source applies.
+    `llm` is the client for punctuation, correction and numeric verdicts; without it the configured `[llm]`
+    provider applies, and with none configured those stages degrade as `quality.warnings` records. Raises the
+    video's own error (`AuthError`, `EngineError`, `LLMError`, `ContractError`, ...), or `BatchStopError` when
+    YouTube asked us to back off before the video was done. `auth` is an auth spec as for `--auth`; without it the
+    configured source applies.
     """
     ref = ids.classify(url)
     if ref is None or ref.kind is not ids.RefKind.VIDEO:
@@ -126,6 +156,7 @@ def process(
     report = process_many(
         [url],
         options,
+        llm=llm,
         out=out,
         source=resolve_source(auth),
         captions=captions,
@@ -151,6 +182,7 @@ def process_many(  # noqa: PLR0913
     targets: Sequence[str],
     options: config.Options | None = None,
     *,
+    llm: LLMClient | None = None,
     out: Path | None = None,
     source: CookieSource | None = None,
     captions: bool = True,
@@ -164,31 +196,22 @@ def process_many(  # noqa: PLR0913
 ) -> BatchReport:
     """Run every video behind `targets` into `<out>/<id>/` and write `<out>/batch_report.json`.
 
-    Raises `DependencyError` when the engine's extra is missing and refuses a cooldown (`BatchStopError`), both
-    before any request; the batch itself is `fetch`'s, with this pipeline as its per-video hook. Per-video
-    failures land in the report; a batch stop mid-run ends the batch and is recorded as well. An ASR worker killed
-    by the memory watch raises `EngineMemoryError`, after the report of the videos before it is written: every
-    later video would run the same engine into the same limit.
+    Raises `ConfigError` for options that cannot run (an unknown engine, correction without an LLM),
+    `DependencyError` when an engine's extra is missing, and refuses a cooldown (`BatchStopError`), all before any
+    request; the batch itself is `fetch`'s, with this pipeline as its per-video hook. Per-video failures land in the
+    report; a batch stop mid-run ends the batch and is recorded as well. An ASR worker killed by the memory watch
+    raises `EngineMemoryError`, after the report of the videos before it is written: every later video would run the
+    same engine into the same limit.
     """
     options = options or config.load_options()
-    definition = _definition(options)
-    registry.check_dependencies(definition)
     out = out if out is not None else paths.default_output_root()
+    settings = _settings(options, llm, out, force, progress or _no_progress, clock)
     fetch_options = FetchOptions(
         policy=options.auth.policy,
-        captions=captions,
+        captions=captions or options.asr.source == "captions",
         cookie_channels=options.auth.cookie_channels,
         max_videos=options.ytdlp.max_videos_per_run,
         ignore_cooldown=ignore_cooldown,
-    )
-    settings = _Settings(
-        definition,
-        out,
-        force,
-        options.text.chapters == "youtube",
-        progress or _no_progress,
-        clock,
-        asr_runner.memory_cap_bytes(options.asr.memory_cap_gib),
     )
     hook = _RunHook(settings)
 
@@ -216,19 +239,77 @@ def _no_progress(_event: ProgressEvent) -> None:
 
 @dataclass(frozen=True)
 class _Settings:
+    text: config.TextOptions
+    source: Literal["asr", "captions"]
     definition: EngineDef
+    second_opinion: EngineDef | None
+    llm: LLMClient | None
+    memory_cap_bytes: int | None
     out: Path
     force: bool
-    chapters: bool
     emit: Callable[[ProgressEvent], None]
     clock: Callable[[], datetime]
-    memory_cap_bytes: int | None
+
+    @property
+    def llm_id(self) -> str | None:
+        return self.llm.id if self.llm is not None else None
+
+    def run_key(self) -> str:
+        """Everything a finished document depends on besides the video itself; a change means a rerun."""
+        return input_hash(
+            "context",
+            STAGE_VERSIONS["context"],
+            {
+                "versions": dict(STAGE_VERSIONS),
+                "source": self.source,
+                "engine": _engine_key(self.definition),
+                "second_opinion": _engine_key(self.second_opinion) if self.second_opinion else None,
+                "text": _plain(asdict(self.text)),
+                "llm": self.llm_id,
+            },
+        )
 
 
-def _definition(options: config.Options) -> EngineDef:
-    if options.asr.source != "asr":
-        raise ConfigError("asr.source = 'captions' is not implemented yet; only ASR transcripts can be produced")
-    return registry.get(options.asr.engine)
+def _settings(
+    options: config.Options,
+    llm: LLMClient | None,
+    out: Path,
+    force: bool,
+    emit: Callable[[ProgressEvent], None],
+    clock: Callable[[], datetime],
+) -> _Settings:
+    definition = registry.get(options.asr.engine)
+    registry.check_dependencies(definition)
+    second: EngineDef | None = None
+    if options.text.numeric_second_opinion != "off":
+        second = registry.get(options.text.numeric_second_opinion)
+        if second.spec.max_chunk_s is None:
+            raise ConfigError(
+                f"text.numeric_second_opinion = {second.spec.id!r} decodes whole files; it needs a chunked engine "
+                "that can re-decode just the numeric spans"
+            )
+        registry.check_dependencies(second)
+    if llm is None and options.llm.provider != "none":
+        llm = client_from_options(options.llm)
+    if options.text.correct and llm is None:
+        raise ConfigError("correction needs an LLM; pass --llm PROVIDER:MODEL or set [llm], or use --no-correct")
+    memory_cap = asr_runner.memory_cap_bytes(options.asr.memory_cap_gib)
+    return _Settings(options.text, options.asr.source, definition, second, llm, memory_cap, out, force, emit, clock)
+
+
+def _engine_key(definition: EngineDef) -> JsonValue:
+    return _plain(asdict(definition))
+
+
+def _plain(value: object) -> JsonValue:
+    return json.loads(json.dumps(value))
+
+
+class _ContextMark(BaseModel):
+    """Written after `context.json`: the document there was made with these settings and is this exact file."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    sha256: str
 
 
 @dataclass
@@ -252,20 +333,17 @@ class _RunHook:
 
 
 def _reusable(vdir: Path, settings: _Settings) -> ContextDocument | None:
-    """Return the finished document, unless `--force` is set or it holds no run of the selected engine."""
+    """Return the finished document, unless `--force` is set or it was made with other settings."""
     context = vdir / CONTEXT_JSON
     if settings.force or not context.is_file():
         return None
-    document = load_document(context)
-    wanted = _run_id(settings.definition)
-    if all(run.id != wanted for run in document.transcript.runs):
-        log.info("%s holds no %s run; transcribing it again", context, wanted)
+    mark = StageStore(vdir).load("context", STAGE_VERSIONS["context"], settings.run_key(), _ContextMark)
+    if mark is None:
         return None
-    return document
-
-
-def _run_id(definition: EngineDef) -> str:
-    return f"asr:{definition.spec.id}"
+    data = context.read_bytes()
+    if hashlib.sha256(data).hexdigest() != mark.sha256:
+        return None
+    return load_document(data.decode("utf-8"))
 
 
 def _run_video(session: FetchSession, planned: PlannedVideo, settings: _Settings) -> VideoResult:
@@ -284,11 +362,9 @@ def _run_video(session: FetchSession, planned: PlannedVideo, settings: _Settings
                     reused=("context",),
                 )
                 return VideoResult(outcome, document, vdir / CONTEXT_MD)
-            settings.emit(ProgressEvent(video_id, "fetch"))
-            outcome = session.fetch_video(video_id, cookies_first=planned.cookies_first)
-            if outcome.status is not VideoStatus.OK or outcome.access is None:
-                return VideoResult(outcome)
-            return VideoResult(outcome, _transcribe(vdir, outcome.access, settings), vdir / CONTEXT_MD)
+            if settings.force:
+                StageStore(vdir).clear()
+            return _VideoRun(session, planned, vdir, settings).run()
     except (BatchStopError, DependencyError, EngineMemoryError):
         raise
     except (YtverbatimError, ValueError, OSError) as exc:
@@ -303,10 +379,14 @@ def _error_kind(exc: Exception) -> str:
             return "busy"
         case EngineError():
             return "engine"
+        case LLMError():
+            return "llm"
         case ContractError():
             return "contract"
         case MediaValidationError():
             return "media_invalid"
+        case ConfigError():
+            return "config"
         case OSError():
             return "os_error"
         case ValueError():
@@ -325,37 +405,367 @@ def _error_for(outcome: VideoOutcome) -> YtverbatimError:
     return YtverbatimError(f"{outcome.video_id}: {outcome.error}: {detail}")
 
 
-def _transcribe(vdir: Path, access: Access, settings: _Settings) -> ContextDocument:
-    definition = settings.definition
-    metadata = load_metadata(vdir)
-    video_id = metadata.video_id
-    asr_dir = vdir / STAGES_DIR / "asr" / definition.spec.id
-    if settings.force:
-        shutil.rmtree(asr_dir, ignore_errors=True)
-    settings.emit(ProgressEvent(video_id, "asr", definition.spec.id))
-    request = WorkerRequest(
-        engine=definition,
-        out_dir=str(asr_dir),
-        files=(FileJob(id=video_id, wav=str(vdir / WAV_NAME), language=metadata.language),),
-        memory_cap_bytes=settings.memory_cap_bytes,
-    )
-    result = asr_runner.run_worker(request)
-    rows = _read_rows(result.hypotheses, video_id)
-    settings.emit(ProgressEvent(video_id, "write"))
-    document = build_document(
-        metadata=metadata,
-        tags=_tags(vdir),
-        access=access,
-        definition=definition,
-        rows=rows,
-        chapters=settings.chapters,
-        created_at=settings.clock(),
-    )
-    atomic.write_text(vdir / CONTEXT_MD, render_markdown(document))
-    # The sentinel goes last: a context.json on disk means the markdown beside it is complete too.
-    atomic.write_text(vdir / CONTEXT_JSON, dump_document(document))
-    (vdir / WAV_NAME).unlink(missing_ok=True)
-    return document
+class _Stretches(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    stretches: tuple[Stretch, ...]
+
+
+class _TextResult(BaseModel):
+    """One text stage's output; `notice` says why the stage could not do its job (and is also a quality warning)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    stretches: tuple[Stretch, ...]
+    usage: tuple[LLMUsage, ...] = ()
+    notice: str | None = None
+
+
+class _Piece(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    text: str
+    start: float
+    end: float
+
+
+class _SecondOpinion(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    engine: str | None
+    pieces: tuple[_Piece, ...]
+
+
+@dataclass
+class _VideoRun:
+    session: FetchSession
+    planned: PlannedVideo
+    vdir: Path
+    settings: _Settings
+    timings: list[StageTiming] = field(default_factory=list[StageTiming])
+    notices: list[str] = field(default_factory=list[str])
+
+    @property
+    def video_id(self) -> str:
+        return self.planned.video_id
+
+    @property
+    def store(self) -> StageStore:
+        return StageStore(self.vdir)
+
+    def run(self) -> VideoResult:
+        settings = self.settings
+        cached = self._local_metadata()
+        need_audio = settings.source == "asr" and (cached is None or not self._asr_cached(cached))
+        outcome = self._fetch(audio=need_audio)
+        if outcome.status is not VideoStatus.OK or outcome.access is None:
+            return VideoResult(outcome)
+        metadata = load_metadata(self.vdir)
+        tracks = saved_captions(self.vdir)
+
+        source: Transcribed | None = None
+        if settings.source == "captions":
+            source = self._from_captions(tracks, metadata)
+        if source is None:
+            if not self._asr_cached(metadata) and not (self.vdir / WAV_NAME).is_file():
+                outcome = self._fetch(audio=True)
+                if outcome.status is not VideoStatus.OK or outcome.access is None:
+                    return VideoResult(outcome)
+            source = self._asr(metadata)
+        second = self._second_opinion(source, metadata) if source.run.kind == "asr" else None
+        (self.vdir / WAV_NAME).unlink(missing_ok=True)
+
+        language = source.language
+        normalized = self._normalize(source)
+        punctuated = self._punctuate(normalized, language)
+        corrected, correction_llm = self._correct(punctuated, language, metadata)
+        verified = self._numeric(corrected, source, tracks, second)
+        for result in (punctuated, verified):
+            if result.notice is not None:
+                self.notices.append(result.notice)
+
+        self._emit("write")
+        began = time.monotonic()
+        document = build_document(
+            metadata=metadata,
+            tags=_tags(self.vdir),
+            access=outcome.access,
+            source=source,
+            stretches=verified.stretches,
+            chapters=settings.text.chapters != "none",
+            created_at=settings.clock(),
+            correction_llm=correction_llm,
+            warnings=self.notices,
+            llm_usage=(*punctuated.usage, *corrected.usage, *verified.usage),
+        )
+        markdown = render_markdown(document)
+        dumped = dump_document(document)
+        atomic.write_text(self.vdir / CONTEXT_MD, markdown)
+        # context.json and then its mark go last: a marked context.json means the markdown beside it is complete.
+        atomic.write_text(self.vdir / CONTEXT_JSON, dumped)
+        sha = hashlib.sha256(dumped.encode("utf-8")).hexdigest()
+        self.store.save("context", STAGE_VERSIONS["context"], settings.run_key(), _ContextMark(sha256=sha))
+        self.timings.append(StageTiming("write", time.monotonic() - began, reused=False))
+        return VideoResult(
+            outcome,
+            document,
+            self.vdir / CONTEXT_MD,
+            notices=tuple(self.notices),
+            timings=tuple(self.timings),
+        )
+
+    def _emit(self, stage: str, detail: str = "") -> None:
+        self.settings.emit(ProgressEvent(self.video_id, stage, detail))
+
+    def _stage[M: BaseModel](
+        self, stage: str, inputs: dict[str, JsonValue], model: type[M], compute: Callable[[], M], detail: str = ""
+    ) -> M:
+        key = input_hash(stage, STAGE_VERSIONS[stage], inputs)
+        began = time.monotonic()
+
+        def announced() -> M:
+            self._emit(stage, detail)
+            return compute()
+
+        output, reused = self.store.run(stage, STAGE_VERSIONS[stage], key, model, announced)
+        self.timings.append(StageTiming(stage, time.monotonic() - began, reused))
+        return output
+
+    def _fetch(self, *, audio: bool) -> VideoOutcome:
+        self._emit("fetch")
+        began = time.monotonic()
+        outcome = self.session.fetch_video(self.video_id, cookies_first=self.planned.cookies_first, audio=audio)
+        self.timings.append(StageTiming("fetch", time.monotonic() - began, reused=False))
+        return outcome
+
+    def _local_metadata(self) -> VideoMetadata | None:
+        try:
+            return load_metadata(self.vdir)
+        except (OSError, ValueError, YtDlpError):
+            return None
+
+    def _asr_request(self, metadata: VideoMetadata) -> WorkerRequest:
+        definition = self.settings.definition
+        return WorkerRequest(
+            engine=definition,
+            out_dir=str(self.store.work_dir("asr") / definition.spec.id),
+            files=(FileJob(id=self.video_id, wav=str(self.vdir / WAV_NAME), language=metadata.language),),
+            memory_cap_bytes=self.settings.memory_cap_bytes,
+        )
+
+    def _asr_inputs(self, metadata: VideoMetadata) -> dict[str, JsonValue]:
+        # Where the WAV and the output live does not change the decode; the video id names the audio.
+        request = self._asr_request(metadata)
+        fingerprint = request.model_dump(
+            mode="json", exclude={"out_dir": True, "hf_hub_cache": True, "files": {"__all__": {"wav"}}}
+        )
+        return {"request": fingerprint}
+
+    def _asr_cached(self, metadata: VideoMetadata) -> bool:
+        key = input_hash("asr", STAGE_VERSIONS["asr"], self._asr_inputs(metadata))
+        source = self.store.load("asr", STAGE_VERSIONS["asr"], key, Transcribed)
+        if source is None:
+            return False
+        if self.settings.second_opinion is None:
+            return True
+        key = input_hash("second_opinion", STAGE_VERSIONS["second_opinion"], self._second_inputs(source))
+        return self.store.load("second_opinion", STAGE_VERSIONS["second_opinion"], key, _SecondOpinion) is not None
+
+    def _asr(self, metadata: VideoMetadata) -> Transcribed:
+        definition = self.settings.definition
+
+        def compute() -> Transcribed:
+            result = asr_runner.run_worker(self._asr_request(metadata))
+            return stages.from_asr_rows(_read_rows(result.hypotheses, self.video_id), definition, metadata)
+
+        return self._stage("asr", self._asr_inputs(metadata), Transcribed, compute, definition.spec.id)
+
+    def _from_captions(self, tracks: Sequence[CaptionTrack], metadata: VideoMetadata) -> Transcribed | None:
+        track = _manual_track(tracks, metadata.language)
+        if track is None:
+            language = metadata.language or "the video's language"
+            self.notices.append(f"no manual caption track in {language}; transcribed with ASR instead")
+            return None
+        inputs: dict[str, JsonValue] = {"track": _track_key(track), "language": metadata.language}
+        return self._stage(
+            "captions", inputs, Transcribed, lambda: stages.from_captions(track, metadata), track.language
+        )
+
+    def _second_inputs(self, source: Transcribed) -> dict[str, JsonValue]:
+        second = self.settings.second_opinion
+        return {"source": store.digest(source), "engine": _engine_key(second) if second else None}
+
+    def _second_opinion(self, source: Transcribed, metadata: VideoMetadata) -> numeric.SecondOpinion | None:
+        second = self.settings.second_opinion
+        if second is None:
+            return None
+
+        def compute() -> _SecondOpinion:
+            words = [word for stretch in source.stretches for word in stretch.words]
+            request = numeric.second_opinion_request(
+                _timed(source.stretches),
+                engine=second,
+                file_id=self.video_id,
+                wav=self.vdir / WAV_NAME,
+                out_dir=self.store.work_dir("second_opinion") / second.spec.id,
+                language=metadata.language,
+                words=words,
+            )
+            if request is None:
+                return _SecondOpinion(engine=None, pieces=())
+            result = asr_runner.run_worker(
+                request.model_copy(update={"memory_cap_bytes": self.settings.memory_cap_bytes})
+            )
+            found = numeric.SecondOpinion.from_hypotheses(_read_rows(result.hypotheses, self.video_id))
+            if found is None:
+                return _SecondOpinion(engine=second.spec.id, pieces=())
+            pieces = tuple(_Piece(text=p.text, start=p.start, end=p.end) for p in found.pieces)
+            return _SecondOpinion(engine=found.engine, pieces=pieces)
+
+        stored = self._stage("second_opinion", self._second_inputs(source), _SecondOpinion, compute, second.spec.id)
+        if stored.engine is None or not stored.pieces:
+            return None
+        pieces = tuple(numeric.TimedText(p.text, p.start, p.end) for p in stored.pieces)
+        return numeric.SecondOpinion(stored.engine, pieces)
+
+    def _normalize(self, source: Transcribed) -> _Stretches:
+        text = self.settings.text
+        inputs: dict[str, JsonValue] = {"source": store.digest(source), "script": text.script, "fillers": text.fillers}
+
+        def compute() -> _Stretches:
+            normalized = stages.normalize(source.stretches, source.language, script=text.script, fillers=text.fillers)
+            return _Stretches(stretches=normalized)
+
+        return self._stage("normalize", inputs, _Stretches, compute)
+
+    def _punctuate(self, previous: _Stretches, language: str) -> _TextResult:
+        llm = self.settings.llm
+        inputs: dict[str, JsonValue] = {"text": _text_key(previous.stretches), "llm": self.settings.llm_id}
+
+        def compute() -> _TextResult:
+            stretches = previous.stretches
+            texts = [stretch.text for stretch in stretches]
+            if not needs_punctuation(" ".join(texts), language):
+                return _TextResult(stretches=stretches)
+            if llm is None:
+                notice = "punctuation not restored: the transcript has few sentence marks and no LLM is configured"
+                return _TextResult(stretches=stretches, notice=notice)
+            result = punctuate(texts, language=language, client=llm, checkpoint_dir=self.store.work_dir("punctuate"))
+            failed = set(result.failed)
+            note = "the LLM's punctuation changed the words twice, so this stretch was kept as transcribed"
+            flags = [
+                [stretch_flag(stretch, "punctuation_failed", note)] if index in failed else []
+                for index, stretch in enumerate(stretches)
+            ]
+            return _TextResult(stretches=with_results(stretches, result.texts, result.edits, flags), usage=result.usage)
+
+        return self._stage("punctuate", inputs, _TextResult, compute, self.settings.llm_id or "")
+
+    def _correct(self, previous: _TextResult, language: str, metadata: VideoMetadata) -> tuple[_TextResult, str | None]:
+        llm = self.settings.llm if self.settings.text.correct else None
+        inputs: dict[str, JsonValue] = {"text": _text_key(previous.stretches), "llm": llm.id if llm else None}
+        if llm is None:
+            return _TextResult(stretches=previous.stretches), None
+
+        def compute() -> _TextResult:
+            stretches = previous.stretches
+            note = metadata.creator_note.text if metadata.creator_note is not None else None
+            context = CorrectionContext(glossary=_tags(self.vdir)[:_GLOSSARY_MAX_TERMS], creator_note=note)
+            result = correct_segments(
+                [stretch.text for stretch in stretches],
+                client=llm,
+                language=language,
+                context=context,
+                checkpoint_dir=self.store.work_dir("correct"),
+                confidence=_confidence(stretches),
+            )
+            return _TextResult(
+                stretches=with_results(stretches, result.texts, result.edits, result.flags), usage=result.usage
+            )
+
+        return self._stage("correct", inputs, _TextResult, compute, llm.id), llm.id
+
+    def _numeric(
+        self,
+        previous: _TextResult,
+        source: Transcribed,
+        tracks: Sequence[CaptionTrack],
+        second: numeric.SecondOpinion | None,
+    ) -> _TextResult:
+        llm = self.settings.llm
+        evidence_tracks = _evidence_tracks(tracks, source.language)
+        inputs: dict[str, JsonValue] = {
+            "text": _text_key(previous.stretches),
+            "captions": [_track_key(track) for track in evidence_tracks],
+            "second_opinion": store.digest(_second_key(second)),
+            "llm": self.settings.llm_id,
+        }
+
+        def compute() -> _TextResult:
+            stretches = previous.stretches
+            primary = source.run.id if source.run.kind == "asr" else stages.CAPTION_MANUAL
+            evidence = numeric.Evidence(
+                primary=primary,
+                words=tuple(word for stretch in stretches for word in stretch.words),
+                captions=tuple(evidence_tracks),
+                second_opinion=second,
+            )
+            result = numeric.verify_numbers(
+                _timed(stretches),
+                language=source.language,
+                evidence=evidence,
+                client=llm,
+                checkpoint_dir=self.store.work_dir("numeric"),
+            )
+            notice = None
+            if llm is None and result.stats.disputed:
+                notice = (
+                    f"{result.stats.disputed} disputed number(s) left as transcribed and flagged: "
+                    "no LLM is configured to choose among the readings"
+                )
+            return _TextResult(
+                stretches=with_results(stretches, result.texts, result.edits, result.flags),
+                usage=result.usage,
+                notice=notice,
+            )
+
+        return self._stage("numeric", inputs, _TextResult, compute, self.settings.llm_id or "")
+
+
+def _text_key(stretches: Sequence[Stretch]) -> str:
+    # Only the text a stage reads; what the previous stage cost or noticed does not change this stage's output.
+    return store.digest(_Stretches(stretches=tuple(stretches)))
+
+
+def _timed(stretches: Sequence[Stretch]) -> list[numeric.TimedText]:
+    return [numeric.TimedText(stretch.text, stretch.start, stretch.end) for stretch in stretches]
+
+
+def _confidence(stretches: Sequence[Stretch]) -> list[list[float] | None] | None:
+    confidence = [[word.conf for word in stretch.words if word.conf is not None] or None for stretch in stretches]
+    return confidence if any(confidence) else None
+
+
+def _manual_track(tracks: Sequence[CaptionTrack], language: str | None) -> CaptionTrack | None:
+    manual = [track for track in tracks if track.kind is CaptionKind.MANUAL]
+    if language is None:
+        return manual[0] if len(manual) == 1 else None
+    return next((track for track in manual if _base(track.language) == _base(language)), None)
+
+
+def _evidence_tracks(tracks: Sequence[CaptionTrack], language: str) -> list[CaptionTrack]:
+    # A track in another language is a translation; it would only make every number look unheard.
+    return [track for track in tracks if _base(track.language) == _base(language)]
+
+
+def _base(code: str) -> str:
+    return code.split("-")[0].lower()
+
+
+def _track_key(track: CaptionTrack) -> str:
+    return store.digest(_plain(asdict(track)))
+
+
+def _second_key(second: numeric.SecondOpinion | None) -> JsonValue:
+    if second is None:
+        return None
+    return {"engine": second.engine, "pieces": [[p.text, p.start, p.end] for p in second.pieces]}
 
 
 def _read_rows(path: Path, video_id: str) -> list[ChunkHypothesis]:
@@ -378,313 +788,3 @@ def _tags(vdir: Path) -> tuple[str, ...]:
         return ()
     tags = raw.get("tags") if isinstance(raw, dict) else None
     return tuple(tag for tag in tags if isinstance(tag, str)) if isinstance(tags, list) else ()
-
-
-def build_document(
-    *,
-    metadata: VideoMetadata,
-    tags: Sequence[str],
-    access: Access,
-    definition: EngineDef,
-    rows: Sequence[ChunkHypothesis],
-    chapters: bool,
-    created_at: datetime,
-) -> ContextDocument:
-    """Turn one engine's chunk rows into a validated document; no I/O.
-
-    Raises `ContractError` when the inputs cannot make a valid document, such as a chapter that ends before it starts.
-    """
-    try:
-        return _build(metadata, tags, access, definition, rows, chapters=chapters, created_at=created_at)
-    except ValidationError as exc:
-        raise ContractError(f"{metadata.video_id}: the transcript does not fit the contract:\n{exc}") from exc
-
-
-def _build(
-    metadata: VideoMetadata,
-    tags: Sequence[str],
-    access: Access,
-    definition: EngineDef,
-    rows: Sequence[ChunkHypothesis],
-    *,
-    chapters: bool,
-    created_at: datetime,
-) -> ContextDocument:
-    spec = definition.spec
-    language = _language(rows, metadata.language)
-    tokens, interpolated, warnings = _tokens(rows, language)
-    sentences = seg.segment_tokens(tokens, language)
-    text = " ".join(sentence.text for sentence in sentences)
-    script = _script(language, text)
-    if script == "zh-Hant":
-        warnings.append("the transcript contains Traditional Chinese characters, which are not converted")
-    if not sentences:
-        warnings.append("no speech was transcribed")
-
-    run = TranscriptRun(
-        id=_run_id(definition),
-        kind="asr",
-        engine=spec.id,
-        model_repo=spec.repo,
-        model_revision=spec.revision,
-        params={**definition.variant, "language_hint": metadata.language, "sample_rate": spec.sample_rate},
-        vad=_vad_info() if spec.max_chunk_s is not None else None,
-        chunking=_chunking_info(spec.max_chunk_s, rows),
-        aligner=None,
-    )
-    chapter_of, chapter_list = _chapters(metadata, sentences, enabled=chapters)
-    paragraph_ranges = seg.split_paragraphs([s.start for s in sentences], [s.end for s in sentences], chapter_of)
-    paragraph_of = [index for index, (first, last) in enumerate(paragraph_ranges) for _ in range(first, last + 1)]
-    anomalies = {row.chunk: row for row in rows if _ANOMALY_FLAG in row.flags}
-    segments = tuple(
-        _segment(index, sentence, run, paragraph_of[index], chapter_of[index], anomalies, interpolated)
-        for index, sentence in enumerate(sentences)
-    )
-    paragraphs = tuple(
-        Paragraph(
-            index=index,
-            start=sentences[first].start,
-            end=max(s.end for s in sentences[first : last + 1]),
-            first_segment=first,
-            last_segment=last,
-        )
-        for index, (first, last) in enumerate(paragraph_ranges)
-    )
-    return ContextDocument(
-        schema_version=SCHEMA_VERSION,
-        generator=GeneratorInfo(name="ytverbatim", version=__version__),
-        created_at=created_at,
-        video=_video(metadata, tags, rows),
-        access=access,
-        transcript=Transcript(
-            language=language,
-            script=script,
-            runs=(run,),
-            punctuation="engine" if seg.is_punctuated(text, language) else "none",
-            correction_llm=None,
-        ),
-        chapters=chapter_list,
-        paragraphs=paragraphs,
-        segments=segments,
-        quality=_quality(rows, sentences, warnings, chunked=spec.max_chunk_s is not None),
-        llm_usage=(),
-    )
-
-
-def _language(rows: Sequence[ChunkHypothesis], declared: str | None) -> str:
-    """Return the language the engine reports for most of the text, else the one YouTube declares."""
-    weight: collections.Counter[str] = collections.Counter()
-    for row in rows:
-        if row.language and row.text.strip():
-            weight[row.language] += len(row.text)
-    if weight:
-        return weight.most_common(1)[0][0]
-    return declared or UNDETERMINED_LANGUAGE
-
-
-def _tokens(rows: Sequence[ChunkHypothesis], language: str) -> tuple[list[seg.Token], set[int], list[str]]:
-    """Return the tokens, the chunks whose word timings had to be partly interpolated, and timing warnings.
-
-    Tokens carry the engine's word times wherever its words line up with its text; the rest is interpolated. A chunk
-    without any word timings is spread over the chunk, which the warning covers rather than a flag on every segment.
-    """
-    zh = seg.uses_zh_rules(" ".join(row.text for row in rows), language)
-    tokens: list[seg.Token] = []
-    interpolated: set[int] = set()
-    chunk_level = 0
-    for row in rows:
-        text = row.text.strip()
-        if not text:
-            continue
-        words = [word for word in row.words if word.text.strip()]
-        if words:
-            piece, complete = seg.aligned_tokens(text, words, row.start, row.end, language=language, origin=row.chunk)
-            if not complete:
-                interpolated.add(row.chunk)
-        else:
-            chunk_level += 1
-            piece = seg.pseudo_tokens(text, row.start, row.end, language=language, origin=row.chunk)
-        # Chunk texts are stripped, so "end." and "Next" would otherwise fuse and hide the sentence break.
-        if tokens and piece and not zh and not tokens[-1].text[-1:].isspace() and not piece[0].text[:1].isspace():
-            piece[0] = replace(piece[0], text=f" {piece[0].text}")
-        tokens += piece
-    warnings: list[str] = []
-    if chunk_level:
-        warnings.append(
-            f"timing is chunk-level for {chunk_level} chunk(s): segment times are spread over each chunk "
-            "in proportion to characters"
-        )
-    if interpolated:
-        warnings.append(
-            f"word timings did not cover the text in {len(interpolated)} chunk(s); the uncovered words are timed "
-            "between their timed neighbours and their segments are flagged timing_interpolated"
-        )
-    return _monotonic(tokens), interpolated, warnings
-
-
-def _monotonic(tokens: Sequence[seg.Token]) -> list[seg.Token]:
-    """Segment starts must not go backwards, and engines occasionally emit a word that does.
-
-    Word times are already clamped to their chunk, so a bogus late start can hold later ones back only to its
-    chunk's end.
-    """
-    out: list[seg.Token] = []
-    floor = 0.0
-    for token in tokens:
-        start = max(token.start, floor)
-        out.append(replace(token, start=start, end=max(token.end, start)))
-        floor = start
-    return out
-
-
-def _script(language: str, text: str) -> Literal["zh-Hans", "zh-Hant", "n/a"]:
-    if not seg.is_zh(language):
-        return "n/a"
-    return "zh-Hans" if opencc.OpenCC("t2s").convert(text) == text else "zh-Hant"
-
-
-def _chapters(
-    metadata: VideoMetadata, sentences: Sequence[seg.Sentence], *, enabled: bool
-) -> tuple[list[int | None], tuple[Chapter, ...]]:
-    """Map sentences to YouTube chapters by start time, dropping chapters that no sentence starts in."""
-    if not enabled or not metadata.chapters or not sentences:
-        return [None] * len(sentences), ()
-    youtube = sorted(metadata.chapters, key=lambda c: c.start)
-    raw = seg.chapter_indexes([s.start for s in sentences], [c.start for c in youtube])
-    order = list(dict.fromkeys(raw))
-    compact = {old: new for new, old in enumerate(order)}
-    chapters = tuple(
-        Chapter(
-            index=compact[old],
-            title=youtube[old].title,
-            start=youtube[old].start,
-            end=youtube[old].end,
-            source="youtube",
-            first_segment=raw.index(old),
-            last_segment=len(raw) - 1 - raw[::-1].index(old),
-        )
-        for old in order
-    )
-    return [compact[old] for old in raw], chapters
-
-
-def _segment(
-    index: int,
-    sentence: seg.Sentence,
-    run: TranscriptRun,
-    paragraph: int,
-    chapter: int | None,
-    anomalies: Mapping[int, ChunkHypothesis],
-    interpolated: Collection[int],
-) -> Segment:
-    words = tuple(
-        Word(text=t.text.strip(), start=t.start, end=t.end, conf=t.conf)
-        for t in sentence.tokens
-        if t.timed and t.text.strip()
-    )
-    flags: list[Flag] = []
-    if any(not t.timed and t.origin in interpolated for t in sentence.tokens):
-        flags.append(
-            Flag(
-                kind="timing_interpolated",
-                char_start=0,
-                char_end=len(sentence.text),
-                note="some words here had no engine timing; their times are interpolated from the words around them",
-            )
-        )
-    for chunk, row in anomalies.items():
-        span = sentence.span_of(chunk)
-        if span is not None:
-            flags.append(
-                Flag(
-                    kind="decoder_anomaly",
-                    char_start=span[0],
-                    char_end=span[1],
-                    note=f"the decoder looped or stalled in the chunk at {_clock(row.start)}-{_clock(row.end)}",
-                )
-            )
-    return Segment(
-        id=index,
-        start=sentence.start,
-        end=sentence.end,
-        text=sentence.text,
-        words=words or None,
-        source=SourceRef(kind=run.kind, run=run.id),
-        flags=tuple(sorted(flags, key=lambda f: f.char_start)),
-        paragraph=paragraph,
-        chapter=chapter,
-    )
-
-
-def _clock(seconds: float) -> str:
-    minutes, secs = divmod(int(seconds), 60)
-    return f"{minutes}:{secs:02d}"
-
-
-def _video(metadata: VideoMetadata, tags: Sequence[str], rows: Sequence[ChunkHypothesis]) -> Video:
-    duration = metadata.duration if metadata.duration is not None else max((row.end for row in rows), default=0.0)
-    return Video(
-        id=metadata.video_id,
-        url=ids.video_url(metadata.video_id),
-        title=metadata.title,
-        channel=metadata.channel,
-        channel_id=metadata.channel_id or "",
-        upload_date=_upload_date(metadata.upload_date),
-        duration_s=duration,
-        description=metadata.description,
-        language=metadata.language,
-        tags=tuple(tags),
-    )
-
-
-def _upload_date(raw: str | None) -> date | None:
-    try:
-        return datetime.strptime(raw, "%Y%m%d").date() if raw else None
-    except ValueError:
-        return None
-
-
-def _vad_info() -> dict[str, JsonValue]:
-    return {"repo": chunks.SILERO_REPO, "revision": chunks.SILERO_REVISION, **asdict(chunks.DEFAULT_VAD_PARAMS)}
-
-
-def _chunking_info(max_chunk_s: float | None, rows: Sequence[ChunkHypothesis]) -> dict[str, JsonValue] | None:
-    if max_chunk_s is None:
-        return None
-    return {
-        "max_chunk_s": max_chunk_s,
-        "tail_fraction": chunks.DEFAULT_TAIL_FRACTION,
-        "min_pause_s": chunks.DEFAULT_MIN_PAUSE_S,
-        "chunks": len(rows),
-    }
-
-
-def _quality(
-    rows: Sequence[ChunkHypothesis], sentences: Sequence[seg.Sentence], warnings: Sequence[str], *, chunked: bool
-) -> Quality:
-    counts: collections.Counter[str] = collections.Counter()
-    for row in rows:
-        counts.update(row.flags)
-        if not row.text.strip() and "empty_output" not in row.flags:
-            counts["empty_output"] += 1
-    transcribed = _covered_seconds([(s.start, s.end) for s in sentences])
-    # Without a VAD (whole-file engines) there is no separate speech estimate; the transcribed span stands in.
-    speech = sum(row.end - row.start for row in rows) if chunked else transcribed
-    return Quality(
-        speech_seconds=speech,
-        transcribed_seconds=transcribed,
-        decoder_anomalies=counts[_ANOMALY_FLAG],
-        flags_by_kind=dict(counts),
-        warnings=tuple(warnings),
-    )
-
-
-def _covered_seconds(spans: Collection[tuple[float, float]]) -> float:
-    total = 0.0
-    reach = 0.0
-    for start, end in sorted(spans):
-        start = max(start, reach)
-        if end > start:
-            total += end - start
-            reach = end
-    return total

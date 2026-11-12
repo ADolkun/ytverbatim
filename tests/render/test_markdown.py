@@ -146,6 +146,17 @@ def test_numeric_single_source_needs_overlapping_low_confidence(make_doc, seg, f
     assert "numeric_single_source: covered" in body
 
 
+def test_timing_interpolated_stays_in_the_json(make_doc, seg, flag) -> None:
+    text = "Prices rose 12 today"
+    timing = flag("timing_interpolated", text, text, note="interpolated")
+    disputed = flag("numeric_disputed", text, "12", note="heard 20")
+    doc = make_doc([seg(text, 0.0, 2.0, flags=[timing, disputed])])
+    body = render_markdown(doc)
+    assert "timing_interpolated" not in body and "interpolated" not in body
+    assert "Prices rose 12[^1] today" in body and "1 flag" in body
+    assert doc.segments[0].flags == (timing, disputed)
+
+
 def test_numeric_single_source_ignores_low_confidence_elsewhere_in_segment(make_doc, seg, flag) -> None:
     text = "up 12 and shaky speech"
     lone = flag("numeric_single_source", text, "12", note="alone")

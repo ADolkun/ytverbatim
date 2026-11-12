@@ -18,7 +18,10 @@ __all__ = [
     "client_from_options",
     "complete_json",
     "extract_json_object",
+    "spec_overrides",
 ]
+
+_PROVIDERS = ("claude-cli", "openai-compat")
 
 
 def client_from_options(options: LLMOptions) -> ClaudeCLIClient | OpenAICompatClient:
@@ -39,3 +42,18 @@ def client_from_options(options: LLMOptions) -> ClaudeCLIClient | OpenAICompatCl
         api_key_env=options.api_key_env,
         timeout_s=options.timeout_s,
     )
+
+
+def spec_overrides(spec: str) -> dict[str, object]:
+    """Turn a `--llm` spec into `[llm]` overrides: `none`, or `PROVIDER:MODEL` with a full model id.
+
+    `claude-cli:claude-sonnet-5-5` or `openai-compat:MODEL`; an openai-compat base URL still comes from the config.
+    """
+    if spec == "none":
+        return {"provider": "none"}
+    provider, _, model = spec.partition(":")
+    if provider not in _PROVIDERS or not model:
+        raise ConfigError(
+            f"--llm takes none or PROVIDER:MODEL with PROVIDER one of {', '.join(_PROVIDERS)}; got {spec!r}"
+        )
+    return {"provider": provider, "model": model}

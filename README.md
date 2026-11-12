@@ -4,15 +4,21 @@ Turn YouTube URLs into verified, timestamped transcripts for LLM context.
 
 Language models need transcripts they can cite. `ytverbatim` aims to produce text where every line carries a timestamp, so a quote can be traced back to the exact moment in the video. It works with your own logged-in browser session, so Premium and members-only videos you can already watch are covered. Speech recognition runs locally on Apple Silicon (MLX), with a focus on Mandarin and English.
 
-**Status: pre-alpha.** The first usable slice works: `ytverbatim run` turns a video into a transcript with local Whisper and no LLM. Correction, numeric verification and the engine selection are still to come.
+**Status: pre-alpha.** `ytverbatim run` turns a video into a transcript with local Whisper, restores missing punctuation and checks every number against independent readings. The engine selection is still to come.
 
 ## Usage
 
 ```
-ytverbatim run URL... [--out DIR] [--auth SPEC] [--engine ID] [--captions/--no-captions] [--force] [--ignore-cooldown]
+ytverbatim run URL... [--out DIR] [--auth SPEC] [--engine ID] [--source asr|captions] [--correct/--no-correct]
+                      [--chapters auto|youtube|none] [--llm SPEC] [--captions/--no-captions] [--force] [--ignore-cooldown]
+ytverbatim render CONTEXT.json [--stdout]
 ```
 
-Each video (playlists and channels are expanded) gets a folder `<out>/<video id>/` holding `context.json` (the versioned contract), `context.md` (the same transcript as markdown with a timestamped link per paragraph and YouTube chapters as headings) and the downloaded audio. A video that already has a `context.json` from the selected engine is skipped unless `--force` is given; one from another engine is transcribed again. Exit codes: 0 ok, 1 some videos failed, 2 auth error, 3 batch stopped. `ytverbatim fetch` downloads without transcribing; `ytverbatim auth` sets up your browser login (see [docs/auth.md](docs/auth.md)).
+Each video (playlists and channels are expanded) gets a folder `<out>/<video id>/` holding `context.json` (the versioned contract), `context.md` (the same transcript as markdown with a timestamped link per paragraph and YouTube chapters as headings) and the downloaded audio. Exit codes: 0 ok, 1 some videos failed, 2 auth error, 3 batch stopped. `ytverbatim fetch` downloads without transcribing; `ytverbatim auth` sets up your browser login (see [docs/auth.md](docs/auth.md)); `ytverbatim render` rewrites the markdown from a `context.json`.
+
+The stages run in this order: metadata, captions and audio; ASR (or, with `--source captions`, the manual caption track, falling back to ASR with a warning when there is none); normalize (Simplified Chinese by default, `[text] script = "keep"` to leave the script alone; fillers are kept unless `[text] fillers = "remove"`); punctuation, only where the transcript has too few sentence marks; correction, off unless `--correct`; numeric verification against the captions; then sentences, paragraphs, chapters and the documents. Every stage is stored under `<video>/.stages/`, keyed by what it read: a rerun with other options recomputes only the stages those options reach, an interrupted run resumes, and a video whose `context.json` is current is skipped. `--force` discards the stored stages. The 16 kHz WAV is deleted once the transcript is stored; the compressed audio stays.
+
+`--llm PROVIDER:MODEL` (for example `claude-cli:claude-sonnet-5-5`, or `openai-compat:MODEL` with `[llm] base_url` set) gives the text stages an LLM; `--llm none` turns it off. Without one, punctuation is left as transcribed and disputed numbers stay flagged with every reading; both are recorded in `quality.warnings` and printed as a notice. `--correct` needs an LLM. Token usage per stage lands in `llm_usage`. As a library, `ytverbatim.process(url, options, llm=client)` takes any object that satisfies `ytverbatim.LLMClient`.
 
 When YouTube answers with a bot check or a rate limit, the batch stops and a cooldown starts (1 hour, doubling on repeats up to 24 hours). Until it ends, `run` and `fetch` refuse to start; only a `run` whose targets are all single videos it has already finished goes ahead, because it requests nothing. `--ignore-cooldown` starts anyway, at the risk of your account being flagged; use it only when you know the block has lifted.
 
@@ -30,7 +36,6 @@ memory_cap_gib = 8
 - Auth status and a `doctor` command that explain problems with clear fixes
 - Local ASR by default, with YouTube captions used as cross-checking evidence
 - Timestamps on every segment, word-level where the engine provides them
-- Guarded LLM correction that never alters numbers silently
 - A versioned JSON output plus a markdown rendering
 
 ## Requirements
