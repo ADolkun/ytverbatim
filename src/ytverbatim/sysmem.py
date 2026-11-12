@@ -103,7 +103,7 @@ def footprint(pid: int) -> Footprint | None:
         code = ctypes.get_errno()
         if code == errno.ESRCH:
             return None
-        raise OSError(code, f"proc_pid_rusage({pid}) failed")
+        raise DependencyError(f"the memory watch cannot read the footprint of process {pid}: errno {code}")
     return Footprint(info.ri_phys_footprint, info.ri_lifetime_max_phys_footprint)
 
 

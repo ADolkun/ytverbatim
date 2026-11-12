@@ -9,7 +9,7 @@ from ytverbatim.auth.fixes import fix_for
 from ytverbatim.auth.preflight import fix_context
 from ytverbatim.auth.source import resolve_source
 from ytverbatim.cli.fetch import EXIT_AUTH, EXIT_FAILED, EXIT_STOPPED
-from ytverbatim.errors import AuthError, BatchStopError, YtverbatimError
+from ytverbatim.errors import AuthError, BatchStopError, EngineMemoryError, YtverbatimError
 from ytverbatim.ytdlp.runner import redact
 
 
@@ -63,6 +63,10 @@ def run_command(
         click.echo(f"✗ {exc.state.value}: {redact(exc.detail)}" if exc.detail else f"✗ {exc.state.value}", err=True)
         click.echo(f"  Fix: {fix_for(exc.state, **fix_context(source))}", err=True)
         raise SystemExit(EXIT_AUTH) from None
+    except EngineMemoryError as exc:
+        click.echo(f"■ {redact(exc.detail)}", err=True)
+        click.echo(f"  Fix: {exc.fix}", err=True)
+        raise SystemExit(EXIT_FAILED) from None
     except YtverbatimError as exc:
         click.echo(f"error: {redact(str(exc))}", err=True)
         raise SystemExit(EXIT_FAILED) from None

@@ -17,7 +17,15 @@ from ytverbatim.asr.models import HYPOTHESES_FILE, ChunkHypothesis, RunMetrics, 
 from ytverbatim.asr.runner import WorkerResult
 from ytverbatim.cli import main
 from ytverbatim.contract import ContextDocument, Word, load_document
-from ytverbatim.errors import BusyError, ConfigError, ContractError, DependencyError, EngineError
+from ytverbatim.errors import (
+    BusyError,
+    ConfigError,
+    ContractError,
+    DependencyError,
+    EngineError,
+    EngineMemoryError,
+    ProcMemoryExceeded,
+)
 from ytverbatim.pipeline import ProgressEvent, VideoResult, process, process_many, video_lock
 from ytverbatim.ytdlp.types import Signal
 
@@ -78,6 +86,8 @@ class FakeWorker:
     seen_wav: list[bool] = field(default_factory=list[bool])
     stale_output: list[bool] = field(default_factory=list[bool])
     error: EngineError | None = None
+    # Raise `error` only from this call on (1-based), so earlier videos finish.
+    fail_from_call: int = 1
     # A line appended to the hypotheses of the named file, to stand in for a corrupt row.
     garbage: dict[str, str] = field(default_factory=dict[str, str])
 
@@ -86,7 +96,7 @@ class FakeWorker:
         out = Path(request.out_dir)
         self.seen_wav.append(Path(request.files[0].wav).is_file())
         self.stale_output.append((out / HYPOTHESES_FILE).exists())
-        if self.error is not None:
+        if self.error is not None and len(self.calls) >= self.fail_from_call:
             raise self.error
         out.mkdir(parents=True, exist_ok=True)
         rows = whole_file_rows(request) if request.engine.spec.max_chunk_s is None else chunked_rows(request)
@@ -239,6 +249,40 @@ def test_a_worker_failure_is_a_per_video_error_and_the_batch_continues(session_k
     assert (first.error, second.error) == ("engine", "engine") and "out of memory" in first.detail
     assert report.exit_code == 1 and len(worker.calls) == 2
     assert all(r.document is None and r.markdown is None for r in results)
+
+
+def memory_kill(trigger: str = "available") -> EngineMemoryError:
+    cause = ProcMemoryExceeded(
+        "python3",
+        trigger,  # type: ignore[arg-type]
+        footprint_bytes=5 << 30,
+        cap_bytes=12 << 30,
+        available_percent=6,
+        floor_percent=10,
+    )
+    return EngineMemoryError(f"w-prod worker stopped to protect the machine: {cause}", "close memory-heavy apps", cause)
+
+
+@pytest.mark.parametrize("trigger", ["available", "footprint"])
+def test_a_memory_kill_stops_the_batch_and_keeps_the_report(session_kit, worker: FakeWorker, trigger: str) -> None:
+    yt = session_kit.yt()
+    worker.error = memory_kill(trigger)
+    worker.fail_from_call = 2
+    with pytest.raises(EngineMemoryError):
+        run(session_kit, yt, ["pubVideo001", "pubVideo002", "pubVideo003"])
+    assert len(worker.calls) == 2
+    assert batch_ids(session_kit) == [("pubVideo001", "ok")]
+
+
+def test_cli_prints_the_memory_fix_and_exits_nonzero(
+    session_kit, worker: FakeWorker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker.error = memory_kill()
+    result = invoke(session_kit, session_kit.yt(), monkeypatch, PUBLIC, "pubVideo002")
+    assert result.exit_code == 1
+    assert "■ w-prod worker stopped to protect the machine" in result.output
+    assert "  Fix: close memory-heavy apps" in result.output
+    assert len(worker.calls) == 1
 
 
 def test_process_raises_the_engine_error(session_kit, worker: FakeWorker) -> None:

@@ -54,6 +54,8 @@ class RunMetrics(_Model):
     audio_s: Seconds
     peak_memory_bytes: int | None
     max_rss_bytes: int
+    # The worker's own lifetime peak physical footprint, which the memory watch's cap is measured against.
+    peak_footprint_bytes: int | None = None
 
 
 class FileJob(_Model):

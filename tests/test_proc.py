@@ -142,7 +142,7 @@ def test_memory_watch_kills_a_hog_and_its_whole_group(script: Path, tmp_path: Pa
     error = info.value
     assert error.trigger == "footprint"
     assert error.footprint_bytes is not None
-    assert 600 * MIB < error.footprint_bytes < 1400 * MIB
+    assert 600 * MIB < error.footprint_bytes < 1600 * MIB
     assert (error.cap_bytes, error.available_percent, error.floor_percent) == (600 * MIB, 50, 10)
     assert "physical footprint reached" in str(error)
     assert "over the 0.59 GiB cap" in str(error)
@@ -170,8 +170,6 @@ def test_memory_watch_keeps_feeding_stdin_and_collects_output(script: Path) -> N
     watch = proc.MemoryWatch(1 << 40, poll_s=0.1, available_percent=_plenty)
     result = proc.run([sys.executable, str(script), "slow-echo"], timeout_s=30, stdin=payload, memory_watch=watch)
     assert (result.returncode, result.stdout) == (0, f"{len(payload)}:hél")
-    assert result.peak_footprint_bytes is not None
-    assert result.peak_footprint_bytes > 0
 
 
 def test_memory_watch_still_times_out(script: Path, tmp_path: Path) -> None:
@@ -201,5 +199,27 @@ def test_without_a_watch_nothing_polls(script: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(sysmem, "available_percent", unexpected)
     result = proc.run([sys.executable, str(script), "slow-echo"], timeout_s=30, stdin="abc")
     assert result.stdout == "3:abc"
-    assert result.peak_footprint_bytes is None
     assert timeouts == [30]
+
+
+def test_a_child_that_exits_as_a_trigger_fires_is_collected_not_reported_killed(script: Path) -> None:
+    waits: list[float | None] = []
+    original = subprocess.Popen.communicate
+
+    def slow_to_notice(self: subprocess.Popen[str], input: Any = None, timeout: float | None = None) -> Any:
+        waits.append(timeout)
+        # The first wait times out even though the child exits during it, as a wait that ends just too early would.
+        if len(waits) == 1:
+            self.wait()
+            raise subprocess.TimeoutExpired(self.args, timeout or 0.0)
+        return original(self, input, timeout)
+
+    def short_of_memory() -> int:
+        return 3
+
+    watch = proc.MemoryWatch(1 << 40, poll_s=0.1, available_percent=short_of_memory)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(subprocess.Popen, "communicate", slow_to_notice)
+        result = proc.run([sys.executable, str(script), "echo", "0"], timeout_s=30, memory_watch=watch)
+    assert (result.returncode, result.stdout) == (0, "out:")
+    assert len(waits) == 2

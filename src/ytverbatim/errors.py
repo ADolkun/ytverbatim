@@ -110,6 +110,16 @@ class EngineError(YtverbatimError):
     pass
 
 
+class EngineMemoryError(EngineError):
+    """The memory watch killed the ASR worker; the batch stops, since the next video would hit the same limit."""
+
+    def __init__(self, detail: str, fix: str, cause: ProcMemoryExceeded) -> None:
+        super().__init__(f"{detail}; {fix}")
+        self.detail = detail
+        self.fix = fix
+        self.trigger: MemoryTrigger = cause.trigger
+
+
 class LLMError(YtverbatimError):
     """A failed LLM call.
 

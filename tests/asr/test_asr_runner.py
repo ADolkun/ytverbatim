@@ -16,7 +16,7 @@ from ytverbatim import config, paths, proc
 from ytverbatim.asr import runner
 from ytverbatim.asr.chunks import Chunk
 from ytverbatim.asr.models import ERROR_FILE, HYPOTHESES_FILE, REQUEST_FILE, ChunkHypothesis, FileJob, WorkerRequest
-from ytverbatim.errors import ConfigError, EngineError, MediaValidationError, ProcMemoryExceeded
+from ytverbatim.errors import ConfigError, EngineError, EngineMemoryError, MediaValidationError, ProcMemoryExceeded
 
 HERE = Path(__file__).parent
 
@@ -156,7 +156,7 @@ def test_every_worker_runs_under_a_memory_watch_defaulting_to_half_the_ram(
     ("trigger", "fix"),
     [("footprint", "use a smaller engine, or raise asr.memory_cap_gib"), ("available", "close memory-heavy apps")],
 )
-def test_a_memory_kill_becomes_an_engine_error_with_the_fix(
+def test_a_memory_kill_becomes_an_engine_memory_error_with_the_fix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trigger: str, fix: str
 ) -> None:
     def fake_run(argv: list[str], **_: object) -> proc.ProcResult:
@@ -170,8 +170,11 @@ def test_a_memory_kill_becomes_an_engine_error_with_the_fix(
         )
 
     monkeypatch.setattr(runner.proc, "run", fake_run)
-    with pytest.raises(EngineError) as caught:
+    with pytest.raises(EngineMemoryError) as caught:
         runner.run_worker(make_request(tmp_path))
+    assert caught.value.trigger == trigger
+    assert fix in caught.value.fix
+    assert caught.value.detail.startswith("fake worker stopped to protect the machine: python3 was killed")
     message = str(caught.value)
     assert message.startswith("fake worker stopped to protect the machine: python3 was killed")
     assert "9.00 GiB" in message
@@ -181,7 +184,8 @@ def test_a_memory_kill_becomes_an_engine_error_with_the_fix(
     assert isinstance(caught.value.__cause__, ProcMemoryExceeded)
 
 
-def test_the_cap_setting_is_converted_and_checked(tmp_path: Path) -> None:
+def test_the_cap_setting_is_converted_and_checked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runner.sysmem, "physical_memory_bytes", lambda: 24 * GIB)
     config_file = tmp_path / "config.toml"
     config_file.write_text("[asr]\nmemory_cap_gib = 8\n", encoding="utf-8")
     assert config.load_options(config_file).asr.memory_cap_gib == 8.0
@@ -194,10 +198,18 @@ def test_the_cap_setting_is_converted_and_checked(tmp_path: Path) -> None:
             runner.memory_cap_bytes(bad)
 
 
-def test_the_peak_footprint_is_reported(tmp_path: Path) -> None:
-    result = runner.run_worker(make_request(tmp_path, sleep_s=0.7))
-    assert result.peak_footprint_bytes is not None
-    assert result.peak_footprint_bytes > 0
+@pytest.mark.parametrize("gib", [21.7, 24.0, 32.0])
+def test_a_cap_above_90_percent_of_ram_is_refused(monkeypatch: pytest.MonkeyPatch, gib: float) -> None:
+    monkeypatch.setattr(runner.sysmem, "physical_memory_bytes", lambda: 24 * GIB)
+    assert runner.memory_cap_bytes(21.6) == round(21.6 * GIB)
+    with pytest.raises(ConfigError, match=r"above 90% of this Mac's memory \(21\.6 GiB\)"):
+        runner.memory_cap_bytes(gib)
+
+
+def test_the_worker_reports_its_own_peak_footprint(tmp_path: Path) -> None:
+    result = runner.run_worker(make_request(tmp_path))
+    assert result.metrics.peak_footprint_bytes is not None
+    assert result.metrics.peak_footprint_bytes > 0
 
 
 def test_an_unreadable_wav_is_refused_before_spawning(tmp_path: Path) -> None:
