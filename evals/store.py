@@ -74,6 +74,10 @@ class Layout:
         return self.root / "runs"
 
     @property
+    def correction(self) -> Path:
+        return self.root / "correction"
+
+    @property
     def screen(self) -> Path:
         return self.root / "screen"
 

@@ -120,6 +120,8 @@ class CorrectionResult:
     flags: tuple[tuple[Flag, ...], ...]
     usage: tuple[LLMUsage, ...]
     rejections: tuple[Rejection, ...]
+    # Batch requests over both passes, checkpoint reuses included; the LLM calls made exceed it only by retries.
+    batches: int
 
 
 def correct_segments(
@@ -161,6 +163,7 @@ def correct_segments(
         flags=flags,
         usage=run.meter.summary(),
         rejections=tuple(run.rejections),
+        batches=run.batches,
     )
     _log.info(
         "correction: %d edits applied, %d proposals rejected",
@@ -185,12 +188,14 @@ class _Run:
         self.edits: list[list[Edit]] = [[] for _ in texts]
         self.rejections: list[Rejection] = []
         self.meter = UsageMeter()
+        self.batches = 0
         self._client = client
         self._language = language
         self._context = context
         self._checkpoint_dir = checkpoint_dir
 
     def correct_batch(self, indices: list[int], pass_: Pass) -> None:
+        self.batches += 1
         system = _SYSTEM if pass_ == "first" else _SECOND_PASS_SYSTEM
         user = self._prompt(indices, pass_)
         fixes = self._fixes(system, user, pass_)

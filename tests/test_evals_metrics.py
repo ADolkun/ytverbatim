@@ -8,11 +8,11 @@ from evals import metrics
 from evals.consensus import TimedUnit
 from evals.metrics import (
     ErrorCounts,
-    _percentile_index,
     cer,
     mer,
     nonspeech_intervals,
     paired_bootstrap,
+    percentile_index,
     quantity_accuracy,
     repetition_runs,
     unit_error_counts,
@@ -184,9 +184,9 @@ def test_paired_bootstrap_pools_counts_instead_of_averaging_window_rates() -> No
 
 
 def test_percentile_indices_pick_the_right_ranks() -> None:
-    assert _percentile_index(0.025, 2000) == 49
-    assert _percentile_index(0.975, 2000) == 1949
-    assert _percentile_index(0.5, 3) == 1
+    assert percentile_index(0.025, 2000) == 49
+    assert percentile_index(0.975, 2000) == 1949
+    assert percentile_index(0.5, 3) == 1
 
 
 def test_paired_bootstrap_rejects_mismatched_samples() -> None:

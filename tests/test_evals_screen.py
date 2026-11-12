@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from evals_fixture import CHUNKS, ZH, chunk_rows, make_eval, write_pair
 
-from evals.consensus import Segment, TimedUnit, find_disputes, timed_units
+from evals.consensus import Segment, TimedUnit, find_disputes, timed_units, window_units
 from evals.metrics import weighted_wilson, wilson_interval
 from evals.screen import (
     NO_SPEED,
@@ -11,15 +11,19 @@ from evals.screen import (
     Quality,
     ScreenResult,
     Share,
+    available,
     build_screen,
     collect_spans,
+    family,
     file_quality,
+    file_spans,
     format_only,
     recommend,
     screen_table,
     speed,
+    window_spans,
 )
-from evals.store import RunRecord, append_history, load_plan, row_units, write_rows
+from evals.store import RunRecord, append_history, hypothesis_units, load_plan, row_units, write_rows
 from ytverbatim.asr.models import ChunkHypothesis, RunMetrics
 from ytverbatim.contract.models import Word
 
@@ -208,3 +212,22 @@ def test_the_screen_table_labels_and_dashes_missing_memory_peaks() -> None:
     assert "peak GB (footprint / MLX / RSS)" in lines[0]
     assert lines[2].endswith("| — / 3.00 / 2.00 |")
     assert lines[3].endswith("| 9.00 / 3.00 / 2.00 |")
+
+
+def test_window_spans_with_a_pivot_equal_file_spans_on_a_one_window_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout, manifest = make_eval(tmp_path / "eval", monkeypatch)
+    write_pair(layout)
+    video = manifest.videos[0]
+    plan = load_plan(layout, video.id)
+    assert plan is not None
+    plan = plan.model_copy(update={"windows": ((0.0, plan.duration_s),)})
+    rows = available(layout, video, plan, ["w-prod", "q-base"])
+    units = {name: hypothesis_units(r, video.view_language, "raw", plan.speech) for name, r in rows.items()}
+    in_window = {name: window_units(u, 0.0, plan.duration_s) for name, u in units.items()}
+    expected = file_spans(video, plan, rows, pivot="w-prod")
+    assert expected
+    families = {name: family(name) for name in rows}
+    assert window_spans(video, video.view_language, 0, in_window, families=families, pivot="w-prod") == expected
+    assert all(s.id.startswith(f"{video.id}#0#") for s in expected)

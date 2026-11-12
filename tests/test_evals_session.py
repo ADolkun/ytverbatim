@@ -6,7 +6,7 @@ import pytest
 from evals_fixture import EN, ZH, make_eval, write_pair
 
 from evals.normalize import Language
-from evals.screen import Span, SpanReading
+from evals.screen import Span, SpanReading, collect_spans
 from evals.session import (
     KEY_FILE,
     SPANS_FILE,
@@ -15,6 +15,7 @@ from evals.session import (
     load_key,
     load_shown,
     sample_spans,
+    session_from_spans,
     write_session,
 )
 from evals.store import Layout
@@ -181,3 +182,20 @@ def test_session_needs_two_different_complete_runs(pair: tuple[Layout, object]) 
         build_session(layout, manifest, "w-prod", "w-prod")  # type: ignore[arg-type]
     with pytest.raises(ConfigError, match="f-aed is not complete for 2 of 2 files"):
         build_session(layout, manifest, "w-prod", "f-aed")  # type: ignore[arg-type]
+
+
+def test_session_from_spans_equals_build_session_on_the_same_spans(pair: tuple[Layout, object]) -> None:
+    layout, manifest = pair
+    spans = collect_spans(layout, manifest, ["w-prod", "q-base"], pivot="w-prod")  # type: ignore[arg-type]
+    built, built_key = build_session(layout, manifest, "w-prod", "q-base", n=20, seed=4)  # type: ignore[arg-type]
+    shown, key = session_from_spans(spans, manifest, "w-prod", "q-base", n=20, seed=4)  # type: ignore[arg-type]
+    assert shown == built
+    assert key.model_copy(update={"created": built_key.created}) == built_key
+
+
+def test_session_from_spans_refuses_when_no_audible_span_is_left(pair: tuple[Layout, object]) -> None:
+    layout, manifest = pair
+    spans = collect_spans(layout, manifest, ["w-prod", "q-base"], pivot="w-prod")  # type: ignore[arg-type]
+    written_form = [s.model_copy(update={"format_only": True}) for s in spans]
+    with pytest.raises(ConfigError, match="no audible disputes"):
+        session_from_spans(written_form, manifest, "w-prod", "q-base")  # type: ignore[arg-type]

@@ -274,3 +274,18 @@ def test_captions_build_the_pseudo_hypothesis_and_the_reference(
     assert REFERENCE not in run_asr.hypotheses_on_disk(layout)
     first_line = layout.rows_path(CAPTION_HYPOTHESIS, EN).read_text().splitlines()[0]
     assert json.loads(first_line)["hypothesis"] == "yt-auto"
+
+
+def test_check_weights_gates_any_repo_not_just_an_engine(tmp_path: Path) -> None:
+    item = disk.Weights("mlx-community/Qwen3.5-9B-8bit", "a" * 40)
+    with pytest.raises(
+        ConfigError, match=r"c-test needs 10\.45 GB of weights plus 1\.50 GB headroom, but only 11\.00 GB"
+    ):
+        disk.check_weights([item], tmp_path, "c-test", free=lambda _: 11 * GB)
+    assert disk.check_weights([item], tmp_path, "c-test", free=lambda _: 12 * GB) == 10_450_000_000
+    snapshot(tmp_path, item.repo, item.revision)
+    assert disk.check_weights([item], tmp_path, "c-test", free=lambda _: 0) == 0
+    fallback = disk.Weights("mlx-community/Qwen3-8B-8bit", "b" * 40)
+    assert disk.check_weights([fallback], tmp_path, "c-test", free=lambda _: 100 * GB) == 8_720_000_000
+    with pytest.raises(ConfigError, match=r"no size on record for org/unlisted; add it to evals/disk.py REPO_BYTES"):
+        disk.check_weights([disk.Weights("org/unlisted", "c" * 40)], tmp_path, "c-test", free=lambda _: 100 * GB)
