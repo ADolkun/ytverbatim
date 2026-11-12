@@ -11,6 +11,7 @@ import importlib
 import importlib.util
 import json
 import os
+import random
 import socket
 import sys
 import time
@@ -21,15 +22,32 @@ from pathlib import Path
 from typing import cast
 
 from pydantic import BaseModel, ConfigDict, ValidationError
+from rapidfuzz.distance import Levenshtein
 
 from evals import disk
+from evals.consensus import TimedUnit
 from evals.manifest import Manifest, Video
-from evals.store import Layout, file_complete, now, require_plan, rows_by_file, videos, write_json
+from evals.normalize import Language, to_units
+from evals.screen import DISPUTE_VIEW, Span, window_spans
+from evals.session import SessionKey, ShownSpan, session_from_spans
+from evals.store import (
+    Layout,
+    Plan,
+    file_complete,
+    hypothesis_units,
+    now,
+    require_plan,
+    row_units,
+    rows_by_file,
+    videos,
+    write_json,
+)
 from ytverbatim import config, pipeline, proc, stages
 from ytverbatim.acquire.metadata import VideoMetadata, trim_info
 from ytverbatim.asr import registry
+from ytverbatim.asr.models import ChunkHypothesis
 from ytverbatim.asr.runner import default_memory_cap_bytes, worker_lock
-from ytverbatim.contract.models import Edit, Flag, LLMUsage
+from ytverbatim.contract.models import Edit, Flag, LLMUsage, Word
 from ytverbatim.errors import (
     ConfigError,
     DependencyError,
@@ -53,6 +71,17 @@ CALLS_FILE = "calls.jsonl"
 FAILURE_FILE = "failure.json"
 SERVER_LOG = "server.log"
 SERVER_RECORD = "server.json"
+
+# Reading names inside the eval's own disputes; a span never reaches the judge or the listener under these.
+BASE = "base"
+BEFORE = "before"
+PROPOSED = "proposed"
+# Supplies word times when the input hypothesis has none (Qwen3 rows); a production-control run always exists.
+TIMING_DONOR = "w-prod"
+SESSION_NAME = "correction"
+SESSION_N = 80
+REJECTIONS_PER_GUARD = 30
+REJECTIONS_TOTAL = 150
 
 # mlx_lm.server loads whichever model a request names, so any other string would trigger a reload; this alias always
 # means the one the server was started with.
@@ -576,3 +605,198 @@ def _server_env(cache: Path) -> dict[str, str]:
     env.update({k: v for k, v in os.environ.items() if k.startswith("LC_")})
     env.update({"HF_HUB_CACHE": str(cache), "HF_HUB_OFFLINE": "1"})
     return env
+
+
+class RejectionSpan(_Frozen):
+    """One dispute inside a rejected proposal: readings ``before`` and ``proposed``, from one candidate's guard."""
+
+    candidate: str
+    guard: str
+    # Position in that candidate file's ``rejections``; the disputes of one proposal share it.
+    rejection: int
+    span: Span
+
+
+def complete_candidates(store: Layout, manifest: Manifest) -> list[Candidate]:
+    """Candidates with a finished run for every manifest file."""
+    return [c for c in CANDIDATES.values() if not pending_files(store, manifest, c, [])]
+
+
+def _require_run(store: Layout, candidate: Candidate, file: str) -> CandidateFile:
+    run = load_candidate_file(store, candidate, file)
+    if run is None:
+        raise ConfigError(
+            f"{candidate.id} has no output for {file}; "
+            f"run `python -m evals.run_correction correct --candidate {candidate.id}` first"
+        )
+    return run
+
+
+@dataclass(frozen=True)
+class _Timing:
+    """A file's base with the word times every pseudo-row of its stretches carries."""
+
+    video: Video
+    plan: Plan
+    language: Language
+    base: BaseFile
+    words: list[tuple[Word, ...]]
+
+    def units(self, name: str, index: int, text: str) -> list[TimedUnit]:
+        """Units of ``text`` as one hypothesis's reading of base stretch ``index``, timed by that stretch's words."""
+        stretch = self.base.stretches[index]
+        row = ChunkHypothesis(
+            hypothesis=name,
+            file=self.video.id,
+            chunk=index,
+            start=stretch.start,
+            end=stretch.end,
+            text=text,
+            words=self.words[index],
+        )
+        return row_units(row, self.language, DISPUTE_VIEW, self.plan.speech)
+
+
+def _timing(store: Layout, video: Video, base: BaseFile) -> _Timing:
+    """Word times per stretch; stretches whose source had none borrow `TIMING_DONOR`'s by alignment.
+
+    The donor's units are aligned to the base's across the whole file rather than per stretch, because a stretch
+    cut from untimed rows has only approximate bounds to select donor words by.
+    """
+    plan, language = require_plan(store, video.id), video.view_language
+    stretches = base.stretches
+    words = [s.words for s in stretches]
+    lacking = {i for i, s in enumerate(stretches) if not s.word_timed}
+    if not lacking:
+        return _Timing(video, plan, language, base, words)
+    rows = rows_by_file(store, TIMING_DONOR).get(video.id, [])
+    if not rows or not file_complete(registry.get(TIMING_DONOR), plan, rows):
+        raise ConfigError(
+            f"{base.hypothesis} has no word timings for {video.id}, so its edits are timed from {TIMING_DONOR}; "
+            f"run `python -m evals.run_asr asr --hyp {TIMING_DONOR}` first"
+        )
+    donor = hypothesis_units(rows, language, DISPUTE_VIEW, plan.speech)
+    units = [(i, unit) for i, s in enumerate(stretches) for unit in to_units(s.text, language, DISPUTE_VIEW)]
+    timed: dict[int, TimedUnit] = {}
+    for op in Levenshtein.opcodes([u.text for u in donor], [unit for _, unit in units]):
+        if op.tag in ("equal", "replace"):
+            for offset in range(min(op.src_end - op.src_start, op.dest_end - op.dest_start)):
+                timed[op.dest_start + offset] = donor[op.src_start + offset]
+    borrowed: dict[int, list[Word]] = {i: [] for i in lacking}
+    for position, (i, unit) in enumerate(units):
+        if i in borrowed and position in timed:
+            borrowed[i].append(Word(text=unit, start=timed[position].start_s, end=timed[position].end_s))
+    for i, found in borrowed.items():
+        words[i] = tuple(found)
+    return _Timing(video, plan, language, base, words)
+
+
+def edit_spans(
+    store: Layout, manifest: Manifest, candidates: Sequence[Candidate], files: Sequence[str] = ()
+) -> list[Span]:
+    """Disputes between the base and every candidate's text, with the base as pivot.
+
+    Only stretches where some candidate's text differs are aligned, so an unchanged stretch gives none. Every span
+    carries a reading for `BASE` and for each candidate id, and is numbered ``<file>#<stretch>#<n>``.
+    """
+    if not candidates:
+        raise ConfigError("no candidate to compare with the base")
+    spans: list[Span] = []
+    for video in videos(manifest, files):
+        base = load_base(store, video.id)
+        runs = {c.id: _require_run(store, c, video.id) for c in candidates}
+        changed = [i for i, s in enumerate(base.stretches) if any(run.texts[i] != s.text for run in runs.values())]
+        if not changed:
+            continue
+        timing = _timing(store, video, base)
+        for i in changed:
+            units = {BASE: timing.units(BASE, i, base.stretches[i].text)}
+            units.update({cid: timing.units(cid, i, run.texts[i]) for cid, run in runs.items()})
+            spans += window_spans(video, timing.language, i, units, pivot=BASE)
+    return spans
+
+
+def audible_edits(spans: Sequence[Span], candidate: str) -> list[Span]:
+    """Return the disputes where ``candidate`` changed the base's words in a way a listener can hear."""
+    return [s for s in spans if not s.format_only and s.reading(candidate).text != s.reading(BASE).text]
+
+
+def rejection_spans(
+    store: Layout,
+    manifest: Manifest,
+    candidates: Sequence[Candidate],
+    *,
+    seed: int = 0,
+    per_guard: int = REJECTIONS_PER_GUARD,
+    total: int = REJECTIONS_TOTAL,
+    files: Sequence[str] = (),
+) -> list[RejectionSpan]:
+    """Draw a seeded sample of rejected proposals, as disputes between the text before and the proposed text.
+
+    Proposals with no audible difference, and bad-index replies (nothing was proposed against any text), are not
+    candidates. At most ``per_guard`` proposals are drawn per guard, pooled over candidates, and the per-guard
+    limit shrinks until the draw fits in ``total``.
+    """
+    proposals: dict[str, list[list[RejectionSpan]]] = {}
+    for video in videos(manifest, files):
+        runs = [(c, _require_run(store, c, video.id)) for c in candidates]
+        if not any(run.rejections for _, run in runs):
+            continue
+        timing = _timing(store, video, load_base(store, video.id))
+        for candidate, run in runs:
+            for ordinal, rejection in enumerate(run.rejections):
+                if rejection.reason == "index":
+                    continue
+                found = _rejection_disputes(timing, candidate, ordinal, rejection)
+                if found:
+                    proposals.setdefault(rejection.reason, []).append(found)
+    limit = per_guard
+    while sum(min(len(p), limit) for p in proposals.values()) > total:
+        limit -= 1
+    rng = random.Random(seed)
+    drawn = [
+        group
+        for guard in sorted(proposals)
+        for group in rng.sample(proposals[guard], min(len(proposals[guard]), limit))
+    ]
+    return sorted((s for group in drawn for s in group), key=lambda r: (r.candidate, r.span.id))
+
+
+def _rejection_disputes(
+    timing: _Timing, candidate: Candidate, ordinal: int, rejection: Rejection
+) -> list[RejectionSpan]:
+    units = {
+        BEFORE: timing.units(BEFORE, rejection.segment, rejection.before),
+        PROPOSED: timing.units(PROPOSED, rejection.segment, rejection.proposed),
+    }
+    spans = window_spans(timing.video, timing.language, ordinal, units, pivot=BEFORE)
+    # The prefix keeps these ids apart from the edit spans', which are numbered by stretch.
+    return [
+        RejectionSpan(
+            candidate=candidate.id,
+            guard=rejection.reason,
+            rejection=ordinal,
+            span=s.model_copy(update={"id": f"{candidate.id}:{s.id}"}),
+        )
+        for s in spans
+        if not s.format_only
+    ]
+
+
+def session_for(
+    store: Layout,
+    manifest: Manifest,
+    candidates: Sequence[Candidate],
+    target: Candidate,
+    *,
+    n: int = SESSION_N,
+    seed: int = 0,
+) -> tuple[list[ShownSpan], SessionKey]:
+    """Build the A/B session of ``target``'s audible edits against the base, from the disputes among ``candidates``.
+
+    ``candidates`` must be the set the judge screened, so each session span is a judged dispute under the same id.
+    """
+    if target.id not in {c.id for c in candidates}:
+        raise ConfigError(f"{target.id} is not among the candidates whose edits were compared")
+    spans = audible_edits(edit_spans(store, manifest, candidates), target.id)
+    return session_from_spans(spans, manifest, BASE, target.id, n=n, seed=seed)
