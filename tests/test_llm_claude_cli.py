@@ -13,6 +13,7 @@ from ytverbatim.llm.claude_cli import ClaudeCLIClient
 from ytverbatim.llm.protocol import LLMRequest, Usage
 
 FAKE_CLAUDE = "/opt/fake/bin/claude"
+SYSTEM_FLAG = "--system-prompt-file="
 DANGEROUS = {
     "ANTHROPIC_API_KEY": "sk-ant-fake",
     "ANTHROPIC_AUTH_TOKEN": "fake-token",
@@ -44,8 +45,19 @@ class FakeProc:
         cwd: Path | None = None,
         stdin: str | None = None,
     ) -> proc.ProcResult:
+        system_files = [arg.removeprefix(SYSTEM_FLAG) for arg in argv if arg.startswith(SYSTEM_FLAG)]
+        system_file = Path(system_files[0]) if system_files else None
         self.calls.append(
-            {"argv": list(argv), "timeout_s": timeout_s, "env": dict(env or {}), "cwd": cwd, "stdin": stdin}
+            {
+                "argv": list(argv),
+                "timeout_s": timeout_s,
+                "env": dict(env or {}),
+                "cwd": cwd,
+                "stdin": stdin,
+                "system_file": system_file,
+                "system": None if system_file is None else system_file.read_text(encoding="utf-8"),
+                "system_mode": None if system_file is None else system_file.stat().st_mode & 0o777,
+            }
         )
         if self.raises is not None:
             raise self.raises
@@ -124,6 +136,7 @@ REQUEST = LLMRequest(system="Be terse.", user="Say hi.", max_output_tokens=321)
 
 def test_argv_is_the_isolated_pure_completion_command(fake: FakeProc) -> None:
     ClaudeCLIClient(model="sonnet", effort="low").complete(REQUEST)
+    system_file = fake.calls[0]["system_file"]
     assert fake.calls[0]["argv"] == [
         FAKE_CLAUDE,
         "-p",
@@ -136,7 +149,7 @@ def test_argv_is_the_isolated_pure_completion_command(fake: FakeProc) -> None:
         "sonnet",
         "--effort",
         "low",
-        "--system-prompt=Be terse.",
+        f"{SYSTEM_FLAG}{system_file}",
         "--tools",
         "",
         "--strict-mcp-config",
@@ -153,9 +166,49 @@ def test_argv_is_the_isolated_pure_completion_command(fake: FakeProc) -> None:
 
 
 def test_effort_is_omitted_when_unset() -> None:
-    argv = ClaudeCLIClient(model="sonnet").argv(FAKE_CLAUDE, "")
+    argv = ClaudeCLIClient(model="sonnet").argv(FAKE_CLAUDE, Path("/tmp/system.txt"))
     assert "--effort" not in argv
-    assert "--system-prompt=" in argv
+
+
+def test_the_system_prompt_travels_in_a_private_file_not_argv(fake: FakeProc) -> None:
+    secret = "-Starts with a dash and stays out of ps."
+    ClaudeCLIClient(model="sonnet").complete(LLMRequest(system=secret, user="Say hi."))
+    call = fake.calls[0]
+    argv = call["argv"]
+    assert isinstance(argv, list)
+    assert not any(secret in arg for arg in argv)
+    assert call["system"] == secret
+    assert call["system_mode"] == 0o600
+    system_file = call["system_file"]
+    assert isinstance(system_file, Path)
+    assert system_file.parent != call["cwd"]
+    assert not system_file.exists()
+
+
+def test_the_system_file_is_removed_when_the_call_times_out(fake: FakeProc) -> None:
+    fake.raises = ProcTimeout("claude", 900.0)
+    with pytest.raises(LLMUnavailableError):
+        ClaudeCLIClient(model="sonnet").complete(REQUEST)
+    system_file = fake.calls[0]["system_file"]
+    assert isinstance(system_file, Path)
+    assert not system_file.exists()
+
+
+@pytest.mark.parametrize("turns", [0, 2, None])
+def test_a_run_that_did_not_take_exactly_one_turn_is_refused(fake: FakeProc, turns: int | None) -> None:
+    fake.stdout = stream(init_message(), result_message(num_turns=turns))
+    with pytest.raises(LLMUnavailableError, match="not 1"):
+        ClaudeCLIClient(model="sonnet").complete(REQUEST)
+
+
+def test_a_full_model_id_must_be_the_model_the_child_started_with(fake: FakeProc) -> None:
+    ClaudeCLIClient(model="claude-haiku-5-5").complete(REQUEST)
+    with pytest.raises(LLMUnavailableError, match="not the requested 'claude-sonnet-5-5'"):
+        ClaudeCLIClient(model="claude-sonnet-5-5").complete(REQUEST)
+
+
+def test_an_alias_is_not_compared_with_the_resolved_model(fake: FakeProc) -> None:
+    assert ClaudeCLIClient(model="haiku").complete(REQUEST).text == '{"ok": true}'
 
 
 def test_env_is_allow_listed_and_dangerous_variables_never_reach_the_child(
@@ -281,8 +334,25 @@ def test_rate_limit_reports_the_reset_time(fake: FakeProc) -> None:
 
 def test_truncated_reply_is_an_output_error(fake: FakeProc) -> None:
     fake.stdout = stream(init_message(), result_message(stop_reason="max_tokens"))
-    with pytest.raises(LLMOutputError, match="max_output_tokens"):
+    with pytest.raises(LLMOutputError, match="max_output_tokens") as caught:
         ClaudeCLIClient(model="haiku").complete(REQUEST)
+    assert (caught.value.responded, caught.value.usage) == (True, Usage(input_tokens=677, output_tokens=9))
+
+
+def test_an_isolation_violation_still_reports_what_the_reply_cost(fake: FakeProc) -> None:
+    fake.stdout = stream(init_message(tools=["Bash"]), result_message())
+    with pytest.raises(LLMUnavailableError, match="tools are enabled") as caught:
+        ClaudeCLIClient(model="haiku").complete(REQUEST)
+    assert caught.value.responded
+    assert caught.value.usage == Usage(input_tokens=677, output_tokens=9)
+
+
+def test_a_rejected_login_bills_nothing(fake: FakeProc) -> None:
+    fake.stdout = stream(init_message(), assistant(error="authentication_failed"), result_message(is_error=True))
+    fake.returncode = 1
+    with pytest.raises(LLMUnavailableError) as caught:
+        ClaudeCLIClient(model="haiku").complete(REQUEST)
+    assert not caught.value.responded
 
 
 def test_empty_reply_is_an_output_error(fake: FakeProc) -> None:

@@ -1,9 +1,11 @@
 """Any OpenAI-compatible `/chat/completions` endpoint (mlx_lm.server, Ollama, hosted APIs) over stdlib HTTP."""
 
+import ipaddress
 import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 
@@ -40,6 +42,7 @@ class OpenAICompatClient:
             raise ConfigError("openai-compat needs [llm] base_url, e.g. http://127.0.0.1:8080/v1")
         if not model:
             raise ConfigError("openai-compat needs [llm] model")
+        _require_safe_transport(base_url, api_key_env)
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._api_key_env = api_key_env
@@ -82,10 +85,10 @@ class OpenAICompatClient:
         elapsed = time.monotonic() - started
         choice, usage = _parse(raw, self.id)
         if choice.get("finish_reason") == "length":
-            raise LLMOutputError(f"{self.id}: the reply hit max_tokens and was cut off")
+            raise LLMOutputError(f"{self.id}: the reply hit max_tokens and was cut off", responded=True, usage=usage)
         content = as_object(choice.get("message")).get("content")
         if not isinstance(content, str) or not content.strip():
-            raise LLMOutputError(f"{self.id}: empty reply")
+            raise LLMOutputError(f"{self.id}: empty reply", responded=True, usage=usage)
         return LLMResponse(text=content, usage=usage, elapsed_s=elapsed)
 
 
@@ -100,11 +103,35 @@ def readiness(
     if not base_url:
         return Readiness(False, "no [llm] base_url configured")
     try:
+        _require_safe_transport(base_url, api_key_env)
         request = urllib.request.Request(f"{base_url.rstrip('/')}/models", headers=_headers(api_key_env), method="GET")
         _send(opener, request, timeout_s, PROVIDER)
     except (ConfigError, LLMUnavailableError) as exc:
         return Readiness(False, str(exc))
     return Readiness(True, f"{base_url} answered /models")
+
+
+def _require_safe_transport(base_url: str, api_key_env: str | None) -> None:
+    """Refuse to send a bearer key in clear text anywhere but this machine."""
+    if api_key_env is None:
+        return
+    parts = urllib.parse.urlsplit(base_url)
+    if parts.scheme == "https" or (parts.scheme == "http" and _is_loopback(parts.hostname)):
+        return
+    raise ConfigError(
+        f"refusing to send the key from {api_key_env} to {base_url}: use https, or http only to a loopback address"
+    )
+
+
+def _is_loopback(host: str | None) -> bool:
+    if host is None:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _headers(api_key_env: str | None) -> dict[str, str]:

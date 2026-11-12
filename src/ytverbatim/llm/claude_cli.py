@@ -7,6 +7,7 @@ environment, and every call re-verifies from the stream that this isolation actu
 import json
 import os
 import shutil
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -55,6 +56,7 @@ _AUTH_ERRORS = frozenset({"authentication_failed", "oauth_org_not_allowed", "acc
 _AUTH_HTTP = frozenset({401, 403})
 _RATE_LIMIT_HTTP = 429
 _TAIL = 500
+_FULL_MODEL_PREFIX = "claude-"
 
 
 def child_env(source: Mapping[str, str] | None = None, *, max_output_tokens: int | None = None) -> dict[str, str]:
@@ -92,7 +94,7 @@ class ClaudeCLIClient:
     def id(self) -> str:
         return f"{PROVIDER}:{self._model}"
 
-    def argv(self, executable: str, system: str) -> list[str]:
+    def argv(self, executable: str, system_file: Path) -> list[str]:
         effort = ["--effort", self._effort] if self._effort is not None else []
         return [
             executable,
@@ -105,8 +107,9 @@ class ClaudeCLIClient:
             "--model",
             self._model,
             *effort,
-            # The equals form keeps a system prompt that starts with "-" from parsing as a flag.
-            f"--system-prompt={system}",
+            # A file rather than argv keeps the prompt out of `ps` for every other local user. The equals form keeps
+            # a path that starts with "-" from parsing as a flag.
+            f"--system-prompt-file={system_file}",
             "--tools",
             "",
             "--strict-mcp-config",
@@ -125,29 +128,46 @@ class ClaudeCLIClient:
         # `json_schema` is not sent: --json-schema works through a hidden tool call and extra turns, which
         # conflict with --tools "" and --max-turns 1; complete_json puts the schema in the prompt instead.
         # Claude Code has no temperature control, so `temperature` cannot be honoured.
-        argv = self.argv(_executable(), request.system)
+        executable = _executable()
         env = child_env(max_output_tokens=request.max_output_tokens)
-        try:
-            result = proc.run(
-                argv,
-                timeout_s=self._timeout_s,
-                env=env,
-                cwd=paths.llm_workdir("claude"),
-                stdin=stdin_line(request.user),
-            )
-        except ProcTimeout as exc:
-            raise LLMUnavailableError(f"{self.id}: {exc}; usage unknown") from exc
+        # Created 0600 in the private cache, outside the child's empty cwd, and removed when the call ends.
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=paths.llm_dir("claude"), prefix="system-", suffix=".txt"
+        ) as system_file:
+            system_file.write(request.system)
+            system_file.flush()
+            try:
+                result = proc.run(
+                    self.argv(executable, Path(system_file.name)),
+                    timeout_s=self._timeout_s,
+                    env=env,
+                    cwd=paths.llm_workdir("claude"),
+                    stdin=stdin_line(request.user),
+                )
+            except ProcTimeout as exc:
+                raise LLMUnavailableError(f"{self.id}: {exc}; usage unknown") from exc
         run = parse_stream(result.stdout)
         if run.init is None or run.result is None:
             raise LLMUnavailableError(
                 f"{self.id}: unusable result (exit {result.returncode}); usage unknown{_stderr_tail(result.stderr)}"
             )
-        check_isolation(run)
-        _raise_for_failure(self.id, run, result.returncode)
+        usage = _usage(run.result)
+        try:
+            check_isolation(run, model=self._model)
+        except LLMUnavailableError as exc:
+            raise LLMUnavailableError(str(exc), responded=True, usage=usage) from None
+        _raise_for_failure(self.id, run, result.returncode, usage)
+        # Checked on success only: a failed run reports its own reason, and its turn count says nothing more.
+        if run.result.get("num_turns") != 1:
+            raise LLMUnavailableError(
+                f"{self.id}: the run took {run.result.get('num_turns')!r} turns, not 1; a pure completion has one",
+                responded=True,
+                usage=usage,
+            )
         text = run.result.get("result")
         if not isinstance(text, str) or not text.strip():
-            raise LLMOutputError(f"{self.id}: empty reply")
-        return LLMResponse(text=text, usage=_usage(run.result), elapsed_s=result.elapsed_s)
+            raise LLMOutputError(f"{self.id}: empty reply", responded=True, usage=usage)
+        return LLMResponse(text=text, usage=usage, elapsed_s=result.elapsed_s)
 
 
 @dataclass(frozen=True)
@@ -191,13 +211,19 @@ def parse_stream(stdout: str) -> ClaudeRun:
     return ClaudeRun(init, result, assistant_error, rejected_limit)
 
 
-def check_isolation(run: ClaudeRun) -> None:
-    """Fail unless the child ran on the subscription login with no tools, MCP servers or user plugins."""
+def check_isolation(run: ClaudeRun, *, model: str) -> None:
+    """Fail unless the child ran on the subscription login with no tools, MCP servers or user plugins.
+
+    A full model id (`claude-...`) must also be the model the child started with; an alias such as `sonnet`
+    resolves inside the CLI, so there is nothing exact to compare it with.
+    """
     init = run.init or {}
     result = run.result or {}
     violations: list[str] = []
     if init.get("apiKeySource") != "none":
         violations.append(f"apiKeySource is {init.get('apiKeySource')!r}, not 'none'")
+    if model.startswith(_FULL_MODEL_PREFIX) and init.get("model") != model:
+        violations.append(f"the model is {init.get('model')!r}, not the requested {model!r}")
     if init.get("tools") != []:
         violations.append("tools are enabled")
     if init.get("mcp_servers") != []:
@@ -247,12 +273,14 @@ def _executable() -> str:
     return found
 
 
-def _raise_for_failure(client_id: str, run: ClaudeRun, returncode: int) -> None:
+def _raise_for_failure(client_id: str, run: ClaudeRun, returncode: int, usage: Usage | None) -> None:
     result = run.result or {}
     error = run.assistant_error
     status = result.get("api_error_status")
     if error == "max_output_tokens" or result.get("stop_reason") == "max_tokens":
-        raise LLMOutputError(f"{client_id}: the reply hit max_output_tokens and was cut off")
+        raise LLMOutputError(
+            f"{client_id}: the reply hit max_output_tokens and was cut off", responded=True, usage=usage
+        )
     if result.get("is_error") is not True and returncode == 0 and error is None:
         return
     category = error or result.get("terminal_reason") or f"exit {returncode}"

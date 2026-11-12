@@ -1,7 +1,11 @@
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from ytverbatim.auth.state import AuthState
 from ytverbatim.ytdlp.types import Signal
+
+if TYPE_CHECKING:
+    from ytverbatim.llm.protocol import Usage
 
 
 class YtverbatimError(Exception):
@@ -69,11 +73,24 @@ class EngineError(YtverbatimError):
     pass
 
 
-class LLMUnavailableError(YtverbatimError):
+class LLMError(YtverbatimError):
+    """A failed LLM call.
+
+    `responded` is True when a reply arrived, and was billed, but could not be used, for example when it was cut off
+    at the token limit; `usage` then holds its tokens, or None when the transport did not report them.
+    """
+
+    def __init__(self, message: str, *, responded: bool = False, usage: "Usage | None" = None) -> None:
+        super().__init__(message)
+        self.responded = responded
+        self.usage = usage
+
+
+class LLMUnavailableError(LLMError):
     pass
 
 
-class LLMOutputError(YtverbatimError):
+class LLMOutputError(LLMError):
     pass
 
 
