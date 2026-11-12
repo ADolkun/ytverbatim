@@ -65,6 +65,7 @@ from ytverbatim.errors import (
     ContractError,
     DependencyError,
     EngineError,
+    EngineMemoryError,
     MediaValidationError,
     YtverbatimError,
 )
@@ -165,7 +166,9 @@ def process_many(  # noqa: PLR0913
 
     Raises `DependencyError` when the engine's extra is missing and refuses a cooldown (`BatchStopError`), both
     before any request; the batch itself is `fetch`'s, with this pipeline as its per-video hook. Per-video
-    failures land in the report; a batch stop mid-run ends the batch and is recorded as well.
+    failures land in the report; a batch stop mid-run ends the batch and is recorded as well. An ASR worker killed
+    by the memory watch raises `EngineMemoryError`, after the report of the videos before it is written: every
+    later video would run the same engine into the same limit.
     """
     options = options or config.load_options()
     definition = _definition(options)
@@ -286,7 +289,7 @@ def _run_video(session: FetchSession, planned: PlannedVideo, settings: _Settings
             if outcome.status is not VideoStatus.OK or outcome.access is None:
                 return VideoResult(outcome)
             return VideoResult(outcome, _transcribe(vdir, outcome.access, settings), vdir / CONTEXT_MD)
-    except (BatchStopError, DependencyError):
+    except (BatchStopError, DependencyError, EngineMemoryError):
         raise
     except (YtverbatimError, ValueError, OSError) as exc:
         detail = str(exc) if isinstance(exc, YtverbatimError) else f"{type(exc).__name__}: {exc}"

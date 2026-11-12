@@ -25,7 +25,14 @@ from ytverbatim.asr.models import (
     WorkerError,
     WorkerRequest,
 )
-from ytverbatim.errors import ConfigError, EngineError, MediaValidationError, ProcMemoryExceeded, stderr_preview
+from ytverbatim.errors import (
+    ConfigError,
+    EngineError,
+    EngineMemoryError,
+    MediaValidationError,
+    ProcMemoryExceeded,
+    stderr_preview,
+)
 
 log = logging.getLogger(__name__)
 
@@ -34,7 +41,11 @@ WORKER_MODULE = "ytverbatim.asr.worker"
 TIMEOUT_FACTOR = 3.0
 TIMEOUT_FLOOR_S = 30 * 60.0
 DEFAULT_MEMORY_CAP_FRACTION = 0.5
+# With the 10% available-memory floor, a cap above 90% of RAM can never fire before the floor does, so it would be a
+# cap in name only.
+MAX_MEMORY_CAP_FRACTION = 0.9
 CAP_SETTING = "memory_cap_gib"
+_GIB = 1 << 30
 
 
 @dataclass(frozen=True)
@@ -44,8 +55,6 @@ class WorkerResult:
     # ru_maxrss of the largest child this process has waited for, in bytes on macOS; an upper bound for this worker.
     children_max_rss_bytes: int
     elapsed_s: float
-    # Highest physical footprint the memory watch saw; None when the worker finished before its first poll.
-    peak_footprint_bytes: int | None = None
 
 
 def worker_argv(request_path: Path, *, python: str | None = None) -> list[str]:
@@ -62,7 +71,14 @@ def memory_cap_bytes(gib: float | None) -> int | None:
         return None
     if not math.isfinite(gib) or gib <= 0:
         raise ConfigError(f"asr.{CAP_SETTING} must be a positive number of GiB, got {gib}")
-    return max(1, round(gib * (1 << 30)))
+    cap = max(1, round(gib * _GIB))
+    ceiling = sysmem.physical_memory_bytes() * MAX_MEMORY_CAP_FRACTION
+    if cap > ceiling:
+        raise ConfigError(
+            f"asr.{CAP_SETTING} = {gib:g} is above 90% of this Mac's memory ({ceiling / _GIB:.1f} GiB), where the "
+            "watch would only fire once the whole machine is short of memory; set it lower"
+        )
+    return cap
 
 
 def default_memory_cap_bytes() -> int:
@@ -92,7 +108,8 @@ def run_worker(request: WorkerRequest, *, python: str | None = None) -> WorkerRe
                 worker_argv(request_path, python=python), timeout_s=limit, memory_watch=proc.MemoryWatch(cap)
             )
         except ProcMemoryExceeded as exc:
-            raise EngineError(f"{hypothesis} worker stopped to protect the machine: {exc}; {_memory_fix(exc)}") from exc
+            detail = f"{hypothesis} worker stopped to protect the machine: {exc}"
+            raise EngineMemoryError(detail, _memory_fix(exc), exc) from exc
     children_rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
     if result.returncode != 0:
         raise EngineError(_failure(hypothesis, out, result.returncode, result.stderr))
@@ -100,7 +117,7 @@ def run_worker(request: WorkerRequest, *, python: str | None = None) -> WorkerRe
         metrics = RunMetrics.model_validate_json((out / METRICS_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise EngineError(f"{hypothesis} worker exited cleanly but left no readable {METRICS_FILE}: {exc}") from exc
-    return WorkerResult(out / HYPOTHESES_FILE, metrics, children_rss, result.elapsed_s, result.peak_footprint_bytes)
+    return WorkerResult(out / HYPOTHESES_FILE, metrics, children_rss, result.elapsed_s)
 
 
 @contextlib.contextmanager

@@ -19,8 +19,6 @@ class ProcResult:
     stdout: str
     stderr: str
     elapsed_s: float
-    # Highest footprint the memory watch saw; None without a watch or when the child exited before the first poll.
-    peak_footprint_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -73,28 +71,26 @@ def run(
     try:
         if memory_watch is None:
             stdout, stderr = child.communicate(stdin, timeout=timeout_s)
-            peak = None
         else:
-            stdout, stderr, peak = _watched(child, command, stdin, started + timeout_s, memory_watch)
+            stdout, stderr = _watched(child, command, stdin, started + timeout_s, memory_watch)
     except subprocess.TimeoutExpired:
         _kill_group(child)
         raise ProcTimeout(command, timeout_s) from None
     except BaseException:
         _kill_group(child)
         raise
-    return ProcResult(child.returncode, stdout, stderr, time.monotonic() - started, peak)
+    return ProcResult(child.returncode, stdout, stderr, time.monotonic() - started)
 
 
 def _watched(
     child: subprocess.Popen[str], command: str, stdin: str | None, deadline: float, watch: MemoryWatch
-) -> tuple[str, str, int | None]:
-    peak: int | None = None
+) -> tuple[str, str]:
     pending = stdin
     while True:
         remaining = deadline - time.monotonic()
         try:
             stdout, stderr = child.communicate(pending, timeout=max(0.0, min(watch.poll_s, remaining)))
-            return stdout, stderr, peak
+            return stdout, stderr
         except subprocess.TimeoutExpired:
             if remaining <= watch.poll_s:
                 raise
@@ -103,14 +99,13 @@ def _watched(
         sample = watch.footprint(child.pid)
         available = watch.available_percent()
         current = None if sample is None else sample.current
-        if sample is not None:
-            peak = max(peak or 0, sample.peak)
         trigger: MemoryTrigger | None = None
         if current is not None and current > watch.cap_bytes:
             trigger = "footprint"
         elif available < watch.floor_percent:
             trigger = "available"
-        if trigger is not None:
+        # A child that exited since the last wait finished its work; collect it instead of reporting a kill.
+        if trigger is not None and child.poll() is None:
             raise ProcMemoryExceeded(
                 command,
                 trigger,

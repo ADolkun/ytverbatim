@@ -62,6 +62,8 @@ def test_asr_runs_the_real_worker_with_the_shared_plan_and_resumes(
     (history,) = read_history(layout, "q-base")
     assert history.files == (ZH,)
     assert history.file_seconds == SECONDS
+    assert history.metrics.peak_footprint_bytes is not None
+    assert history.metrics.peak_footprint_bytes > 0
 
     again = run_asr.run_hypothesis(layout, manifest, "q-base", [ZH], cache, definition=fake_definition(), free=plenty)
     assert again.results == ()

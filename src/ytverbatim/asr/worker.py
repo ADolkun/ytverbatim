@@ -16,7 +16,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Protocol, cast
 
-from ytverbatim import atomic
+from ytverbatim import atomic, sysmem
 from ytverbatim.asr.audio import Audio, frame_energy, load_wav
 from ytverbatim.asr.chunks import Chunk, plan_chunks
 from ytverbatim.asr.guard import QualityGuard
@@ -43,6 +43,9 @@ _PLAN_TOLERANCE_S = 1e-3
 # Measured on f-aed: a 1 or 2 GiB freed-buffer cache decoded no faster than none (about 9.6-9.8 s per chunk either
 # way) and only added its own size to the footprint.
 CACHE_LIMIT_BYTES = 0
+# The process footprint always exceeds MLX's own active memory (Python, weights being read, Metal bookkeeping), so a
+# limit equal to the cap would never come into play before the parent kills the worker.
+MLX_LIMIT_FRACTION = 0.85
 
 
 class _MlxCore(Protocol):
@@ -104,6 +107,7 @@ def run_request(
         audio_s=audio_s,
         peak_memory_bytes=_peak_memory_bytes(),
         max_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        peak_footprint_bytes=_peak_footprint_bytes(),
     )
     atomic.write_json(out / METRICS_FILE, metrics.model_dump(mode="json"))
     return metrics
@@ -264,12 +268,12 @@ def bound_allocator(mlx: MlxAllocator, memory_cap_bytes: int | None) -> None:
     """Keep MLX's freed-buffer cache small and steer its scheduling under the cap.
 
     MLX defaults both limits to about the whole of RAM, so without this the cache alone can grow until the machine
-    stops. The memory limit only makes MLX wait for queued work before allocating more; the parent's watch is the
-    hard stop.
+    stops. The memory limit is a soft scheduling guideline: past it MLX waits for queued work to finish before it
+    allocates more, but it still allocates. The parent's watch is the hard stop.
     """
     mlx.set_cache_limit(CACHE_LIMIT_BYTES)
     if memory_cap_bytes is not None:
-        mlx.set_memory_limit(memory_cap_bytes)
+        mlx.set_memory_limit(int(memory_cap_bytes * MLX_LIMIT_FRACTION))
 
 
 def _mlx_allocator() -> MlxAllocator | None:
@@ -278,6 +282,11 @@ def _mlx_allocator() -> MlxAllocator | None:
         return cast(MlxAllocator, importlib.import_module("mlx.core"))
     except ImportError:
         return None
+
+
+def _peak_footprint_bytes() -> int | None:
+    sample = sysmem.footprint(os.getpid())
+    return None if sample is None else sample.peak
 
 
 def _peak_memory_bytes() -> int | None:

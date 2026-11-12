@@ -89,7 +89,7 @@ def test_the_allocator_is_bounded_before_load_and_emptied_after_every_chunk(tmp_
     worker.run_request(req, mlx=FakeMlx(log))
     assert log.read_text(encoding="utf-8").splitlines() == [
         f"cache_limit {worker.CACHE_LIMIT_BYTES}",
-        f"memory_limit {8 << 30}",
+        f"memory_limit {int((8 << 30) * worker.MLX_LIMIT_FRACTION)}",
         "load",
         f"transcribe {2 * RATE}",
         "clear_cache",
@@ -111,9 +111,15 @@ def test_main_bounds_the_mlx_allocator(tmp_path: Path, wav: Path, fake_mlx: Fake
     req_path = tmp_path / "req.json"
     req_path.write_text(req.model_dump_json(), encoding="utf-8")
     assert worker.main([str(req_path)]) == 0
-    assert fake_mlx.calls == [f"cache_limit {worker.CACHE_LIMIT_BYTES}", f"memory_limit {1 << 30}", "clear_cache"]
+    assert fake_mlx.calls == [
+        f"cache_limit {worker.CACHE_LIMIT_BYTES}",
+        f"memory_limit {int((1 << 30) * worker.MLX_LIMIT_FRACTION)}",
+        "clear_cache",
+    ]
     metrics = RunMetrics.model_validate_json((tmp_path / "out" / METRICS_FILE).read_text(encoding="utf-8"))
     assert metrics.peak_memory_bytes == 7
+    assert metrics.peak_footprint_bytes is not None
+    assert metrics.peak_footprint_bytes > 0
 
 
 def test_the_memory_cap_does_not_change_the_fingerprint(tmp_path: Path, wav: Path) -> None:
