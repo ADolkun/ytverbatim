@@ -32,7 +32,7 @@ def _t2s() -> opencc.OpenCC:
 
 
 @cache
-def _english() -> EnglishTextNormalizer:
+def english_normalizer() -> EnglishTextNormalizer:
     return EnglishTextNormalizer()
 
 
@@ -82,7 +82,7 @@ def to_units(text: str, language: Language, view: View) -> list[str]:
     """
     text = canonical(text, language)
     if view == "itn":
-        text = _english()(_LETTER_DOT.sub("", text)) if language == "en" else quantities_to_itn(text)
+        text = english_normalizer()(_LETTER_DOT.sub("", text)) if language == "en" else quantities_to_itn(text)
     text = _strip_symbols(text)
     text = _ZH_FILLER.sub(" ", text) if language == "zh" else _EN_FILLER.sub(" ", text)
     units = split_units(text)

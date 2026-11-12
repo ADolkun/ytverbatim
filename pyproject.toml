@@ -127,7 +127,7 @@ max-statements = 80
 preset = "strict"
 project-includes = ["src", "tests", "scripts", "evals"]
 python-version = "3.12"
-search-path = [".", "scripts", "tests/asr"]
+search-path = [".", "scripts", "tests", "tests/asr"]
 
 [tool.pyrefly.errors]
 unannotated-attribute = true

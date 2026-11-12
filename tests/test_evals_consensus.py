@@ -1,18 +1,18 @@
 import pytest
 
 from evals.consensus import (
+    UNCERTAIN,
     Segment,
     TimedUnit,
     find_disputes,
-    screening_stats,
     timed_units,
     window_units,
 )
-from evals.normalize import Language
+from evals.normalize import Language, View
 
 
-def hypothesis(language: Language, *segments: str, step: float = 10.0) -> list[TimedUnit]:
-    return timed_units([Segment(t, i * step, (i + 1) * step) for i, t in enumerate(segments)], language)
+def hypothesis(language: Language, *segments: str, step: float = 10.0, view: View = "itn") -> list[TimedUnit]:
+    return timed_units([Segment(t, i * step, (i + 1) * step) for i, t in enumerate(segments)], language, view)
 
 
 def test_agreeing_hypotheses_have_no_disputes() -> None:
@@ -141,27 +141,85 @@ def test_four_way_readings_are_deduplicated() -> None:
     assert dispute.distinct == ("乙", "丁", "戊")
 
 
-def test_screening_stats_follow_the_plurality() -> None:
-    hyps = {
-        "a": hypothesis("zh", "我买了很多的甲股票"),
-        "b": hypothesis("zh", "我买了很多的甲股票"),
-        "c": hypothesis("zh", "我卖了很多的乙股票"),
-    }
-    disputes = find_disputes(hyps, "zh")
-    stats = screening_stats(disputes, ["a", "b", "c"])
-    assert stats["a"].agreement == 1.0
-    assert stats["c"].agreement == 0.0
-    assert stats["c"].disputes == 2
-
-
-def test_undecided_disputes_count_for_nobody() -> None:
-    hyps = {"a": hypothesis("zh", "买"), "b": hypothesis("zh", "卖")}
-    stats = screening_stats(find_disputes(hyps, "zh"), ["a", "b"])
-    assert stats["a"].decided == 0
-    assert stats["a"].agreement is None
-
-
 def test_window_units_use_the_midpoint() -> None:
     units = hypothesis("zh", "甲乙", "丙丁")
     assert [u.text for u in window_units(units, 0, 10)] == ["甲", "乙"]
     assert [u.text for u in window_units(units, 5, 15)] == ["乙", "丙"]
+
+
+def test_english_entities_and_spelled_numbers_are_flagged_on_the_raw_view() -> None:
+    entity = {
+        "a": hypothesis("en", "we bought NVDA today", view="raw"),
+        "b": hypothesis("en", "we bought and video today", view="raw"),
+    }
+    (dispute,) = find_disputes(entity, "en")
+    assert dispute.touches_latin
+    spelled = {
+        "a": hypothesis("en", "it rose fifteen percent today", view="raw"),
+        "b": hypothesis("en", "it rose fifty percent today", view="raw"),
+    }
+    (numeric,) = find_disputes(spelled, "en")
+    assert numeric.touches_quantity
+    plain = {"a": hypothesis("en", "The cat sat", view="raw"), "b": hypothesis("en", "The cap sat", view="raw")}
+    (neither,) = find_disputes(plain, "en")
+    assert not neither.touches_latin
+    assert not neither.touches_quantity
+
+
+def test_the_pivot_counts_one_hypothesis_per_family() -> None:
+    texts = {"w1": "甲乙丙丁", "w2": "甲乙丙丁", "q": "甲乙戊丁", "f": "甲乙戊丁", "m": "甲己丙丁"}
+    hyps = {n: hypothesis("zh", t) for n, t in texts.items()}
+    families = {"w1": "whisper", "w2": "whisper", "q": "qwen", "f": "fire", "m": "mimo"}
+    # Counting both Whisper variants makes a Whisper the medoid; with one per family the q/f wording wins.
+    unweighted = find_disputes(hyps, "zh")
+    per_family = find_disputes(hyps, "zh", families=families)
+    assert [r.text for r in unweighted[0].readings] == [r.text for r in per_family[0].readings]
+    from evals.consensus import _medoid
+
+    units = {n: [u.text for u in h] for n, h in hyps.items()}
+    assert _medoid(units, {}) in {"w1", "w2"}
+    assert _medoid(units, families) in {"q", "f"}
+
+
+def test_an_explicit_pivot_aligns_two_hypotheses_directly() -> None:
+    hyps = {"control": hypothesis("zh", "我们买了股票"), "challenger": hypothesis("zh", "我们卖了股票")}
+    (dispute,) = find_disputes(hyps, "zh", pivot="control")
+    assert set(dispute.distinct) == {"买", "卖"}
+    with pytest.raises(ValueError, match="pivot"):
+        find_disputes(hyps, "zh", pivot="other")
+
+
+def test_context_holds_only_agreed_units_with_placeholders_for_other_disputes() -> None:
+    hyps = {
+        "a": hypothesis("zh", "我们今天买了这只股票然后卖出"),
+        "b": hypothesis("zh", "我们明天买了这只股票然后卖出"),
+        "c": hypothesis("zh", "我们今天买了这支股票然后卖掉"),
+    }
+    disputes = find_disputes(hyps, "zh")
+    middle = next(d for d in disputes if set(d.distinct) == {"只", "支"})
+    assert middle.left_context == f"我们{UNCERTAIN}天买了这"
+    assert middle.right_context == f"股票然后卖{UNCERTAIN}"
+    for d in disputes:
+        for reading in d.distinct:
+            if reading not in ("天", ""):
+                assert reading not in d.left_context.replace(UNCERTAIN, "")
+
+
+def test_readings_record_their_neighbouring_unit_times() -> None:
+    hyps = {"a": hypothesis("en", "red green blue", view="raw"), "b": hypothesis("en", "red blue", view="raw")}
+    (dispute,) = find_disputes(hyps, "en")
+    empty = next(r for r in dispute.readings if r.hypothesis == "b")
+    assert empty.start_s is None
+    assert empty.before_s == pytest.approx(5.0)
+    assert empty.after_s == pytest.approx(5.0)
+    spoken = next(r for r in dispute.readings if r.hypothesis == "a")
+    assert (spoken.start_s, spoken.end_s) == pytest.approx((10 / 3, 20 / 3))
+
+
+def test_units_spread_over_speech_only() -> None:
+    units = timed_units([Segment("甲乙丙丁", 0.0, 10.0)], "zh", speech=[(0.0, 2.0), (8.0, 10.0)])
+    assert [(u.start_s, u.end_s) for u in units] == [(0.0, 1.0), (1.0, 2.0), (8.0, 9.0), (9.0, 10.0)]
+    straddling = timed_units([Segment("甲乙丙", 0.0, 10.0)], "zh", speech=[(0.0, 2.0), (8.0, 10.0)])
+    assert all(not 2.0 < u.midpoint_s < 8.0 for u in straddling)
+    no_speech = timed_units([Segment("甲乙", 0.0, 4.0)], "zh", speech=[(10.0, 12.0)])
+    assert [(u.start_s, u.end_s) for u in no_speech] == [(0.0, 2.0), (2.0, 4.0)]

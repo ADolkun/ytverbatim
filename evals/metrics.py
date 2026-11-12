@@ -15,7 +15,7 @@ from statistics import NormalDist
 import jiwer
 
 from evals.consensus import TimedUnit
-from evals.normalize import Language, View, canonical, normalize, to_units
+from evals.normalize import Language, View, canonical, english_normalizer, normalize, to_units
 from ytverbatim.text.numbers import QKind, QToken, quantity_tokens
 
 Interval = tuple[float, float]
@@ -107,17 +107,25 @@ def quantity_accuracy(
     """Share of the reference's quantity tokens the hypothesis reproduces, as a multiset.
 
     The raw view compares surfaces case-sensitively (``150期`` is not ``一百五十期``, ``nvda`` is
-    not ``NVDA``); the itn view compares token values and casefolds.
+    not ``NVDA``); the itn view compares token values and casefolds, after Whisper's English
+    normalizer for English, so ``fifteen percent`` matches ``15%``.
     """
     expected = _tokens(reference, language, kinds)
     found = _tokens(hypothesis, language, kinds)
     if view == "raw":
         return Proportion(_overlap([t.surface for t in expected], [t.surface for t in found]), len(expected))
-    values = _overlap(
-        [t.value_itn.casefold() for t in expected if t.kind != "ticker"],
-        [t.value_itn.casefold() for t in found if t.kind != "ticker"],
-    )
-    return Proportion(values + _ticker_hits(expected, hypothesis, language), len(expected))
+    wanted = _itn_values(reference, language, kinds)
+    values = _overlap(wanted, _itn_values(hypothesis, language, kinds))
+    tickers = sum(t.kind == "ticker" for t in expected)
+    return Proportion(values + _ticker_hits(expected, hypothesis, language), len(wanted) + tickers)
+
+
+def _itn_values(text: str, language: Language, kinds: frozenset[QKind] | None) -> list[str]:
+    # English spells quantities out ("fifteen percent"); Whisper's normalizer writes them as digits first. It also
+    # lowercases, which is why tickers are matched separately against the raw tokens.
+    if language == "en":
+        text = english_normalizer()(canonical(text, language))
+    return [t.value_itn.casefold() for t in _tokens(text, language, kinds) if t.kind != "ticker"]
 
 
 def _overlap(expected: list[str], found: list[str]) -> int:
@@ -137,8 +145,34 @@ def _ticker_hits(expected: list[QToken], hypothesis: str, language: Language) ->
 def wilson_interval(successes: int, trials: int, confidence: float = DEFAULT_CONFIDENCE) -> Interval:
     if trials <= 0 or not 0 <= successes <= trials:
         raise ValueError(f"need 0 <= successes <= trials and trials > 0, got {successes}/{trials}")
+    return _wilson(successes / trials, trials, confidence)
+
+
+@dataclass(frozen=True, slots=True)
+class WeightedRate:
+    rate: float
+    effective_n: float
+    low: float
+    high: float
+
+
+def weighted_wilson(outcomes: Sequence[tuple[bool, float]], confidence: float = DEFAULT_CONFIDENCE) -> WeightedRate:
+    """Weighted success rate with a Wilson interval over Kish's effective sample size.
+
+    Stratified samples that oversample a stratum carry inverse-inclusion weights; with equal weights this is the
+    plain Wilson interval.
+    """
+    if not outcomes or any(w <= 0 for _, w in outcomes):
+        raise ValueError("need at least one outcome and only positive weights")
+    total = sum(w for _, w in outcomes)
+    rate = sum(w for success, w in outcomes if success) / total
+    effective_n = total * total / sum(w * w for _, w in outcomes)
+    low, high = _wilson(rate, effective_n, confidence)
+    return WeightedRate(rate, effective_n, low, high)
+
+
+def _wilson(p: float, trials: float, confidence: float) -> Interval:
     z = NormalDist().inv_cdf(0.5 + confidence / 2)
-    p = successes / trials
     denominator = 1 + z * z / trials
     centre = (p + z * z / (2 * trials)) / denominator
     margin = z * math.sqrt(p * (1 - p) / trials + z * z / (4 * trials * trials)) / denominator
@@ -227,7 +261,9 @@ def units_in_nonspeech(units: Sequence[TimedUnit], nonspeech: Sequence[Interval]
 
 @dataclass(frozen=True, slots=True)
 class Bootstrap:
-    mean_difference: float
+    """Difference of pooled error rates (a minus b) with its percentile interval."""
+
+    difference: float
     low: float
     high: float
 
@@ -236,21 +272,44 @@ class Bootstrap:
         return self.low > 0 or self.high < 0
 
 
+def _pooled(counts: Sequence[ErrorCounts], picks: Sequence[int]) -> float:
+    reference = sum(counts[i].reference_units for i in picks)
+    return sum(counts[i].errors for i in picks) / reference if reference else 0.0
+
+
+def _percentile_index(quantile: float, resamples: int) -> int:
+    # The q-th percentile of R sorted values is the ceil(q * R)-th smallest, at index ceil(q * R) - 1; the epsilon
+    # keeps float noise such as 1950.0000000000002 from moving it one rank up.
+    return min(resamples - 1, max(0, math.ceil(quantile * resamples - 1e-9) - 1))
+
+
 def paired_bootstrap(
-    a: Sequence[float],
-    b: Sequence[float],
+    a: Sequence[ErrorCounts],
+    b: Sequence[ErrorCounts],
     seed: int,
     resamples: int = DEFAULT_RESAMPLES,
     confidence: float = DEFAULT_CONFIDENCE,
 ) -> Bootstrap:
-    """Percentile interval of mean(a - b), resampling the paired items together. Deterministic per seed."""
+    """Interval of the pooled error-rate difference, resampling alignment windows as pairs. Deterministic per seed.
+
+    Each resample sums errors and reference units over the drawn windows before dividing, so a short window
+    weighs as much as its reference length and no more; averaging per-window rates would overweight short windows.
+    """
     if len(a) != len(b) or not a:
         raise ValueError("paired samples must be non-empty and equally long")
-    differences = [x - y for x, y in zip(a, b, strict=True)]
+    if sum(c.reference_units for c in a) == 0 or sum(c.reference_units for c in b) == 0:
+        raise ValueError("the reference has no units")
+    n = len(a)
+    every = range(n)
     rng = random.Random(seed)
-    n = len(differences)
-    means = sorted(sum(rng.choices(differences, k=n)) / n for _ in range(resamples))
+    differences = []
+    for _ in range(resamples):
+        picks = rng.choices(every, k=n)
+        differences.append(_pooled(a, picks) - _pooled(b, picks))
+    differences.sort()
     tail = (1 - confidence) / 2
-    low = means[int(tail * resamples)]
-    high = means[min(resamples - 1, int((1 - tail) * resamples))]
-    return Bootstrap(sum(differences) / n, low, high)
+    return Bootstrap(
+        _pooled(a, every) - _pooled(b, every),
+        differences[_percentile_index(tail, resamples)],
+        differences[_percentile_index(1 - tail, resamples)],
+    )
