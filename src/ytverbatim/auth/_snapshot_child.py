@@ -1,6 +1,6 @@
 """Child-process entry point for browser cookie snapshots; the only module that imports yt-dlp's cookie code.
 
-Prints one JSON line on stdout: ``{"ok": true, counts, decrypt_failures, logged_in, warnings}`` or
+Prints one JSON line on stdout: ``{"ok": true, counts, decrypt_failures, logged_in, warnings, profile}`` or
 ``{"ok": false, state, detail}``. It never prints cookie values or raw log messages.
 """
 
@@ -15,8 +15,10 @@ from pathlib import Path
 from ytverbatim.auth import chromium
 from ytverbatim.auth.cookiefile import CookieEntry
 from ytverbatim.auth.snapshot import write_snapshot
+from ytverbatim.auth.source import BrowserSource
 from ytverbatim.auth.state import AuthState
 from ytverbatim.errors import AuthError
+from ytverbatim.ytdlp.runner import redact
 
 _KEYCHAIN = re.compile(
     r"find-generic-password failed|exception running find-generic-password|cannot decrypt v1[01] cookies: no key found",
@@ -25,6 +27,8 @@ _KEYCHAIN = re.compile(
 _EXTRACTED = re.compile(r"extracted (\d+) cookies from \w+ \((\d+) could not be decrypted\)", re.I)
 _WARNING_KINDS = (
     ("keychain", _KEYCHAIN),
+    # yt-dlp's per-cookie AES failures; with a wrong key every v10 cookie fails this way.
+    ("wrong_key", re.compile(r"possibly the key is wrong", re.I)),
     ("unknown_cookie_version", re.compile(r"unknown cookie version", re.I)),
     ("no_sqlite", re.compile(r"without sqlite3 support", re.I)),
 )
@@ -82,7 +86,8 @@ def _entry(cookie: http.cookiejar.Cookie) -> CookieEntry:
 
 
 def run_snapshot(browser: str, profile: str | None, out: Path, extract: Extractor) -> dict[str, object]:
-    pin_dir = chromium.pin_cookie_db(chromium.cookie_db(browser, profile))
+    store = chromium.cookie_db(browser, profile)
+    pin_dir = chromium.pin_cookie_db(store.path)
     logger = CaptureLogger()
     try:
         jar = list(extract(browser, str(pin_dir), logger))
@@ -90,20 +95,10 @@ def run_snapshot(browser: str, profile: str | None, out: Path, extract: Extracto
         raise AuthError(
             AuthState.PROFILE_NOT_FOUND, f"the {browser} cookie database disappeared while reading it"
         ) from None
-    keychain = f"{chromium.keychain_item(browser)!r} in Keychain Access"
-    if "keychain" in logger.kinds:
-        raise AuthError(
-            AuthState.KEYCHAIN_DENIED,
-            f"macOS Keychain refused the {browser} cookie key; allow /usr/bin/security for {keychain}, then retry",
-        )
-    if not jar and logger.decrypt_failures:
-        raise AuthError(
-            AuthState.KEYCHAIN_DENIED,
-            f"none of {logger.decrypt_failures} {browser} cookies could be decrypted; check {keychain}",
-        )
     summary = write_snapshot(
         (_entry(c) for c in jar),
         out,
+        source=BrowserSource(browser, store.profile),
         decrypt_failures=logger.decrypt_failures,
         warnings=tuple(logger.kinds),
     )
@@ -131,7 +126,7 @@ def main(argv: Sequence[str] | None = None, extract: Extractor = _ytdlp_extract)
     except AuthError as exc:
         result = {"ok": False, "state": exc.state.value, "detail": exc.detail}
     except Exception as exc:
-        result = {"ok": False, "state": None, "detail": f"{type(exc).__name__}: {exc}"}
+        result = {"ok": False, "state": None, "detail": redact(f"{type(exc).__name__}: {exc}")}
     sys.stdout.write(json.dumps(result) + "\n")
     return 0 if result["ok"] is True else 1
 

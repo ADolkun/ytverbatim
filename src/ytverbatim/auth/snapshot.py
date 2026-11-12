@@ -14,6 +14,7 @@ from ytverbatim.auth.cookiefile import CookieEntry
 from ytverbatim.auth.source import BrowserSource, CookieFileSource, CookieSource
 from ytverbatim.auth.state import AuthState
 from ytverbatim.errors import AuthError, ProcTimeout, YtverbatimError
+from ytverbatim.ytdlp.runner import redact
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +37,8 @@ class SnapshotSummary:
     decrypt_failures: int
     logged_in: bool
     warnings: tuple[str, ...]
+    # The browser profile directory actually read; None for a cookie file.
+    profile: str | None = None
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -43,6 +46,7 @@ class SnapshotSummary:
             "decrypt_failures": self.decrypt_failures,
             "logged_in": self.logged_in,
             "warnings": list(self.warnings),
+            "profile": self.profile,
         }
 
 
@@ -74,6 +78,7 @@ def write_snapshot(
     entries: Iterable[CookieEntry],
     out: Path,
     *,
+    source: CookieSource,
     decrypt_failures: int = 0,
     warnings: tuple[str, ...] = (),
     now: float | None = None,
@@ -86,15 +91,41 @@ def write_snapshot(
         domain = allowed_domain(entry.domain)
         if domain is not None:
             counts[domain] += 1
-    summary = SnapshotSummary(counts, decrypt_failures, is_logged_in(kept, now), warnings)
+    profile = source.profile if isinstance(source, BrowserSource) else None
+    summary = SnapshotSummary(counts, decrypt_failures, is_logged_in(kept, now), warnings, profile)
     if not summary.logged_in:
-        raise AuthError(
-            AuthState.LOGGED_OUT,
-            f"no signed-in YouTube session in these cookies ({counts['youtube.com']} youtube.com cookies); "
-            "sign in to YouTube in this browser profile, then retry",
-        )
+        raise _logged_out_error(source, summary)
     atomic.write_text(out, cookiefile.render(kept), mode=SNAPSHOT_MODE)
     return summary
+
+
+def _logged_out_error(source: CookieSource, summary: SnapshotSummary) -> AuthError:
+    if isinstance(source, CookieFileSource):
+        return AuthError(
+            AuthState.COOKIE_FILE_LOGGED_OUT,
+            "the exported cookie file is signed out or expired; re-export it from a fresh private window",
+        )
+    where = f"{source.browser} profile {source.profile!r}" if source.profile else source.browser
+    # Undecryptable cookies or a refused/wrong key explain a missing login better than "signed out" does,
+    # and telling the user to sign in again would not fix them.
+    reasons: list[str] = []
+    if summary.decrypt_failures:
+        reasons.append(f"{summary.decrypt_failures} cookies could not be decrypted")
+    if "keychain" in summary.warnings:
+        reasons.append("macOS Keychain refused the cookie key")
+    if "wrong_key" in summary.warnings:
+        reasons.append("the cookie key looks wrong")
+    if reasons:
+        return AuthError(
+            AuthState.KEYCHAIN_DENIED,
+            f"no signed-in YouTube session could be read from {where} ({'; '.join(reasons)}); allow "
+            f"/usr/bin/security for {chromium.keychain_item(source.browser)!r} in Keychain Access, then retry",
+        )
+    return AuthError(
+        AuthState.LOGGED_OUT,
+        f"no signed-in YouTube session in {where} ({summary.counts['youtube.com']} youtube.com cookies); "
+        "sign in to YouTube in that browser profile, then retry",
+    )
 
 
 def new_snapshot_path() -> Path:
@@ -119,11 +150,13 @@ def _summary_from_json(raw: dict[str, object]) -> SnapshotSummary:
     counts = raw.get("counts")
     warnings = raw.get("warnings")
     failures = raw.get("decrypt_failures")
+    profile = raw.get("profile")
     return SnapshotSummary(
         counts={str(k): v for k, v in counts.items() if isinstance(v, int)} if isinstance(counts, dict) else {},
         decrypt_failures=failures if isinstance(failures, int) else 0,
         logged_in=raw.get("logged_in") is True,
         warnings=tuple(str(w) for w in warnings) if isinstance(warnings, list) else (),
+        profile=profile if isinstance(profile, str) else None,
     )
 
 
@@ -135,19 +168,20 @@ def _parse_child_output(stdout: str, stderr: str, returncode: int) -> SnapshotSu
         raw = None
     if not isinstance(raw, dict):
         tail = stderr.strip().splitlines()[-1:] or ["no output"]
-        raise YtverbatimError(f"cookie snapshot child failed with exit {returncode}: {tail[0]}")
+        raise YtverbatimError(redact(f"cookie snapshot child failed with exit {returncode}: {tail[0]}"))
     if raw.get("ok") is True:
         return _summary_from_json(raw)
     state = raw.get("state")
     detail = str(raw.get("detail", ""))
     if isinstance(state, str) and state in set(AuthState):
         raise AuthError(AuthState(state), detail)
-    raise YtverbatimError(f"cookie snapshot failed: {detail}")
+    raise YtverbatimError(redact(f"cookie snapshot failed: {detail}"))
 
 
 def snapshot_browser(source: BrowserSource, out: Path, *, timeout_s: float = DEFAULT_TIMEOUT_S) -> SnapshotSummary:
     """Snapshot browser cookies in a child process, because macOS may block on a Keychain prompt."""
-    argv = [sys.executable, "-m", CHILD_MODULE, "--browser", source.browser, "--out", str(out)]
+    # -P: never let a json.py or similar in the caller's working directory shadow a module in the child.
+    argv = [sys.executable, "-P", "-m", CHILD_MODULE, "--browser", source.browser, "--out", str(out)]
     if source.profile is not None:
         argv += ["--profile", source.profile]
     try:
@@ -161,8 +195,9 @@ def snapshot_browser(source: BrowserSource, out: Path, *, timeout_s: float = DEF
         ) from None
     summary = _parse_child_output(result.stdout, result.stderr, result.returncode)
     log.info(
-        "cookie snapshot from %s: %s, %d undecryptable, %.1fs",
+        "cookie snapshot from %s profile %s: %s, %d undecryptable, %.1fs",
         source.browser,
+        summary.profile,
         ", ".join(f"{n} {d}" for d, n in summary.counts.items()),
         summary.decrypt_failures,
         result.elapsed_s,
@@ -177,7 +212,7 @@ def take_snapshot(source: CookieSource, out: Path, *, timeout_s: float = DEFAULT
         case CookieFileSource(path=path):
             # A private filtered copy: yt-dlp writes rotated values back to --cookies, and must not touch
             # the user's own file.
-            return write_snapshot(cookiefile.read_cookie_file(path), out)
+            return write_snapshot(cookiefile.read_cookie_file(path), out, source=source)
 
 
 @contextmanager

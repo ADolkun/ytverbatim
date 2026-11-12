@@ -1,3 +1,4 @@
+import contextlib
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ from typing import Literal
 from ytverbatim import paths
 from ytverbatim.auth.state import AuthState
 from ytverbatim.errors import AuthError
+from ytverbatim.ytdlp.runner import redact
 
 
 @dataclass(frozen=True)
@@ -86,26 +88,54 @@ def _profile_stores(root: Path) -> dict[str, Path]:
     }
 
 
-def cookie_db(browser: str, profile: str | None) -> Path:
+@dataclass(frozen=True)
+class CookieStore:
+    profile: str
+    path: Path
+
+
+def cookie_db(browser: str, profile: str | None) -> CookieStore:
     """Resolve a profile's own cookie database.
 
-    Without a profile this follows yt-dlp's "most recently used profile" meaning, but compares
-    profile stores only, never extension stores.
+    Without a profile this succeeds only when exactly one profile has a cookie store. Guessing (yt-dlp
+    picks the most recently written store) can silently select a different Google account.
     """
     root = _existing_root(browser)
     stores = _profile_stores(root)
-    if profile is None:
-        store = max(stores.values(), key=lambda s: s.stat().st_mtime, default=None)
-    else:
+    fix = f"run `ytverbatim auth use {browser}:<DIR>` with one of those directories"
+    if profile is not None:
         store = stores.get(profile)
-    if store is None:
-        wanted = f"profile {profile!r}" if profile is not None else "any profile"
-        available = ", ".join(repr(name) for name in stores) or "none"
+        if store is None:
+            raise AuthError(
+                AuthState.PROFILE_NOT_FOUND,
+                f"no {browser} cookie database for profile {profile!r}; profiles with cookies: "
+                f"{_describe(browser, root, stores) or 'none'}; {fix}",
+            )
+        return CookieStore(profile, store)
+    if len(stores) == 1:
+        [(name, store)] = stores.items()
+        return CookieStore(name, store)
+    if not stores:
         raise AuthError(
             AuthState.PROFILE_NOT_FOUND,
-            f"no {browser} cookie database for {wanted}; profiles with cookies: {available}",
+            f"no {browser} profile has a cookie database; sign in to YouTube in {browser} once, then retry",
         )
-    return store
+    raise AuthError(
+        AuthState.PROFILE_NOT_FOUND,
+        f"{len(stores)} {browser} profiles have cookies and none was chosen: {_describe(browser, root, stores)}; {fix}",
+    )
+
+
+def _describe(browser: str, root: Path, stores: dict[str, Path]) -> str:
+    """Profile dirs with their display names; never emails."""
+    names: dict[str, str] = {}
+    # Only decorates an error message; the dirs alone still tell the user what to pass.
+    with contextlib.suppress(AuthError):
+        names = {p.dir: p.name for p in _profiles_from_state(_read_local_state(browser, root), root, emails="omit")}
+    return ", ".join(
+        f"{directory!r} ({names[directory]})" if names.get(directory, directory) != directory else repr(directory)
+        for directory in stores
+    )
 
 
 def pin_cookie_db(store: Path) -> Path:
@@ -147,10 +177,17 @@ def _active_time(value: object) -> datetime | None:
 def list_profiles(browser: str, *, emails: EmailMode = "omit") -> list[Profile]:
     """List profiles from the browser's ``Local State``; emails only when asked, masked unless ``full``."""
     root = _existing_root(browser)
+    return _profiles_from_state(_read_local_state(browser, root), root, emails=emails)
+
+
+def _read_local_state(browser: str, root: Path) -> object:
     try:
-        state = json.loads((root / "Local State").read_text(encoding="utf-8"))
+        return json.loads((root / "Local State").read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        raise AuthError(AuthState.BROWSER_NOT_FOUND, f"cannot read {browser} Local State: {exc}") from exc
+        raise AuthError(AuthState.BROWSER_NOT_FOUND, redact(f"cannot read {browser} Local State: {exc}")) from exc
+
+
+def _profiles_from_state(state: object, root: Path, *, emails: EmailMode) -> list[Profile]:
     section = state.get("profile") if isinstance(state, dict) else None
     info_cache = section.get("info_cache") if isinstance(section, dict) else None
     if not isinstance(section, dict) or not isinstance(info_cache, dict):

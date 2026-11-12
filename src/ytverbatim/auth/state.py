@@ -8,6 +8,8 @@ class AuthState(StrEnum):
     COOKIE_FILE_INVALID = "cookie_file_invalid"
     KEYCHAIN_DENIED = "keychain_denied"
     LOGGED_OUT = "logged_out"
+    # Kept apart from LOGGED_OUT: the fix is a fresh export, not signing in to a browser.
+    COOKIE_FILE_LOGGED_OUT = "cookie_file_logged_out"
     ROTATED = "rotated"
     BOT_CHECK = "bot_check"
     CAPTCHA = "captcha"

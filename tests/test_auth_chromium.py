@@ -72,6 +72,15 @@ def test_list_profiles_masks_emails_unless_full_requested(root: Path) -> None:
     assert full[0].email == "alice@example.com"
 
 
+def test_unreadable_local_state_hides_the_home_directory(root: Path, tmp_path: Path) -> None:
+    (root / "Local State").mkdir()
+    with pytest.raises(AuthError) as caught:
+        chromium.list_profiles("chrome")
+    assert caught.value.state is AuthState.BROWSER_NOT_FOUND
+    assert str(tmp_path) not in caught.value.detail
+    assert "~/Library/" in caught.value.detail
+
+
 def test_list_profiles_missing_browser(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     with pytest.raises(AuthError) as caught:
@@ -89,20 +98,49 @@ def test_unknown_browser_is_rejected(root: Path) -> None:
 def test_named_profile_ignores_newer_extension_store(root: Path) -> None:
     real = _store(root, "Default", "Cookies", mtime=1_000)
     _store(root, "Default", "Storage", "ext", "abc", "def", "Cookies", mtime=2_000)
-    assert chromium.cookie_db("chrome", "Default") == real
+    assert chromium.cookie_db("chrome", "Default") == chromium.CookieStore("Default", real)
 
 
 def test_network_store_wins_over_legacy_location(root: Path) -> None:
     _store(root, "Default", "Cookies", mtime=2_000)
     network = _store(root, "Default", "Network", "Cookies", mtime=1_000)
-    assert chromium.cookie_db("chrome", "Default") == network
+    assert chromium.cookie_db("chrome", "Default").path == network
 
 
-def test_unnamed_profile_picks_most_recent_profile_store(root: Path) -> None:
+def test_unnamed_profile_uses_the_only_profile_with_a_store(root: Path) -> None:
+    only = _store(root, "Solo", "Cookies", mtime=1_000)
+    _store(root, "Solo", "Storage", "ext", "abc", "Cookies", mtime=9_000)
+    (root / "Empty").mkdir()
+    assert chromium.cookie_db("chrome", None) == chromium.CookieStore("Solo", only)
+
+
+def test_unnamed_profile_never_guesses_between_several(root: Path) -> None:
+    _local_state(root)
     _store(root, "Default", "Cookies", mtime=1_000)
-    _store(root, "Default", "Storage", "ext", "abc", "Cookies", mtime=9_000)
-    recent = _store(root, "Guest Dir", "Cookies", mtime=2_000)
-    assert chromium.cookie_db("chrome", None) == recent
+    _store(root, "Work", "Cookies", mtime=2_000)
+    with pytest.raises(AuthError) as caught:
+        chromium.cookie_db("chrome", None)
+    assert caught.value.state is AuthState.PROFILE_NOT_FOUND
+    detail = caught.value.detail
+    assert "'Default' (Person 1), 'Work'" in detail
+    assert "'Work' (" not in detail
+    assert "ytverbatim auth use chrome:<DIR>" in detail
+    assert "@" not in detail
+
+
+def test_unnamed_profile_lists_bare_dirs_without_local_state(root: Path) -> None:
+    _store(root, "Default", "Cookies")
+    _store(root, "Side", "Cookies")
+    with pytest.raises(AuthError) as caught:
+        chromium.cookie_db("chrome", None)
+    assert "'Default', 'Side'" in caught.value.detail
+
+
+def test_unnamed_profile_without_any_store(root: Path) -> None:
+    (root / "Default").mkdir()
+    with pytest.raises(AuthError) as caught:
+        chromium.cookie_db("chrome", None)
+    assert caught.value.state is AuthState.PROFILE_NOT_FOUND
 
 
 def test_missing_profile_lists_available_dirs(root: Path) -> None:
@@ -114,6 +152,7 @@ def test_missing_profile_lists_available_dirs(root: Path) -> None:
     assert caught.value.state is AuthState.PROFILE_NOT_FOUND
     assert "'Default', 'Side'" in caught.value.detail
     assert "Empty" not in caught.value.detail
+    assert "ytverbatim auth use chrome:<DIR>" in caught.value.detail
 
 
 def test_pin_holds_only_a_symlink_and_is_idempotent(root: Path) -> None:

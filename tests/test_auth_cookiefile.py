@@ -71,6 +71,13 @@ def test_missing_file(tmp_path: Path) -> None:
     assert caught.value.state is AuthState.COOKIE_FILE_INVALID
 
 
+def test_errors_show_the_home_directory_as_tilde(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    with pytest.raises(AuthError) as caught:
+        cookiefile.read_cookie_file(tmp_path / "absent.txt")
+    assert caught.value.detail == "~/absent.txt: file not found"
+
+
 def test_render_round_trips(tmp_path: Path) -> None:
     entries = [
         CookieEntry(".youtube.com", "/", True, 1_900_000_000, "PREF", SECRET, http_only=True),
