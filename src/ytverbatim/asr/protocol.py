@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     import numpy as np
     from numpy.typing import NDArray
 
-ChunkFlag = Literal["forced_cut", "token_cap_hit", "decoder_anomaly"]
+ChunkFlag = Literal["forced_cut", "token_cap_hit", "decoder_anomaly", "redecoded"]
 
 
 @dataclass(frozen=True, slots=True)

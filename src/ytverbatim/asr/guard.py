@@ -82,7 +82,9 @@ class QualityGuard:
         capped = any(_hit_cap(half) for half in halves)
         again = _Attempt(merged, capped, triggers(merged, duration=duration, capped=capped))
         # On a tie the re-decode wins: its damage is bounded by half a chunk.
-        return _verdict(min((again, first), key=_badness))
+        verdict = _verdict(min((again, first), key=_badness))
+        # Marked whichever attempt is kept, so trigger rates stay measurable with the guard on.
+        return GuardedChunk(verdict.raw, ("redecoded", *verdict.flags))
 
 
 @dataclass(frozen=True, slots=True)
