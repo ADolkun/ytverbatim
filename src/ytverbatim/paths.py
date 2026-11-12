@@ -34,6 +34,14 @@ def auth_dir() -> Path:
     return _private(state_dir() / "auth")
 
 
+def auth_source_file() -> Path:
+    return auth_dir() / "source.json"
+
+
+def snapshots_dir() -> Path:
+    return _private(auth_dir() / "snapshots")
+
+
 def locks_dir() -> Path:
     return _private(state_dir() / "locks")
 
