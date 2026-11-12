@@ -60,16 +60,24 @@ def fetch_info(
     timeout_s: float = DEFAULT_TIMEOUT_S,
     creator_note: bool = False,
     max_comments: int = DEFAULT_MAX_COMMENTS,
+    verbose: bool = False,
 ) -> VideoMetadata:
     """Run the video's single extraction and keep the raw info JSON for `--load-info-json` reuse.
 
     `creator_note` folds a bounded comment page into that same extraction rather than a second one. It is
     opt-in because comment pages are extra, rate-limit-prone requests, and yt-dlp fails the whole extraction
     when they fail.
+
+    `verbose` adds `-v`, whose debug lines carry account facts (Premium, auth cookies found) as secondary
+    signals. That stderr also echoes argv, so callers must never persist or log it.
     """
     extra = comment_args(max_comments) if creator_note else ()
+    debug = ("-v",) if verbose else ()
     result = runner.run(
-        ["-J", "--no-playlist", *extra, video_url(video_id)], cookies=cookies, timeout_s=timeout_s, label="metadata"
+        [*debug, "-J", "--no-playlist", *extra, video_url(video_id)],
+        cookies=cookies,
+        timeout_s=timeout_s,
+        label="metadata",
     )
     info = _parse_info(result.stdout, result.returncode)
     if info.get("id") != video_id:

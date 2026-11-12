@@ -18,6 +18,7 @@ _COOLDOWN_STATES = {
     Signal.CAPTCHA.value: AuthState.CAPTCHA,
     Signal.IP_BLOCKED.value: AuthState.IP_BLOCKED,
     Signal.RATE_LIMITED.value: AuthState.RATE_LIMITED,
+    Signal.HTTP_429.value: AuthState.RATE_LIMITED,
 }
 
 
