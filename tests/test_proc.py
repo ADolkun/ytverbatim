@@ -35,6 +35,13 @@ def script(tmp_path: Path) -> Path:
                 time.sleep(0.6)
                 data = sys.stdin.read()
                 sys.stdout.write(f"{len(data)}:{data[:3]}")
+            if mode == "chatty":
+                for i in range(6):
+                    sys.stdout.write(str(i) * 100_000)
+                    sys.stderr.write("é" * 50_000)
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    time.sleep(0.1)
             if mode == "hog":
                 import subprocess
                 helper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
@@ -165,11 +172,22 @@ def test_memory_watch_stops_the_child_when_the_machine_runs_short(script: Path, 
     assert _group_gone(int(pid_file.read_text(encoding="utf-8")))
 
 
-def test_memory_watch_keeps_feeding_stdin_and_collects_output(script: Path) -> None:
-    payload = "héllo" * 200_000
+def test_memory_watch_collects_output_across_polls(script: Path) -> None:
     watch = proc.MemoryWatch(1 << 40, poll_s=0.1, available_percent=_plenty)
-    result = proc.run([sys.executable, str(script), "slow-echo"], timeout_s=30, stdin=payload, memory_watch=watch)
-    assert (result.returncode, result.stdout) == (0, f"{len(payload)}:hél")
+    result = proc.run([sys.executable, str(script), "chatty"], timeout_s=30, memory_watch=watch)
+    assert result.returncode == 0
+    assert result.stdout == "".join(str(i) * 100_000 for i in range(6))
+    assert result.stderr == "é" * 300_000
+
+
+def test_memory_watch_refuses_stdin(script: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_spawn(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("must refuse before starting a process")
+
+    monkeypatch.setattr(subprocess, "Popen", no_spawn)
+    watch = proc.MemoryWatch(1 << 40, poll_s=0.1, available_percent=_plenty)
+    with pytest.raises(ValueError, match="stdin"):
+        proc.run([sys.executable, str(script), "slow-echo"], timeout_s=30, stdin="abc", memory_watch=watch)
 
 
 def test_memory_watch_still_times_out(script: Path, tmp_path: Path) -> None:
