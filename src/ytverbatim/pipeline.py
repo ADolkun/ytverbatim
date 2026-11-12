@@ -782,14 +782,16 @@ def _worker_dir(root: Path, engine: str, key: str) -> Path:
 
 
 def _prune(root: Path, keep: Path) -> None:
-    """Remove every worker folder under `root` but `keep`; their requests are no longer the stored stage's."""
-    for engine in root.iterdir():
-        if engine != keep.parent:
-            _remove(engine)
-            continue
-        for entry in engine.iterdir():
-            if entry != keep:
-                _remove(entry)
+    """Remove the stale requests of `keep`'s engine; its other entries can never be resumed again.
+
+    Other engines' folders stay: switching back to one resumes its finished chunks instead of decoding again.
+    """
+    for entry in keep.parent.iterdir():
+        if entry != keep:
+            _remove(entry)
+    for entry in root.iterdir():
+        if not entry.is_dir():
+            _remove(entry)
 
 
 def _remove(path: Path) -> None:

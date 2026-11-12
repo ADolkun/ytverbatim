@@ -454,6 +454,14 @@ def test_a_changed_asr_request_decodes_into_a_fresh_folder_and_prunes_the_old_on
     assert not (legacy / "fingerprint.json").exists(), "stale folders go once the new stage is stored"
 
 
+def test_switching_engines_keeps_the_other_engines_output(session_kit, worker) -> None:
+    yt = zh_yt(session_kit)
+    run(session_kit, yt)
+    store.StageStore(session_kit.out / ZH).discard("context")
+    run(session_kit, yt, options=config.load_options(overrides={"asr": {"engine": "w-vad"}}))
+    assert [path.split("/")[0] for path in worker_dirs(session_kit)] == ["w-prod", "w-vad"]
+
+
 def test_an_interrupted_asr_run_resumes_in_its_own_folder(session_kit, worker) -> None:
     yt = zh_yt(session_kit)
     worker.error = EngineError("killed mid-decode")
