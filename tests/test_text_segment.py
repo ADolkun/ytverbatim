@@ -1,5 +1,7 @@
 from collections.abc import Sequence
 
+import pytest
+
 from ytverbatim.text import segment as seg
 from ytverbatim.text.segment import Token
 
@@ -84,15 +86,34 @@ def test_en_splits_at_terminator_space_capital_or_digit() -> None:
     ]
 
 
-def test_en_does_not_split_at_lowercase_continuations() -> None:
-    assert chunk_level("It rose. and then fell.", "en") == ["It rose. and then fell."]
+def test_en_a_period_before_a_lowercase_word_splits() -> None:
+    parts = chunk_level("It rose. and then fell. why? because.", "en")
+    assert parts == ["It rose.", "and then fell.", "why?", "because."]
+
+
+def test_en_an_ellipsis_before_a_lowercase_word_is_a_pause_not_a_break() -> None:
+    assert chunk_level("So... we went. And… then it ended.", "en") == ["So... we went.", "And… then it ended."]
 
 
 def test_en_abbreviations_do_not_end_sentences() -> None:
-    text = "Dr. Smith met J. Smith in the U.S. last week. Prof. Lee agreed, e.g. Mr. Kim did."
+    text = "Dr. Smith met Mr. Jones in the U.S. last week. Prof. Lee agreed, e.g. Mr. Kim did."
     assert chunk_level(text, "en") == [
-        "Dr. Smith met J. Smith in the U.S. last week.",
+        "Dr. Smith met Mr. Jones in the U.S. last week.",
         "Prof. Lee agreed, e.g. Mr. Kim did.",
+    ]
+
+
+def test_en_abbreviations_hold_before_a_lowercase_word_too() -> None:
+    text = "Apples, pears, etc. are cheap, i.e. not costly, vs. last year at Acme Inc. and Acme Co. too."
+    assert chunk_level(text, "en") == [text]
+
+
+def test_en_a_lone_capital_or_ticker_before_a_capital_ends_the_sentence() -> None:
+    assert chunk_level("They chose plan B. Then it worked. Buy AAPL. Sell it later.", "en") == [
+        "They chose plan B.",
+        "Then it worked.",
+        "Buy AAPL.",
+        "Sell it later.",
     ]
 
 
@@ -186,6 +207,55 @@ def test_pseudo_token_times_are_proportional_to_characters() -> None:
 def test_zh_pseudo_tokens_keep_latin_words_and_numbers_whole() -> None:
     texts = [t.text for t in seg.pseudo_tokens("买NVDA涨了3.5%。", 0, 8, language="zh")]
     assert texts == ["买", "NVDA", "涨", "了", "3.5", "%", "。"]
+
+
+def test_zh_tagged_text_without_cjk_uses_the_english_rules() -> None:
+    assert chunk_level("It rose. Then it fell.", "zh") == ["It rose.", "Then it fell."]
+    assert seg.is_punctuated("It rose. Then it fell.", "zh")
+    assert not seg.is_punctuated(" ".join(["word"] * 80), "zh")
+    assert not seg.uses_zh_rules("It rose.", "zh") and seg.uses_zh_rules("它涨了。", "zh-Hans")
+
+
+class _Budget:
+    """Fails a call that runs away instead of letting the test hang: a deterministic stand-in for a timeout."""
+
+    def __init__(self, limit: int) -> None:
+        self.left = limit
+
+    def spend(self) -> None:
+        self.left -= 1
+        if self.left < 0:
+            raise AssertionError("segmentation did not terminate within its call budget")
+
+
+def budgeted_units(monkeypatch: pytest.MonkeyPatch, limit: int = 10_000) -> None:
+    budget = _Budget(limit)
+    real = seg._Cutter.units
+
+    def units(self: seg._Cutter, a: int, b: int) -> int:
+        budget.spend()
+        return real(self, a, b)
+
+    monkeypatch.setattr(seg._Cutter, "units", units)
+
+
+def test_a_zh_token_longer_than_the_unit_cap_becomes_its_own_sentence(monkeypatch: pytest.MonkeyPatch) -> None:
+    budgeted_units(monkeypatch)
+    giant = "甲" * 60
+    assert [s.text for s in seg.segment_tokens([Token(giant, 0, 1)], "zh")] == [giant]
+    after = [Token(t.text, t.start + 4.0, t.end + 4.0) for t in timed(list("丙" * 10))]
+    tokens = [*timed(list("乙" * 10)), Token(giant, 3.0, 4.0), *after]
+    texts = [s.text for s in seg.segment_tokens(tokens, "zh")]
+    assert giant in texts and "".join(texts) == "乙" * 10 + giant + "丙" * 10
+
+
+def test_an_en_token_holding_many_words_still_terminates(monkeypatch: pytest.MonkeyPatch) -> None:
+    budgeted_units(monkeypatch)
+    giant = " " + " ".join(["word"] * 80)
+    tokens = [*timed([f" w{n}" for n in range(30)]), Token(giant, 9.0, 30.0), *timed([" tail"])]
+    texts = [s.text for s in seg.segment_tokens(tokens, "en")]
+    assert " ".join(texts) == " ".join([f"w{n}" for n in range(30)]) + giant + " tail"
+    assert [s.text for s in seg.segment_tokens([Token(giant, 0, 1)], "en")] == [giant.strip()]
 
 
 def test_punctuation_density() -> None:
