@@ -38,7 +38,7 @@ from ytverbatim.acquire.session import (
 )
 from ytverbatim.asr import registry
 from ytverbatim.asr import runner as asr_runner
-from ytverbatim.asr.models import ChunkHypothesis, FileJob, WorkerRequest
+from ytverbatim.asr.models import FINGERPRINT_FILE, ChunkHypothesis, FileJob, WorkerRequest
 from ytverbatim.asr.protocol import EngineDef
 from ytverbatim.auth.cooldown import utcnow
 from ytverbatim.auth.source import CookieSource, resolve_source
@@ -79,9 +79,10 @@ CONTEXT_MD = "context.md"
 
 # The pipeline's own part of each stage's version: bump it when this module changes what a stage outputs for the same
 # input. The text modules' versions are folded in by `stage_versions`, so a prompt, guard or rule change there redoes
-# that stage, everything after it, and the context record.
+# that stage, everything after it, and the context record. Worker folders are keyed by the decode request alone, so an
+# `asr` or `second_opinion` bump re-reads the decoded rows they keep instead of decoding the audio again.
 _PIPELINE_VERSIONS: dict[str, int] = {
-    "asr": 1,
+    "asr": 2,
     "captions": 1,
     "second_opinion": 1,
     "normalize": 1,
@@ -483,7 +484,7 @@ class _VideoRun:
     def run(self) -> VideoResult:
         settings = self.settings
         cached = self._local_metadata()
-        need_audio = settings.source == "asr" and (cached is None or not self._asr_cached(cached))
+        need_audio = settings.source == "asr" and (cached is None or self._needs_audio(cached))
         outcome = self._fetch(audio=need_audio)
         if outcome.status is not VideoStatus.OK or outcome.access is None:
             return VideoResult(outcome)
@@ -494,7 +495,7 @@ class _VideoRun:
         if settings.source == "captions":
             source = self._from_captions(tracks, metadata)
         if source is None:
-            if not self._asr_cached(metadata) and not (self.vdir / WAV_NAME).is_file():
+            if self._needs_audio(metadata) and not (self.vdir / WAV_NAME).is_file():
                 outcome = self._fetch(audio=True)
                 if outcome.status is not VideoStatus.OK or outcome.access is None:
                     return VideoResult(outcome)
@@ -582,38 +583,60 @@ class _VideoRun:
         except (OSError, ValueError, YtDlpError):
             return None
 
-    def _asr_request(self, metadata: VideoMetadata, out_dir: Path) -> WorkerRequest:
-        return WorkerRequest(
+    def _placed(self, stage: str, request: WorkerRequest) -> WorkerRequest:
+        """Point `request` at its worker folder in `stage`'s working directory.
+
+        The folder is keyed by what the decode depends on and never by a stage version: a change to what the pipeline
+        makes of the rows must not decode the audio again. The worker refuses a folder holding another request's
+        output, and an interrupted run of the same request resumes in the same folder.
+        """
+        fingerprint = request.fingerprint()
+        out_dir = self.store.work_dir(stage) / request.engine.spec.id / store.digest(_without_wav(fingerprint))[:16]
+        _adopt(out_dir, fingerprint)
+        return request.model_copy(update={"out_dir": str(out_dir)})
+
+    def _asr_request(self, metadata: VideoMetadata) -> WorkerRequest:
+        request = WorkerRequest(
             engine=self.settings.definition,
-            out_dir=str(out_dir),
+            out_dir=str(self.store.work_dir("asr")),
             files=(FileJob(id=self.video_id, wav=str(self.vdir / WAV_NAME), language=metadata.language),),
             memory_cap_bytes=self.settings.memory_cap_bytes,
         )
+        return self._placed("asr", request)
 
-    def _asr_key(self, metadata: VideoMetadata) -> str:
+    def _asr_key(self, request: WorkerRequest) -> str:
         # The worker's own fingerprint, minus the WAV path: the video id already names the audio.
-        fingerprint = self._asr_request(metadata, self.vdir).fingerprint()
-        return self._key("asr", {"request": _without_wav(fingerprint)})
+        return self._key("asr", {"request": _without_wav(request.fingerprint())})
 
-    def _asr_cached(self, metadata: VideoMetadata) -> bool:
-        source = self.store.load("asr", stage_versions()["asr"], self._asr_key(metadata), Transcribed)
+    def _transcribed(self, hypotheses: Path, metadata: VideoMetadata) -> Transcribed:
+        return stages.from_asr_rows(_read_rows(hypotheses, self.video_id), self.settings.definition, metadata)
+
+    def _needs_audio(self, metadata: VideoMetadata) -> bool:
+        """Whether an ASR stage still has audio to decode; stored stages and finished worker folders need none."""
+        request = self._asr_request(metadata)
+        source = self.store.load("asr", stage_versions()["asr"], self._asr_key(request), Transcribed)
         if source is None:
-            return False
+            hypotheses = asr_runner.finished(request)
+            if hypotheses is None:
+                return True
+            source = self._transcribed(hypotheses, metadata)
         if self.settings.second_opinion is None:
-            return True
+            return False
         key = self._key("second_opinion", self._second_inputs(source, metadata))
-        return self.store.load("second_opinion", stage_versions()["second_opinion"], key, _Opinion) is not None
+        if self.store.load("second_opinion", stage_versions()["second_opinion"], key, _Opinion) is not None:
+            return False
+        second = self._second_request(source, metadata)
+        return second is not None and asr_runner.finished(second) is None
 
     def _asr(self, metadata: VideoMetadata) -> Transcribed:
-        definition = self.settings.definition
-        key = self._asr_key(metadata)
-        out_dir = _worker_dir(self.store.work_dir("asr"), definition.spec.id, key)
+        request = self._asr_request(metadata)
 
         def compute() -> Transcribed:
-            result = asr_runner.run_worker(self._asr_request(metadata, out_dir))
-            return stages.from_asr_rows(_read_rows(result.hypotheses, self.video_id), definition, metadata)
+            hypotheses = asr_runner.finished(request) or asr_runner.run_worker(request).hypotheses
+            return self._transcribed(hypotheses, metadata)
 
-        return self._stage("asr", key, Transcribed, compute, definition.spec.id, keep=out_dir)
+        engine = request.engine.spec.id
+        return self._stage("asr", self._asr_key(request), Transcribed, compute, engine, keep=Path(request.out_dir))
 
     def _from_captions(self, tracks: Sequence[CaptionTrack], metadata: VideoMetadata) -> Transcribed | None:
         track, missing = _manual_track(tracks, metadata.language)
@@ -631,30 +654,39 @@ class _VideoRun:
             "language": metadata.language,
         }
 
+    def _second_request(self, source: Transcribed, metadata: VideoMetadata) -> WorkerRequest | None:
+        second = self.settings.second_opinion
+        if second is None:
+            return None
+        request = numeric.second_opinion_request(
+            _timed(source.stretches),
+            engine=second,
+            file_id=self.video_id,
+            wav=self.vdir / WAV_NAME,
+            out_dir=self.store.work_dir("second_opinion"),
+            language=metadata.language,
+            words=[word for stretch in source.stretches for word in stretch.words],
+        )
+        if request is None:
+            return None
+        request = request.model_copy(update={"memory_cap_bytes": self.settings.memory_cap_bytes})
+        return self._placed("second_opinion", request)
+
     def _second_opinion(self, source: Transcribed, metadata: VideoMetadata) -> numeric.SecondOpinion | None:
         second = self.settings.second_opinion
         if second is None:
             return None
         key = self._key("second_opinion", self._second_inputs(source, metadata))
-        out_dir = _worker_dir(self.store.work_dir("second_opinion"), second.spec.id, key)
+        request = self._second_request(source, metadata)
 
         def compute() -> _Opinion:
-            request = numeric.second_opinion_request(
-                _timed(source.stretches),
-                engine=second,
-                file_id=self.video_id,
-                wav=self.vdir / WAV_NAME,
-                out_dir=out_dir,
-                language=metadata.language,
-                words=[word for stretch in source.stretches for word in stretch.words],
-            )
             if request is None:
                 return _Opinion(opinion=None)
-            request = request.model_copy(update={"memory_cap_bytes": self.settings.memory_cap_bytes})
-            result = asr_runner.run_worker(request)
-            return _Opinion(opinion=numeric.SecondOpinion.from_hypotheses(_read_rows(result.hypotheses, self.video_id)))
+            hypotheses = asr_runner.finished(request) or asr_runner.run_worker(request).hypotheses
+            return _Opinion(opinion=numeric.SecondOpinion.from_hypotheses(_read_rows(hypotheses, self.video_id)))
 
-        return self._stage("second_opinion", key, _Opinion, compute, second.spec.id, keep=out_dir).opinion
+        keep = Path(request.out_dir) if request is not None else None
+        return self._stage("second_opinion", key, _Opinion, compute, second.spec.id, keep=keep).opinion
 
     def _normalize(self, source: Transcribed) -> _Stretches:
         text = self.settings.text
@@ -774,10 +806,21 @@ class _VideoRun:
         return self._stage("numeric", self._key("numeric", inputs), _TextResult, compute, self.settings.llm_id or "")
 
 
-def _worker_dir(root: Path, engine: str, key: str) -> Path:
-    # Keyed by the stage input: the worker refuses a folder holding another request's output, and an interrupted run
-    # with the same request resumes in the same folder.
-    return root / engine / key[:16]
+def _adopt(out_dir: Path, fingerprint: dict[str, JsonValue]) -> None:
+    """Move a folder holding this exact request's output, left under another name, to `out_dir`.
+
+    Folders were once keyed by the stage version, so a version bump would otherwise decode the audio again.
+    """
+    if out_dir.exists() or not out_dir.parent.is_dir():
+        return
+    for entry in out_dir.parent.iterdir():
+        try:
+            stored: object = json.loads((entry / FINGERPRINT_FILE).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if stored == fingerprint:
+            entry.rename(out_dir)
+            return
 
 
 def _prune(root: Path, keep: Path) -> None:

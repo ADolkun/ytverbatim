@@ -15,7 +15,15 @@ from fake_engine import definition, write_silence
 from ytverbatim import config, paths, proc
 from ytverbatim.asr import runner
 from ytverbatim.asr.chunks import Chunk
-from ytverbatim.asr.models import ERROR_FILE, HYPOTHESES_FILE, REQUEST_FILE, ChunkHypothesis, FileJob, WorkerRequest
+from ytverbatim.asr.models import (
+    ERROR_FILE,
+    HYPOTHESES_FILE,
+    METRICS_FILE,
+    REQUEST_FILE,
+    ChunkHypothesis,
+    FileJob,
+    WorkerRequest,
+)
 from ytverbatim.errors import ConfigError, EngineError, EngineMemoryError, MediaValidationError, ProcMemoryExceeded
 
 HERE = Path(__file__).parent
@@ -57,6 +65,19 @@ def test_a_real_worker_subprocess_produces_hypotheses_and_resumes(tmp_path: Path
     again = runner.run_worker(request)
     assert (again.metrics.chunks_decoded, again.metrics.chunks_skipped) == (0, 2)
     assert first.hypotheses.read_text(encoding="utf-8").splitlines() == lines
+
+
+def test_only_a_completed_run_of_the_same_request_counts_as_finished(tmp_path: Path) -> None:
+    request = make_request(tmp_path)
+    assert runner.finished(request) is None
+    result = runner.run_worker(request)
+    assert runner.finished(request) == result.hypotheses
+    capped = request.model_copy(update={"memory_cap_bytes": 1 << 30, "hf_hub_cache": str(tmp_path / "hub")})
+    assert runner.finished(capped) == result.hypotheses
+    other = request.model_copy(update={"files": (request.files[0].model_copy(update={"language": "zh"}),)})
+    assert runner.finished(other) is None
+    (tmp_path / "out" / METRICS_FILE).unlink()
+    assert runner.finished(request) is None, "an interrupted run leaves no metrics"
 
 
 def test_the_error_report_travels_to_the_parent(tmp_path: Path) -> None:

@@ -331,6 +331,16 @@ def test_engine_failure_names_the_chunk_and_keeps_earlier_lines(tmp_path: Path, 
     assert [r.chunk for r in rows(tmp_path)] == [0]
 
 
+def test_a_run_that_does_not_finish_leaves_no_metrics_to_mark_it_complete(tmp_path: Path, wav: Path) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / METRICS_FILE).write_text("{}", encoding="utf-8")
+    job = FileJob(id="f1", wav=str(wav), chunks=(Chunk(0.0, 2.0),))
+    with pytest.raises(EngineError, match="fake decoder exploded"):
+        worker.run_request(request(tmp_path, job, engine=definition(fail_on_call=1)))
+    assert not (out / METRICS_FILE).exists()
+
+
 def test_main_writes_a_structured_error_and_exits_nonzero(
     tmp_path: Path, wav: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -9,11 +9,11 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from ytverbatim import config, pipeline, store
+from ytverbatim import config, pipeline, stages, store
 from ytverbatim.acquire import session
 from ytverbatim.asr import registry
 from ytverbatim.asr import runner as asr_runner
-from ytverbatim.asr.models import HYPOTHESES_FILE, ChunkHypothesis, RunMetrics, WorkerRequest
+from ytverbatim.asr.models import HYPOTHESES_FILE, METRICS_FILE, ChunkHypothesis, RunMetrics, WorkerRequest
 from ytverbatim.asr.runner import WorkerResult
 from ytverbatim.asr.worker import _claim_output as claim_output
 from ytverbatim.cli import main
@@ -110,6 +110,7 @@ class FakeWorker:
         out = Path(request.out_dir)
         out.mkdir(parents=True, exist_ok=True)
         claim_output(out, request)
+        (out / METRICS_FILE).unlink(missing_ok=True)
         if self.error is not None:
             raise self.error
         rows = en_rows(request) if request.files[0].id == EN else zh_rows(request, pause=self.pause)
@@ -125,6 +126,7 @@ class FakeWorker:
             peak_memory_bytes=None,
             max_rss_bytes=0,
         )
+        (out / METRICS_FILE).write_text(metrics.model_dump_json(), encoding="utf-8")
         return WorkerResult(out / HYPOTHESES_FILE, metrics, 0, 0.0)
 
 
@@ -432,8 +434,8 @@ def set_info(kit, video: str, **fields: object) -> None:
     info.write_text(json.dumps({**data, **fields}, ensure_ascii=False), encoding="utf-8")
 
 
-def worker_dirs(kit, video: str = ZH) -> list[str]:
-    root = kit.out / video / ".stages" / "asr"
+def worker_dirs(kit, video: str = ZH, stage: str = "asr") -> list[str]:
+    root = kit.out / video / ".stages" / stage
     return sorted(str(path.relative_to(root)) for path in root.glob("*/*"))
 
 
@@ -461,6 +463,72 @@ def test_switching_engines_keeps_the_other_engines_output(session_kit, worker) -
     store.StageStore(session_kit.out / ZH).discard("context")
     run(session_kit, yt, options=config.load_options(overrides={"asr": {"engine": "w-vad"}}))
     assert [path.split("/")[0] for path in worker_dirs(session_kit)] == ["w-prod", "w-vad"]
+    store.StageStore(session_kit.out / ZH).discard("context")
+    _, results, _ = run(session_kit, yt)
+    assert stored(results[0])["asr"] is False and len(worker.calls) == 2, "switching back decodes nothing"
+    assert [path.split("/")[0] for path in worker_dirs(session_kit)] == ["w-prod", "w-vad"]
+
+
+def bump(monkeypatch: pytest.MonkeyPatch, *stage_names: str) -> None:
+    for stage in stage_names:
+        monkeypatch.setitem(pipeline._PIPELINE_VERSIONS, stage, pipeline._PIPELINE_VERSIONS[stage] + 1)
+
+
+def test_an_asr_version_bump_rereads_the_kept_rows_without_audio_or_decoding(session_kit, worker, monkeypatch) -> None:
+    yt = zh_yt(session_kit)
+    run(session_kit, yt)
+    (folder,) = worker_dirs(session_kit)
+    assert not (session_kit.out / ZH / "audio.wav").exists()
+    converted, fetched = ffmpeg_calls(session_kit), len(yt.labels("audio"))
+
+    bump(monkeypatch, "asr")
+    real = stages.from_asr_rows
+    monkeypatch.setattr(
+        stages, "from_asr_rows", lambda *args: real(*args).model_copy(update={"warnings": ("re-derived",)})
+    )
+    report, results, _ = run(session_kit, yt)
+    assert report.exit_code == 0, results[0].outcome
+    assert stored(results[0])["asr"] is False and len(worker.calls) == 1
+    assert ffmpeg_calls(session_kit) == converted and len(yt.labels("audio")) == fetched
+    assert "re-derived" in only_document(results).quality.warnings
+    assert worker_dirs(session_kit) == [folder]
+
+
+def test_a_folder_of_the_same_request_under_an_older_name_is_adopted(session_kit, worker, monkeypatch) -> None:
+    yt = zh_yt(session_kit)
+    run(session_kit, yt)
+    (folder,) = worker_dirs(session_kit)
+    engine_dir = session_kit.out / ZH / ".stages" / "asr" / "w-prod"
+    (engine_dir / folder.split("/")[1]).rename(engine_dir / "0123456789abcdef")
+
+    bump(monkeypatch, "asr")
+    report, results, _ = run(session_kit, yt)
+    assert report.exit_code == 0, results[0].outcome
+    assert len(worker.calls) == 1 and worker_dirs(session_kit) == [folder]
+
+
+def test_the_second_opinion_folder_follows_its_request_not_the_stage_versions(session_kit, worker, monkeypatch) -> None:
+    yt = zh_yt(session_kit)
+    options = config.load_options(overrides={"text": {"numeric_second_opinion": "w-vad"}})
+    run(session_kit, yt, options=options)
+    assert [call.engine.spec.id for call in worker.calls] == ["w-prod", "w-vad"]
+    (folder,) = worker_dirs(session_kit, stage="second_opinion")
+    converted = ffmpeg_calls(session_kit)
+
+    bump(monkeypatch, "asr", "second_opinion")
+    report, results, _ = run(session_kit, yt, options=options)
+    assert report.exit_code == 0, results[0].outcome
+    assert stored(results[0])["second_opinion"] is False and len(worker.calls) == 2
+    assert ffmpeg_calls(session_kit) == converted
+    assert worker_dirs(session_kit, stage="second_opinion") == [folder]
+
+    set_info(session_kit, ZH, language="zh-Hant")
+    store.StageStore(session_kit.out / ZH).discard("context")
+    report, results, _ = run(session_kit, yt, options=options)
+    assert report.exit_code == 0, results[0].outcome
+    assert [call.files[0].language for call in worker.calls[2:]] == ["zh-Hant", "zh-Hant"]
+    (moved,) = worker_dirs(session_kit, stage="second_opinion")
+    assert moved != folder and moved.startswith("w-vad/")
 
 
 def test_an_interrupted_asr_run_resumes_in_its_own_folder(session_kit, worker) -> None:
