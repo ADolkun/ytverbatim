@@ -18,9 +18,6 @@ DEFAULT_LANGUAGES = ("en", "zh")
 DEFAULT_TIMEOUT_S = 300.0
 FILE_STEM = "captions"
 
-# HTTP 429 on a subtitle download only costs this video its captions; PO-token demands behave the same way.
-_DROP_CAPTION_SIGNALS = frozenset({Signal.HTTP_429, Signal.PO_TOKEN_SUBS})
-
 _LANG_VARIANTS: dict[str, tuple[str, ...]] = {
     "en": ("en", "en-US", "en-GB"),
     "zh": ("zh", "zh-Hans", "zh-CN", "zh-Hant", "zh-TW"),
@@ -147,15 +144,13 @@ def fetch_captions(
         f"subtitle:{captions_dir / FILE_STEM}.%(ext)s",
     ]
     try:
-        result = runner.run(args, cookies=cookies, timeout_s=timeout_s, label="captions")
+        runner.run(args, cookies=cookies, timeout_s=timeout_s, label="captions")
     except YtDlpError as exc:
-        signal = _drop_signal((exc.primary, *exc.secondary))
-        if signal is None:
+        # A bare 429 on the subtitle download only costs this video its captions; the playability rate-limit
+        # text (RATE_LIMITED) and everything else must reach the caller.
+        if exc.primary is not Signal.HTTP_429:
             raise
-        return _dropped(captions_dir, signal)
-    signal = _drop_signal((result.primary, *result.secondary))
-    if signal is not None:
-        return _dropped(captions_dir, signal)
+        return _dropped(captions_dir)
 
     tracks: list[CaptionTrack] = []
     warnings: list[str] = []
@@ -258,15 +253,11 @@ def _base(code: str) -> str:
     return code.split("-")[0].lower()
 
 
-def _drop_signal(signals: Sequence[Signal | None]) -> Signal | None:
-    return next((signal for signal in signals if signal in _DROP_CAPTION_SIGNALS), None)
-
-
-def _dropped(captions_dir: Path, signal: Signal) -> CaptionsResult:
+def _dropped(captions_dir: Path) -> CaptionsResult:
     # Keeping a partial set could silently swap a manual track for a worse auto one.
     for leftover in captions_dir.glob(f"{FILE_STEM}.*"):
         leftover.unlink(missing_ok=True)
-    warning = f"captions skipped for this video: subtitle download hit {signal.value}"
+    warning = f"captions skipped for this video: subtitle download hit {Signal.HTTP_429.value}"
     log.warning(warning)
     return CaptionsResult((), (warning,))
 
