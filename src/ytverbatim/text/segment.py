@@ -6,9 +6,11 @@ works on tokens, so engines with and without word timings share one set of rules
 """
 
 import bisect
+import difflib
 import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import Protocol
 
 SENTENCE_GAP_S = 0.6
 PARAGRAPH_PAUSE_S = 2.0
@@ -28,7 +30,13 @@ _EN_WORDS_PER_TERMINATOR = 40
 _CJK = "\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
 _CLOSERS = "”’\"')）】」』》〕\\]"
 _ZH_TERMINATORS = re.compile(f"[。！？；…!?;]+[{_CLOSERS}]*")
-_EN_TERMINATORS = re.compile(f"[.!?…]+[{_CLOSERS}]*(?=\\s+[\"'“‘(\\[]*[A-Z0-9])")
+_EN_OPENERS = "\"'“‘(\\["
+# Any terminator before a capital or digit ends a sentence. Before a lowercase word only a plain period, "!" or "?"
+# does (Whisper lowercases whole stretches of speech); an ellipsis there is a trailing-off pause mid-sentence.
+_EN_TERMINATORS = re.compile(
+    f"[.!?…]+[{_CLOSERS}]*(?=\\s+[{_EN_OPENERS}]*[A-Z0-9])"
+    f"|(?<![.…])(?:\\.|[!?]+)[{_CLOSERS}]*(?=\\s+[{_EN_OPENERS}]*[a-z])"
+)
 _EN_DENSITY_MARKS = re.compile(r"[.!?…]+(?=\s|$)")
 _ZH_DENSITY_MARKS = re.compile(r"[。！？；…!?;]")
 _ZH_UNITS = re.compile(f"[{_CJK}]|[A-Za-z0-9]+")
@@ -36,16 +44,20 @@ _CJK_CHAR = re.compile(f"[{_CJK}]")
 _ZH_PSEUDO_TOKEN = re.compile(f"\\s*(?:[{_CJK}]|[0-9A-Za-z]+(?:[.,'’][0-9A-Za-z]+)*|\\S)")
 _EN_PSEUDO_TOKEN = re.compile(r"\s*\S+")
 _COMMAS = ",，、"
-# A period inside a word ("example.com") or before a lowercase word is no break; Whisper sometimes lowercases a whole
-# stretch of speech.
+# What word alignment compares: a CJK character, or a run of other letters and digits.
+_ALIGN_UNITS = re.compile(f"[{_CJK}]|[^\\W_{_CJK}]+")
+# Punctuation between two aligned words goes to the word before it, except opening marks, which lead the next word.
+_OPENERS = "“‘(（「『《【〔["
+# A period inside a word ("example.com") is no break. Inside a sentence range a period before a lowercase word is an
+# abbreviation or an ellipsis, since every other one is already a terminator cut.
 _INNER_MARKS = re.compile(r"[,，、;；:：。！？]|[.!?…](?=\s+[^a-z\s]|\s*$)")
 _LEADING_PUNCTUATION = "([“\"'$"
 
-# Lowercase, without the final period. Words that also end real sentences ("no", "etc") are left out on purpose.
+# Lowercase, without the final period. "no" is left out on purpose: it is an ordinary word that ends sentences too.
 _ABBREVIATIONS = frozenset(
     (  # noqa: SIM905
         "mr mrs ms dr prof sr jr st vs inc ltd co corp fig eg ie cf al approx est vol ch pp mt gen sen rep gov lt col "
-        "capt sgt jan feb mar apr jun jul aug sep sept oct nov dec e.g i.e"
+        "capt sgt jan feb mar apr jun jul aug sep sept oct nov dec e.g i.e etc"
     ).split()
 )
 _DOTTED_INITIALS = re.compile(r"(?:[A-Za-z]\.)+[A-Za-z]")
@@ -89,10 +101,15 @@ def is_zh(language: str) -> bool:
     return language.lower().startswith("zh")
 
 
+def uses_zh_rules(text: str, language: str) -> bool:
+    """Whether Chinese sentence rules apply: a zh-tagged video whose text has no CJK at all reads as English."""
+    return is_zh(language) and _CJK_CHAR.search(text) is not None
+
+
 def is_punctuated(text: str, language: str) -> bool:
     """Whether the text carries enough sentence-final marks to trust its own punctuation."""
-    cjk = len(_CJK_CHAR.findall(text))
-    if is_zh(language) and cjk:
+    if uses_zh_rules(text, language):
+        cjk = len(_CJK_CHAR.findall(text))
         return len(_ZH_DENSITY_MARKS.findall(text)) * _ZH_CHARS_PER_TERMINATOR >= cjk
     words = len(text.split())
     return words > 0 and len(_EN_DENSITY_MARKS.findall(text)) * _EN_WORDS_PER_TERMINATOR >= words
@@ -121,6 +138,84 @@ def pseudo_tokens(text: str, start: float, end: float, *, language: str, origin:
     return tokens
 
 
+class TimedWord(Protocol):
+    @property
+    def text(self) -> str: ...
+    @property
+    def start(self) -> float: ...
+    @property
+    def end(self) -> float: ...
+    @property
+    def conf(self) -> float | None: ...
+
+
+def aligned_tokens(
+    text: str, words: Sequence[TimedWord], start: float, end: float, *, language: str, origin: int = 0
+) -> tuple[list[Token], bool]:
+    """Tokens of `text` timed by the engine's `words` wherever a sequence diff matches them; True when all matched.
+
+    Letters and digits are compared casefolded, so punctuation and spacing differences do not matter. A word matches
+    when every unit of it lines up with consecutive text; its token takes the text's spelling and the word's times,
+    clamped to `[start, end]`. Text that no word matches is spread over the gap between the timed words around it, and
+    those tokens are not `timed`.
+    """
+    text = text.strip()
+    text_units = [(m.start(), m.end()) for m in _ALIGN_UNITS.finditer(text)]
+    word_units: list[str] = []
+    owners: list[int] = []
+    for index, word in enumerate(words):
+        for unit in _ALIGN_UNITS.findall(word.text):
+            word_units.append(unit.casefold())
+            owners.append(index)
+    matcher = difflib.SequenceMatcher(None, [text[a:b].casefold() for a, b in text_units], word_units, autojunk=False)
+    hits: dict[int, list[int]] = {}
+    for block in matcher.get_matching_blocks():
+        for k in range(block.size):
+            hits.setdefault(owners[block.b + k], []).append(block.a + k)
+    sizes = [0] * len(words)
+    for owner in owners:
+        sizes[owner] += 1
+
+    tokens: list[Token] = []
+    complete = True
+    cursor = 0
+    left = start
+    for index, word in enumerate(words):
+        units = hits.get(index, [])
+        if not units or len(units) != sizes[index] or units[-1] - units[0] != len(units) - 1:
+            continue
+        first, last = text_units[units[0]][0], text_units[units[-1]][1]
+        word_start = min(max(word.start, start), end)
+        word_end = min(max(word.end, word_start), end)
+        lead, interpolated = _fill(tokens, text[cursor:first], left, word_start, language, origin)
+        complete = complete and not interpolated
+        tokens.append(Token(lead + text[first:last], word_start, word_end, word.conf, origin=origin))
+        cursor, left = last, word_end
+    rest, interpolated = _fill(tokens, text[cursor:], left, end, language, origin)
+    if rest and tokens:
+        tokens[-1] = replace(tokens[-1], text=tokens[-1].text + rest)
+    elif rest:
+        # Text without a letter or digit, which nothing can be matched against.
+        return pseudo_tokens(rest, start, end, language=language, origin=origin), False
+    return tokens, complete and not interpolated
+
+
+def _fill(tokens: list[Token], stretch: str, left: float, right: float, language: str, origin: int) -> tuple[str, bool]:
+    """Place the text between two matched words; return what leads the next word and whether anything was timed."""
+    if not any(char.isalnum() for char in stretch):
+        space = next((i for i, char in enumerate(stretch) if char.isspace()), None)
+        split = space if space is not None else len(stretch.rstrip(_OPENERS))
+        if not tokens:
+            return stretch, False
+        tokens[-1] = replace(tokens[-1], text=tokens[-1].text + stretch[:split])
+        return stretch[split:], False
+    head = stretch[: len(stretch) - len(stretch.lstrip())]
+    piece = pseudo_tokens(stretch, left, max(right, left), language=language, origin=origin)
+    piece[0] = replace(piece[0], text=head + piece[0].text)
+    tokens += piece
+    return stretch[len(stretch.rstrip()) :], True
+
+
 def segment_tokens(tokens: Sequence[Token], language: str) -> list[Sentence]:
     """Group tokens into sentences.
 
@@ -132,7 +227,7 @@ def segment_tokens(tokens: Sequence[Token], language: str) -> list[Sentence]:
     if not kept:
         return []
     text = "".join(token.text for token in kept)
-    cutter = _Cutter(kept, language)
+    cutter = _Cutter(kept, zh=uses_zh_rules(text, language))
     cuts = cutter.terminator_cuts(text)
     ranges = _ranges(len(kept), cuts)
     unpunctuated = not is_punctuated(text, language)
@@ -217,9 +312,9 @@ def _attach_bare_punctuation(ranges: list[tuple[int, int]], cutter: "_Cutter") -
 
 
 class _Cutter:
-    def __init__(self, tokens: Sequence[Token], language: str) -> None:
+    def __init__(self, tokens: Sequence[Token], *, zh: bool) -> None:
         self._tokens = tokens
-        self._zh = is_zh(language)
+        self._zh = zh
         count: Callable[[str], int] = _zh_units if self._zh else _en_units
         self._prefix = [0]
         for token in tokens:
@@ -268,16 +363,21 @@ class _Cutter:
         return [part for piece in pieces for part in self._peel(*piece)]
 
     def _peel(self, a: int, b: int) -> list[tuple[int, int]]:
-        """Cut a long unpunctuated run near the target size, preferring the longest pause in the window."""
+        """Cut a long unpunctuated run near the target size, preferring the longest pause in the window.
+
+        A single token over the cap cannot be cut and stays a part of its own.
+        """
         low, high = (round(self._run_units * f) for f in _RUN_WINDOW)
         parts: list[tuple[int, int]] = []
         first = a
-        while self.units(first, b) > high:
+        while b - first > 1 and self.units(first, b) > high:
             window = [i for i in range(first, b - 1) if low <= self.units(first, i + 1) <= high]
             if window:
                 cut = max(window, key=lambda i, f=first: self._run_cut_rank(f, i))
             else:
                 cut = next((i for i in range(first, b - 1) if self.units(first, i + 1) >= self._run_units), b - 2)
+                if cut > first and self.units(cut, cut + 1) > high:
+                    cut -= 1
             parts.append((first, cut + 1))
             first = cut + 1
         parts.append((first, b))
@@ -338,5 +438,5 @@ def _is_abbreviation(text: str, match: re.Match[str]) -> bool:
     # "No. 5" is a number sign, while "I said no. Then" ends a sentence.
     if word.lower() == "no":
         return text[match.end() :].lstrip()[:1].isdigit()
-    # A lone capital is an initial ("John F. Kennedy"), except the words "I" and "A" that really end sentences.
-    return len(word) == 1 and word.isupper() and word not in ("I", "A")
+    # A lone capital or a ticker ("Plan B.", "AAPL.") ends a sentence; an initial ("John F. Kennedy") is the price.
+    return False
