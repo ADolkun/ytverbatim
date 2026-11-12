@@ -77,6 +77,8 @@ def run_request(
     (out / ERROR_FILE).unlink(missing_ok=True)
     sink_path = out / HYPOTHESES_FILE
     _claim_output(out, request)
+    # Written again only once every chunk is on disk, so its presence says this request's output is complete.
+    (out / METRICS_FILE).unlink(missing_ok=True)
     done = _read_done(sink_path, spec.id)
     if mlx is not None:
         bound_allocator(mlx, request.memory_cap_bytes)

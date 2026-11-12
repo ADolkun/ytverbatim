@@ -5,6 +5,7 @@ Nothing here imports MLX or numpy; the engine libraries only ever load inside th
 
 import contextlib
 import fcntl
+import json
 import logging
 import math
 import os
@@ -18,6 +19,7 @@ from pathlib import Path
 from ytverbatim import atomic, paths, proc, sysmem
 from ytverbatim.asr.models import (
     ERROR_FILE,
+    FINGERPRINT_FILE,
     HYPOTHESES_FILE,
     METRICS_FILE,
     REQUEST_FILE,
@@ -118,6 +120,21 @@ def run_worker(request: WorkerRequest, *, python: str | None = None) -> WorkerRe
     except (OSError, ValueError) as exc:
         raise EngineError(f"{hypothesis} worker exited cleanly but left no readable {METRICS_FILE}: {exc}") from exc
     return WorkerResult(out / HYPOTHESES_FILE, metrics, children_rss, result.elapsed_s)
+
+
+def finished(request: WorkerRequest) -> Path | None:
+    """Return the hypotheses a completed run of exactly this request left in its `out_dir`, or None.
+
+    Reading them needs neither the WAV nor the worker, so a change to what is made of the rows never decodes again.
+    """
+    out = Path(request.out_dir)
+    if not (out / METRICS_FILE).is_file():
+        return None
+    try:
+        stored: object = json.loads((out / FINGERPRINT_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return out / HYPOTHESES_FILE if stored == request.fingerprint() else None
 
 
 @contextlib.contextmanager
