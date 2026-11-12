@@ -18,6 +18,9 @@ import opencc
 
 from ytverbatim.text.segment import is_zh
 
+# Part of the normalize stage key: bump it on any rule change so stored results are redone.
+VERSION = "clean-v1"
+
 Script = Literal["zh-Hans", "keep"]
 Fillers = Literal["keep", "remove"]
 

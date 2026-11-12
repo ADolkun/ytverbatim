@@ -92,7 +92,8 @@ class ClaudeCLIClient:
 
     @property
     def id(self) -> str:
-        return f"{PROVIDER}:{self._model}"
+        # Effort changes the replies, so it is part of the identity that checkpoints are keyed by.
+        return f"{PROVIDER}:{self._model}" + (f"@{self._effort}" if self._effort is not None else "")
 
     def argv(self, executable: str, system_file: Path) -> list[str]:
         effort = ["--effort", self._effort] if self._effort is not None else []
@@ -264,6 +265,11 @@ def readiness(*, timeout_s: float = _AUTH_STATUS_TIMEOUT_S) -> Readiness:
     if provider != "firstParty":
         return Readiness(False, f"API provider is {provider!r}, not firstParty")
     return Readiness(True, "logged in through claude.ai (firstParty)")
+
+
+def executable() -> str:
+    """Path of the `claude` CLI, or `DependencyError`; a cheap check that sends nothing."""
+    return _executable()
 
 
 def _executable() -> str:

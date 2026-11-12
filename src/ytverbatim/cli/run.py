@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 from typing import NoReturn
 
@@ -11,7 +12,7 @@ from ytverbatim.auth.source import resolve_source
 from ytverbatim.cli.fetch import EXIT_AUTH, EXIT_FAILED, EXIT_STOPPED
 from ytverbatim.contract import LLMUsage
 from ytverbatim.errors import AuthError, BatchStopError, EngineMemoryError, YtverbatimError
-from ytverbatim.llm import spec_overrides
+from ytverbatim.llm import apply_spec
 from ytverbatim.ytdlp.runner import redact
 
 
@@ -30,7 +31,7 @@ from ytverbatim.ytdlp.runner import redact
     "--correct/--no-correct", default=None, help="LLM correction of misheard words (default off; needs --llm)."
 )
 @click.option(
-    "--chapters", type=click.Choice(["auto", "youtube", "none"]), help="Chapter headings: auto is YouTube's (default)."
+    "--chapters", type=click.Choice(["auto", "none"]), help="Chapter headings: auto uses YouTube's chapters (default)."
 )
 @click.option(
     "--llm",
@@ -73,9 +74,9 @@ def run_command(  # noqa: PLR0913
             "asr": {"engine": engine, "source": transcript_source},
             "text": {"correct": correct, "chapters": chapters},
         }
-        if llm_spec is not None:
-            overrides["llm"] = spec_overrides(llm_spec)
         options = config.load_options(overrides=overrides)
+        if llm_spec is not None:
+            options = replace(options, llm=apply_spec(options.llm, llm_spec))
         root = out if out is not None else paths.default_output_root()
         report = pipeline.process_many(
             urls,
@@ -139,7 +140,8 @@ def _print_result(result: pipeline.VideoResult) -> None:
     if result.timings:
         click.echo(f"    stages: {' · '.join(_timing(t) for t in result.timings)}")
     if document.llm_usage:
-        click.echo(f"    llm: {' · '.join(_usage(u) for u in document.llm_usage)}")
+        # What the document cost in total, batches reused from earlier runs included; not what this run spent.
+        click.echo(f"    document LLM tokens: {' · '.join(_usage(u) for u in document.llm_usage)}")
 
 
 def _usage(usage: LLMUsage) -> str:

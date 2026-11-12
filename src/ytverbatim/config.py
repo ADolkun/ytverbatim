@@ -36,8 +36,8 @@ class AsrOptions:
 class TextOptions:
     # Off until the correction head-to-head shows it helps.
     correct: bool = False
-    # "auto" is YouTube's chapters; an LLM fallback for videos without them is deferred.
-    chapters: Literal["auto", "youtube", "none"] = "auto"
+    # "auto" is YouTube's chapters today; an LLM fallback for videos without them comes later.
+    chapters: Literal["auto", "none"] = "auto"
     # An ASR hypothesis id that re-decodes the numeric spans as independent evidence, or "off".
     numeric_second_opinion: str = "off"
     script: Literal["zh-Hans", "keep"] = "zh-Hans"

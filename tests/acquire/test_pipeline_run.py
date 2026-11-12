@@ -184,7 +184,7 @@ def test_end_to_end_writes_a_valid_document_and_markdown(session_kit, worker: Fa
     assert request.engine.spec.id == "w-prod"
     assert request.files[0].language == "en" and request.files[0].id == PUBLIC
     assert request.files[0].wav == str(vdir / "audio.wav") and worker.seen_wav == [True]
-    assert Path(request.out_dir) == vdir / ".stages" / "asr" / "w-prod"
+    assert Path(request.out_dir).parent == vdir / ".stages" / "asr" / "w-prod", "one folder per request, by engine"
     assert [e.stage for e in events] == ["fetch", "asr", "normalize", "punctuate", "numeric", "write"]
     assert results[0].document == doc and results[0].markdown == vdir / "context.md"
     assert len(yt.labels("metadata")) == 1
@@ -359,7 +359,7 @@ def test_the_engine_option_selects_a_chunked_hypothesis(session_kit, worker: Fak
     assert doc.transcript.runs[0].engine == "q-base" and doc.transcript.runs[0].vad is not None
     assert all(s.words is None for s in doc.segments)
     assert any("chunk-level" in w for w in doc.quality.warnings)
-    assert Path(request.out_dir).name == "q-base"
+    assert Path(request.out_dir).parent.name == "q-base"
 
 
 def test_an_unknown_engine_fails_before_any_request(session_kit, worker: FakeWorker) -> None:

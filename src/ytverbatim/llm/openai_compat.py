@@ -52,7 +52,10 @@ class OpenAICompatClient:
 
     @property
     def id(self) -> str:
-        return f"{PROVIDER}:{self._model}"
+        # The same model name on another server is another model; the host (never credentials or path) tells them apart.
+        parts = urllib.parse.urlsplit(self._base_url)
+        host = parts.hostname or self._base_url
+        return f"{PROVIDER}:{self._model}@{host}" + (f":{parts.port}" if parts.port else "")
 
     def body(self, request: LLMRequest) -> dict[str, object]:
         messages = [{"role": "system", "content": request.system}] if request.system else []
@@ -132,6 +135,11 @@ def _is_loopback(host: str | None) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def check_key(api_key_env: str | None) -> None:
+    """Raise `ConfigError` when the configured key variable is not set; sends nothing."""
+    _headers(api_key_env)
 
 
 def _headers(api_key_env: str | None) -> dict[str, str]:

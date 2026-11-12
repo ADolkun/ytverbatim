@@ -793,5 +793,4 @@ __all__ = [
     "sleep_args",
     "start_cooldown",
     "stop_fix",
-    "video_lock",
 ]

@@ -70,7 +70,9 @@ def row(text: str, start: float, end: float, words: tuple[Word, ...] = (), langu
     )
 
 
-def document(source: Transcribed, stretches: tuple[Stretch, ...], language: str = "zh") -> ContextDocument:
+def document(
+    source: Transcribed, stretches: tuple[Stretch, ...], language: str = "zh", *, llm_punctuated: bool = False
+) -> ContextDocument:
     doc = build_document(
         metadata=metadata(language),
         tags=(),
@@ -79,6 +81,7 @@ def document(source: Transcribed, stretches: tuple[Stretch, ...], language: str 
         stretches=stretches,
         chapters=False,
         created_at=NOW,
+        llm_punctuated=llm_punctuated,
     )
     assert load_document(dump_document(doc)) == doc
     return doc
@@ -98,15 +101,13 @@ def test_flags_stay_on_their_characters_across_normalize_and_punctuation() -> No
     assert normal.text == "这个GAAP数据很好 然后估值也不低"
     punctuated = "这个GAAP数据很好。然后估值也不低。"
     edit = Edit(stage="punctuation", before=normal.text, after=punctuated, llm=LLM)
-    final = with_results((normal,), [punctuated], [[edit]])
+    # As the pipeline does: punctuation moves the flags but is not recorded as edits.
+    final = with_results((normal,), [punctuated], [[edit]], record=False)
 
-    doc = document(source, final)
+    doc = document(source, final, llm_punctuated=True)
     assert [s.text for s in doc.segments] == ["这个GAAP数据很好。", "然后估值也不低。"]
     assert flagged(doc) == [(0, "decoder_anomaly", "GAAP数据"), (1, "low_confidence", "估值")]
-    assert [[(e.stage, e.before, e.after) for e in s.edits] for s in doc.segments] == [
-        [("punctuation", " ", "。")],
-        [("punctuation", "", "。")],
-    ]
+    assert all(s.edits == () for s in doc.segments)
     assert doc.transcript.punctuation == "llm" and doc.transcript.script == "zh-Hans"
 
 
@@ -136,18 +137,17 @@ def test_numeric_edits_after_punctuation_land_in_the_final_text() -> None:
     punctuated = "营收增长了十五个百分点，利润也不错。"
     fixed = "营收增长了五十个百分点，利润也不错。"
     first = with_results(
-        (stretch,), [punctuated], [[Edit(stage="punctuation", before=stretch.text, after=punctuated, llm=LLM)]]
+        (stretch,),
+        [punctuated],
+        [[Edit(stage="punctuation", before=stretch.text, after=punctuated, llm=LLM)]],
+        record=False,
     )
     numeric_flag = flag_on(fixed, "五十个百分点", "numeric_fixed")
     final = with_results(
         first, [fixed], [[Edit(stage="numeric", before=punctuated, after=fixed, llm=LLM)]], [[numeric_flag]]
     )
     (segment,) = document(source, final).segments
-    assert [(e.stage, e.before, e.after) for e in segment.edits] == [
-        ("punctuation", " ", "，"),
-        ("punctuation", "", "。"),
-        ("numeric", "十五", "五十"),
-    ]
+    assert [(e.stage, e.before, e.after) for e in segment.edits] == [("numeric", "十五", "五十")]
     assert segment.text[segment.flags[0].char_start : segment.flags[0].char_end] == "五十个百分点"
 
 

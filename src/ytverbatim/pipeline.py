@@ -11,6 +11,7 @@ stored; the compressed audio stays.
 import hashlib
 import json
 import logging
+import shutil
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field, replace
@@ -57,13 +58,15 @@ from ytverbatim.errors import (
     YtDlpError,
     YtverbatimError,
 )
-from ytverbatim.llm import client_from_options
+from ytverbatim.llm import check_ready, client_from_options
 from ytverbatim.llm.protocol import LLMClient
 from ytverbatim.render import render_markdown
 from ytverbatim.stages import Stretch, Transcribed, build_document, stretch_flag, with_results
 from ytverbatim.store import StageStore, input_hash
 from ytverbatim.store import lock as video_lock
-from ytverbatim.text import numeric
+from ytverbatim.text import clean, numeric
+from ytverbatim.text import correct as correct_module
+from ytverbatim.text import punctuate as punctuate_module
 from ytverbatim.text.correct import CorrectionContext, correct_segments
 from ytverbatim.text.punctuate import needs_punctuation, punctuate
 from ytverbatim.ytdlp.runner import redact
@@ -73,11 +76,11 @@ log = logging.getLogger(__name__)
 
 CONTEXT_JSON = "context.json"
 CONTEXT_MD = "context.md"
-STAGES_DIR = store.STAGES_DIR
 
-# Bump a stage's version when its code changes what it outputs for the same input; only that stage and the stages
-# its output feeds are recomputed.
-STAGE_VERSIONS: dict[str, int] = {
+# The pipeline's own part of each stage's version: bump it when this module changes what a stage outputs for the same
+# input. The text modules' versions are folded in by `stage_versions`, so a prompt, guard or rule change there redoes
+# that stage, everything after it, and the context record.
+_PIPELINE_VERSIONS: dict[str, int] = {
     "asr": 1,
     "captions": 1,
     "second_opinion": 1,
@@ -85,9 +88,25 @@ STAGE_VERSIONS: dict[str, int] = {
     "punctuate": 2,
     "correct": 1,
     "numeric": 1,
-    "context": 1,
+    "context": 2,
 }
 _GLOSSARY_MAX_TERMS = 20
+
+
+def stage_versions() -> dict[str, str]:
+    """Each stored stage's version: the pipeline's own, plus the versions of the modules it runs."""
+    modules = {
+        "asr": [stages.VERSION],
+        "captions": [stages.VERSION],
+        "second_opinion": [numeric.PROMPT_VERSION],
+        "normalize": [clean.VERSION, stages.VERSION],
+        "punctuate": [punctuate_module.PROMPT_VERSION, stages.VERSION],
+        "correct": [correct_module.PROMPT_VERSION, stages.VERSION],
+        "numeric": [numeric.PROMPT_VERSION, stages.VERSION],
+        "context": [stages.VERSION],
+    }
+    return {stage: "+".join([str(version), *modules[stage]]) for stage, version in _PIPELINE_VERSIONS.items()}
+
 
 __all__ = [
     "CONTEXT_JSON",
@@ -205,10 +224,11 @@ def process_many(  # noqa: PLR0913
     """
     options = options or config.load_options()
     out = out if out is not None else paths.default_output_root()
-    settings = _settings(options, llm, out, force, progress or _no_progress, clock)
+    captions = captions or options.asr.source == "captions"
+    settings = _settings(options, llm, out, force=force, captions=captions, emit=progress or _no_progress, clock=clock)
     fetch_options = FetchOptions(
         policy=options.auth.policy,
-        captions=captions or options.asr.source == "captions",
+        captions=captions,
         cookie_channels=options.auth.cookie_channels,
         max_videos=options.ytdlp.max_videos_per_run,
         ignore_cooldown=ignore_cooldown,
@@ -247,6 +267,7 @@ class _Settings:
     memory_cap_bytes: int | None
     out: Path
     force: bool
+    captions: bool
     emit: Callable[[ProgressEvent], None]
     clock: Callable[[], datetime]
 
@@ -256,12 +277,14 @@ class _Settings:
 
     def run_key(self) -> str:
         """Everything a finished document depends on besides the video itself; a change means a rerun."""
+        versions = stage_versions()
         return input_hash(
             "context",
-            STAGE_VERSIONS["context"],
+            versions["context"],
             {
-                "versions": dict(STAGE_VERSIONS),
+                "versions": dict[str, JsonValue](versions),
                 "source": self.source,
+                "captions": self.captions,
                 "engine": _engine_key(self.definition),
                 "second_opinion": _engine_key(self.second_opinion) if self.second_opinion else None,
                 "text": _plain(asdict(self.text)),
@@ -274,7 +297,9 @@ def _settings(
     options: config.Options,
     llm: LLMClient | None,
     out: Path,
+    *,
     force: bool,
+    captions: bool,
     emit: Callable[[ProgressEvent], None],
     clock: Callable[[], datetime],
 ) -> _Settings:
@@ -290,11 +315,15 @@ def _settings(
             )
         registry.check_dependencies(second)
     if llm is None and options.llm.provider != "none":
+        # A missing `claude` CLI or base URL must fail now, not after an hour of ASR.
+        check_ready(options.llm)
         llm = client_from_options(options.llm)
     if options.text.correct and llm is None:
         raise ConfigError("correction needs an LLM; pass --llm PROVIDER:MODEL or set [llm], or use --no-correct")
     memory_cap = asr_runner.memory_cap_bytes(options.asr.memory_cap_gib)
-    return _Settings(options.text, options.asr.source, definition, second, llm, memory_cap, out, force, emit, clock)
+    return _Settings(
+        options.text, options.asr.source, definition, second, llm, memory_cap, out, force, captions, emit, clock
+    )
 
 
 def _engine_key(definition: EngineDef) -> JsonValue:
@@ -322,7 +351,7 @@ class _RunHook:
     def done(self, video_id: str) -> bool:
         try:
             return _reusable(paths.video_dir(video_id, self.settings.out), self.settings) is not None
-        except (ContractError, OSError):
+        except OSError:
             return False
 
     def __call__(self, session: FetchSession, planned: PlannedVideo) -> VideoOutcome:
@@ -337,13 +366,17 @@ def _reusable(vdir: Path, settings: _Settings) -> ContextDocument | None:
     context = vdir / CONTEXT_JSON
     if settings.force or not context.is_file():
         return None
-    mark = StageStore(vdir).load("context", STAGE_VERSIONS["context"], settings.run_key(), _ContextMark)
+    mark = StageStore(vdir).load("context", stage_versions()["context"], settings.run_key(), _ContextMark)
     if mark is None:
         return None
     data = context.read_bytes()
     if hashlib.sha256(data).hexdigest() != mark.sha256:
         return None
-    return load_document(data.decode("utf-8"))
+    try:
+        return load_document(data.decode("utf-8"))
+    except ContractError:
+        # A document this reader can no longer load (a contract change) is rebuilt from the stored stages.
+        return None
 
 
 def _run_video(session: FetchSession, planned: PlannedVideo, settings: _Settings) -> VideoResult:
@@ -354,6 +387,8 @@ def _run_video(session: FetchSession, planned: PlannedVideo, settings: _Settings
             document = _reusable(vdir, settings)
             if document is not None:
                 settings.emit(ProgressEvent(video_id, "skip", f"{CONTEXT_JSON} exists"))
+                if not (vdir / CONTEXT_MD).is_file():
+                    atomic.write_text(vdir / CONTEXT_MD, render_markdown(document))
                 outcome = VideoOutcome(
                     video_id,
                     VideoStatus.OK,
@@ -411,25 +446,21 @@ class _Stretches(BaseModel):
 
 
 class _TextResult(BaseModel):
-    """One text stage's output; `notice` says why the stage could not do its job (and is also a quality warning)."""
+    """One text stage's output; `notices` say what the stage could not do (and are also quality warnings).
+
+    `usage` is what producing this output cost, batches reused from checkpoints included.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
     stretches: tuple[Stretch, ...]
     usage: tuple[LLMUsage, ...] = ()
-    notice: str | None = None
+    notices: tuple[str, ...] = ()
+    llm_punctuated: bool = False
 
 
-class _Piece(BaseModel):
+class _Opinion(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-    text: str
-    start: float
-    end: float
-
-
-class _SecondOpinion(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-    engine: str | None
-    pieces: tuple[_Piece, ...]
+    opinion: numeric.SecondOpinion | None
 
 
 @dataclass
@@ -476,9 +507,7 @@ class _VideoRun:
         punctuated = self._punctuate(normalized, language)
         corrected, correction_llm = self._correct(punctuated, language, metadata)
         verified = self._numeric(corrected, source, tracks, second)
-        for result in (punctuated, verified):
-            if result.notice is not None:
-                self.notices.append(result.notice)
+        self.notices += [*punctuated.notices, *verified.notices]
 
         self._emit("write")
         began = time.monotonic()
@@ -491,16 +520,17 @@ class _VideoRun:
             chapters=settings.text.chapters != "none",
             created_at=settings.clock(),
             correction_llm=correction_llm,
+            llm_punctuated=punctuated.llm_punctuated,
             warnings=self.notices,
             llm_usage=(*punctuated.usage, *corrected.usage, *verified.usage),
         )
-        markdown = render_markdown(document)
         dumped = dump_document(document)
-        atomic.write_text(self.vdir / CONTEXT_MD, markdown)
-        # context.json and then its mark go last: a marked context.json means the markdown beside it is complete.
+        # The record goes first and comes back last, so it never vouches for a half-written pair of files.
+        self.store.discard("context")
+        atomic.write_text(self.vdir / CONTEXT_MD, render_markdown(document))
         atomic.write_text(self.vdir / CONTEXT_JSON, dumped)
         sha = hashlib.sha256(dumped.encode("utf-8")).hexdigest()
-        self.store.save("context", STAGE_VERSIONS["context"], settings.run_key(), _ContextMark(sha256=sha))
+        self.store.save("context", stage_versions()["context"], settings.run_key(), _ContextMark(sha256=sha))
         self.timings.append(StageTiming("write", time.monotonic() - began, reused=False))
         return VideoResult(
             outcome,
@@ -513,17 +543,29 @@ class _VideoRun:
     def _emit(self, stage: str, detail: str = "") -> None:
         self.settings.emit(ProgressEvent(self.video_id, stage, detail))
 
+    def _key(self, stage: str, inputs: dict[str, JsonValue]) -> str:
+        return input_hash(stage, stage_versions()[stage], inputs)
+
     def _stage[M: BaseModel](
-        self, stage: str, inputs: dict[str, JsonValue], model: type[M], compute: Callable[[], M], detail: str = ""
+        self,
+        stage: str,
+        key: str,
+        model: type[M],
+        compute: Callable[[], M],
+        detail: str = "",
+        *,
+        keep: Path | None = None,
     ) -> M:
-        key = input_hash(stage, STAGE_VERSIONS[stage], inputs)
+        """Run or reuse one stage; `keep` is its worker folder, and the stage's other folders go once it is stored."""
         began = time.monotonic()
 
         def announced() -> M:
             self._emit(stage, detail)
             return compute()
 
-        output, reused = self.store.run(stage, STAGE_VERSIONS[stage], key, model, announced)
+        output, reused = self.store.run(stage, stage_versions()[stage], key, model, announced)
+        if keep is not None and not reused:
+            _prune(self.store.work_dir(stage), keep)
         self.timings.append(StageTiming(stage, time.monotonic() - began, reused))
         return output
 
@@ -540,103 +582,93 @@ class _VideoRun:
         except (OSError, ValueError, YtDlpError):
             return None
 
-    def _asr_request(self, metadata: VideoMetadata) -> WorkerRequest:
-        definition = self.settings.definition
+    def _asr_request(self, metadata: VideoMetadata, out_dir: Path) -> WorkerRequest:
         return WorkerRequest(
-            engine=definition,
-            out_dir=str(self.store.work_dir("asr") / definition.spec.id),
+            engine=self.settings.definition,
+            out_dir=str(out_dir),
             files=(FileJob(id=self.video_id, wav=str(self.vdir / WAV_NAME), language=metadata.language),),
             memory_cap_bytes=self.settings.memory_cap_bytes,
         )
 
-    def _asr_inputs(self, metadata: VideoMetadata) -> dict[str, JsonValue]:
-        # Where the WAV and the output live does not change the decode; the video id names the audio.
-        request = self._asr_request(metadata)
-        fingerprint = request.model_dump(
-            mode="json", exclude={"out_dir": True, "hf_hub_cache": True, "files": {"__all__": {"wav"}}}
-        )
-        return {"request": fingerprint}
+    def _asr_key(self, metadata: VideoMetadata) -> str:
+        # The worker's own fingerprint, minus the WAV path: the video id already names the audio.
+        fingerprint = self._asr_request(metadata, self.vdir).fingerprint()
+        return self._key("asr", {"request": _without_wav(fingerprint)})
 
     def _asr_cached(self, metadata: VideoMetadata) -> bool:
-        key = input_hash("asr", STAGE_VERSIONS["asr"], self._asr_inputs(metadata))
-        source = self.store.load("asr", STAGE_VERSIONS["asr"], key, Transcribed)
+        source = self.store.load("asr", stage_versions()["asr"], self._asr_key(metadata), Transcribed)
         if source is None:
             return False
         if self.settings.second_opinion is None:
             return True
-        key = input_hash("second_opinion", STAGE_VERSIONS["second_opinion"], self._second_inputs(source))
-        return self.store.load("second_opinion", STAGE_VERSIONS["second_opinion"], key, _SecondOpinion) is not None
+        key = self._key("second_opinion", self._second_inputs(source, metadata))
+        return self.store.load("second_opinion", stage_versions()["second_opinion"], key, _Opinion) is not None
 
     def _asr(self, metadata: VideoMetadata) -> Transcribed:
         definition = self.settings.definition
+        key = self._asr_key(metadata)
+        out_dir = _worker_dir(self.store.work_dir("asr"), definition.spec.id, key)
 
         def compute() -> Transcribed:
-            result = asr_runner.run_worker(self._asr_request(metadata))
+            result = asr_runner.run_worker(self._asr_request(metadata, out_dir))
             return stages.from_asr_rows(_read_rows(result.hypotheses, self.video_id), definition, metadata)
 
-        return self._stage("asr", self._asr_inputs(metadata), Transcribed, compute, definition.spec.id)
+        return self._stage("asr", key, Transcribed, compute, definition.spec.id, keep=out_dir)
 
     def _from_captions(self, tracks: Sequence[CaptionTrack], metadata: VideoMetadata) -> Transcribed | None:
-        track = _manual_track(tracks, metadata.language)
+        track, missing = _manual_track(tracks, metadata.language)
         if track is None:
-            language = metadata.language or "the video's language"
-            self.notices.append(f"no manual caption track in {language}; transcribed with ASR instead")
+            self.notices.append(f"{missing}; transcribed with ASR instead")
             return None
-        inputs: dict[str, JsonValue] = {"track": _track_key(track), "language": metadata.language}
-        return self._stage(
-            "captions", inputs, Transcribed, lambda: stages.from_captions(track, metadata), track.language
-        )
+        key = self._key("captions", {"track": _track_key(track), "language": metadata.language})
+        return self._stage("captions", key, Transcribed, lambda: stages.from_captions(track, metadata), track.language)
 
-    def _second_inputs(self, source: Transcribed) -> dict[str, JsonValue]:
+    def _second_inputs(self, source: Transcribed, metadata: VideoMetadata) -> dict[str, JsonValue]:
         second = self.settings.second_opinion
-        return {"source": store.digest(source), "engine": _engine_key(second) if second else None}
+        return {
+            "source": store.digest(source),
+            "engine": _engine_key(second) if second else None,
+            "language": metadata.language,
+        }
 
     def _second_opinion(self, source: Transcribed, metadata: VideoMetadata) -> numeric.SecondOpinion | None:
         second = self.settings.second_opinion
         if second is None:
             return None
+        key = self._key("second_opinion", self._second_inputs(source, metadata))
+        out_dir = _worker_dir(self.store.work_dir("second_opinion"), second.spec.id, key)
 
-        def compute() -> _SecondOpinion:
-            words = [word for stretch in source.stretches for word in stretch.words]
+        def compute() -> _Opinion:
             request = numeric.second_opinion_request(
                 _timed(source.stretches),
                 engine=second,
                 file_id=self.video_id,
                 wav=self.vdir / WAV_NAME,
-                out_dir=self.store.work_dir("second_opinion") / second.spec.id,
+                out_dir=out_dir,
                 language=metadata.language,
-                words=words,
+                words=[word for stretch in source.stretches for word in stretch.words],
             )
             if request is None:
-                return _SecondOpinion(engine=None, pieces=())
-            result = asr_runner.run_worker(
-                request.model_copy(update={"memory_cap_bytes": self.settings.memory_cap_bytes})
-            )
-            found = numeric.SecondOpinion.from_hypotheses(_read_rows(result.hypotheses, self.video_id))
-            if found is None:
-                return _SecondOpinion(engine=second.spec.id, pieces=())
-            pieces = tuple(_Piece(text=p.text, start=p.start, end=p.end) for p in found.pieces)
-            return _SecondOpinion(engine=found.engine, pieces=pieces)
+                return _Opinion(opinion=None)
+            request = request.model_copy(update={"memory_cap_bytes": self.settings.memory_cap_bytes})
+            result = asr_runner.run_worker(request)
+            return _Opinion(opinion=numeric.SecondOpinion.from_hypotheses(_read_rows(result.hypotheses, self.video_id)))
 
-        stored = self._stage("second_opinion", self._second_inputs(source), _SecondOpinion, compute, second.spec.id)
-        if stored.engine is None or not stored.pieces:
-            return None
-        pieces = tuple(numeric.TimedText(p.text, p.start, p.end) for p in stored.pieces)
-        return numeric.SecondOpinion(stored.engine, pieces)
+        return self._stage("second_opinion", key, _Opinion, compute, second.spec.id, keep=out_dir).opinion
 
     def _normalize(self, source: Transcribed) -> _Stretches:
         text = self.settings.text
-        inputs: dict[str, JsonValue] = {"source": store.digest(source), "script": text.script, "fillers": text.fillers}
+        key = self._key("normalize", {"source": store.digest(source), "script": text.script, "fillers": text.fillers})
 
         def compute() -> _Stretches:
             normalized = stages.normalize(source.stretches, source.language, script=text.script, fillers=text.fillers)
             return _Stretches(stretches=normalized)
 
-        return self._stage("normalize", inputs, _Stretches, compute)
+        return self._stage("normalize", key, _Stretches, compute)
 
     def _punctuate(self, previous: _Stretches, language: str) -> _TextResult:
         llm = self.settings.llm
-        inputs: dict[str, JsonValue] = {"text": _text_key(previous.stretches), "llm": self.settings.llm_id}
+        key = self._key("punctuate", {"text": _text_key(previous.stretches), "llm": self.settings.llm_id})
 
         def compute() -> _TextResult:
             stretches = previous.stretches
@@ -646,7 +678,7 @@ class _VideoRun:
                 return _TextResult(stretches=stretches)
             if llm is None:
                 notice = "punctuation not restored: some stretches have few sentence marks and no LLM is configured"
-                return _TextResult(stretches=stretches, notice=notice)
+                return _TextResult(stretches=stretches, notices=(notice,))
             result = punctuate(texts, language=language, client=llm, checkpoint_dir=self.store.work_dir("punctuate"))
             failed = set(result.failed)
             note = "the LLM's punctuation changed the words twice, so this stretch was kept as transcribed"
@@ -654,20 +686,29 @@ class _VideoRun:
                 [stretch_flag(stretch, "punctuation_failed", note)] if index in failed else []
                 for index, stretch in enumerate(stretches)
             ]
-            return _TextResult(stretches=with_results(stretches, result.texts, result.edits, flags), usage=result.usage)
+            return _TextResult(
+                stretches=with_results(stretches, result.texts, result.edits, flags, record=False),
+                usage=result.usage,
+                llm_punctuated=any(result.edits),
+            )
 
-        return self._stage("punctuate", inputs, _TextResult, compute, self.settings.llm_id or "")
+        return self._stage("punctuate", key, _TextResult, compute, self.settings.llm_id or "")
 
     def _correct(self, previous: _TextResult, language: str, metadata: VideoMetadata) -> tuple[_TextResult, str | None]:
         llm = self.settings.llm if self.settings.text.correct else None
-        inputs: dict[str, JsonValue] = {"text": _text_key(previous.stretches), "llm": llm.id if llm else None}
         if llm is None:
             return _TextResult(stretches=previous.stretches), None
+        note = metadata.creator_note.text if metadata.creator_note is not None else None
+        context = CorrectionContext(glossary=_tags(self.vdir)[:_GLOSSARY_MAX_TERMS], creator_note=note)
+        inputs: dict[str, JsonValue] = {
+            "text": _text_key(previous.stretches),
+            "llm": self.settings.llm_id,
+            "glossary": list(context.glossary),
+            "creator_note": context.creator_note,
+        }
 
         def compute() -> _TextResult:
             stretches = previous.stretches
-            note = metadata.creator_note.text if metadata.creator_note is not None else None
-            context = CorrectionContext(glossary=_tags(self.vdir)[:_GLOSSARY_MAX_TERMS], creator_note=note)
             result = correct_segments(
                 [stretch.text for stretch in stretches],
                 client=llm,
@@ -680,7 +721,7 @@ class _VideoRun:
                 stretches=with_results(stretches, result.texts, result.edits, result.flags), usage=result.usage
             )
 
-        return self._stage("correct", inputs, _TextResult, compute, llm.id), llm.id
+        return self._stage("correct", self._key("correct", inputs), _TextResult, compute, llm.id), llm.id
 
     def _numeric(
         self,
@@ -690,11 +731,11 @@ class _VideoRun:
         second: numeric.SecondOpinion | None,
     ) -> _TextResult:
         llm = self.settings.llm
-        evidence_tracks = _evidence_tracks(tracks, source.language)
+        evidence_tracks = _evidence_tracks(tracks, source)
         inputs: dict[str, JsonValue] = {
             "text": _text_key(previous.stretches),
             "captions": [_track_key(track) for track in evidence_tracks],
-            "second_opinion": store.digest(_second_key(second)),
+            "second_opinion": store.digest(_Opinion(opinion=second)),
             "llm": self.settings.llm_id,
         }
 
@@ -714,19 +755,58 @@ class _VideoRun:
                 client=llm,
                 checkpoint_dir=self.store.work_dir("numeric"),
             )
-            notice = None
+            notices: list[str] = []
+            if not evidence_tracks and second is None and result.stats.single_source:
+                notices.append(
+                    f"numbers not cross-checked: no captions in {source.language} and no second opinion; "
+                    f"{result.stats.single_source} number(s) rest on the transcript alone"
+                )
             if llm is None and result.stats.disputed:
-                notice = (
+                notices.append(
                     f"{result.stats.disputed} disputed number(s) left as transcribed and flagged: "
                     "no LLM is configured to choose among the readings"
                 )
             return _TextResult(
                 stretches=with_results(stretches, result.texts, result.edits, result.flags),
                 usage=result.usage,
-                notice=notice,
+                notices=tuple(notices),
             )
 
-        return self._stage("numeric", inputs, _TextResult, compute, self.settings.llm_id or "")
+        return self._stage("numeric", self._key("numeric", inputs), _TextResult, compute, self.settings.llm_id or "")
+
+
+def _worker_dir(root: Path, engine: str, key: str) -> Path:
+    # Keyed by the stage input: the worker refuses a folder holding another request's output, and an interrupted run
+    # with the same request resumes in the same folder.
+    return root / engine / key[:16]
+
+
+def _prune(root: Path, keep: Path) -> None:
+    """Remove every worker folder under `root` but `keep`; their requests are no longer the stored stage's."""
+    for engine in root.iterdir():
+        if engine != keep.parent:
+            _remove(engine)
+            continue
+        for entry in engine.iterdir():
+            if entry != keep:
+                _remove(entry)
+
+
+def _remove(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _without_wav(fingerprint: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    files = fingerprint.get("files")
+    if not isinstance(files, list):
+        return fingerprint
+    kept: list[JsonValue] = [
+        {k: v for k, v in job.items() if k != "wav"} if isinstance(job, dict) else job for job in files
+    ]
+    return {**fingerprint, "files": kept}
 
 
 def _text_key(stretches: Sequence[Stretch]) -> str:
@@ -743,16 +823,29 @@ def _confidence(stretches: Sequence[Stretch]) -> list[list[float] | None] | None
     return confidence if any(confidence) else None
 
 
-def _manual_track(tracks: Sequence[CaptionTrack], language: str | None) -> CaptionTrack | None:
+def _manual_track(tracks: Sequence[CaptionTrack], language: str | None) -> tuple[CaptionTrack | None, str]:
+    """Pick the manual track to transcribe from; without one, say why there is none."""
     manual = [track for track in tracks if track.kind is CaptionKind.MANUAL]
     if language is None:
-        return manual[0] if len(manual) == 1 else None
-    return next((track for track in manual if _base(track.language) == _base(language)), None)
+        if len(manual) == 1:
+            return manual[0], ""
+        if manual:
+            return None, f"{len(manual)} manual caption tracks and no declared video language to choose one"
+        return None, "no manual caption track"
+    track = next((track for track in manual if _base(track.language) == _base(language)), None)
+    return track, "" if track is not None else f"no manual caption track in {language}"
 
 
-def _evidence_tracks(tracks: Sequence[CaptionTrack], language: str) -> list[CaptionTrack]:
-    # A track in another language is a translation; it would only make every number look unheard.
-    return [track for track in tracks if _base(track.language) == _base(language)]
+def _evidence_tracks(tracks: Sequence[CaptionTrack], source: Transcribed) -> list[CaptionTrack]:
+    """Caption tracks that are independent readings of the transcript's numbers."""
+    # A track in another language is a translation; it would only make every number look unheard. The manual track a
+    # captions-mode transcript was built from is the transcript itself.
+    return [
+        track
+        for track in tracks
+        if _base(track.language) == _base(source.language)
+        and not (source.run.kind != "asr" and track.kind is CaptionKind.MANUAL)
+    ]
 
 
 def _base(code: str) -> str:
@@ -761,12 +854,6 @@ def _base(code: str) -> str:
 
 def _track_key(track: CaptionTrack) -> str:
     return store.digest(_plain(asdict(track)))
-
-
-def _second_key(second: numeric.SecondOpinion | None) -> JsonValue:
-    if second is None:
-        return None
-    return {"engine": second.engine, "pieces": [[p.text, p.start, p.end] for p in second.pieces]}
 
 
 def _read_rows(path: Path, video_id: str) -> list[ChunkHypothesis]:

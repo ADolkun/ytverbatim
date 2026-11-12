@@ -9,17 +9,20 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from ytverbatim import config, pipeline
+from ytverbatim import config, pipeline, store
 from ytverbatim.acquire import session
 from ytverbatim.asr import registry
 from ytverbatim.asr import runner as asr_runner
 from ytverbatim.asr.models import HYPOTHESES_FILE, ChunkHypothesis, RunMetrics, WorkerRequest
 from ytverbatim.asr.runner import WorkerResult
+from ytverbatim.asr.worker import _claim_output as claim_output
 from ytverbatim.cli import main
 from ytverbatim.contract import ContextDocument, Word, load_document
-from ytverbatim.errors import ConfigError, LLMUnavailableError
+from ytverbatim.errors import ConfigError, DependencyError, EngineError, LLMUnavailableError
+from ytverbatim.llm import claude_cli
 from ytverbatim.llm.protocol import LLMRequest, LLMResponse, Usage
 from ytverbatim.pipeline import ProgressEvent, VideoResult, process_many
+from ytverbatim.text import punctuate as punctuate_module
 
 ZH = "zhVideo0001"
 EN = "enVideo0001"
@@ -48,9 +51,10 @@ EN_MANUAL = {
 }
 
 
-def zh_rows(request: WorkerRequest) -> list[ChunkHypothesis]:
+def zh_rows(request: WorkerRequest, *, pause: float = 0.5) -> list[ChunkHypothesis]:
     words = tuple(
-        Word(text=phrase, start=3.0 * index, end=3.0 * index + 2.5, conf=0.9) for index, phrase in enumerate(ZH_PHRASES)
+        Word(text=phrase, start=3.0 * index, end=3.0 * index + 3.0 - pause, conf=0.9)
+        for index, phrase in enumerate(ZH_PHRASES)
     )
     return [
         ChunkHypothesis(
@@ -93,13 +97,22 @@ def en_rows(request: WorkerRequest) -> list[ChunkHypothesis]:
 
 @dataclass
 class FakeWorker:
+    """Claims its output folder exactly as the real worker does, then writes the rows a real decode would."""
+
     calls: list[WorkerRequest] = field(default_factory=list[WorkerRequest])
+    # Raise this after claiming the folder, as a worker killed mid-decode would.
+    error: EngineError | None = None
+    # Seconds between the Mandarin phrases; from 0.6 s each phrase becomes a stretch of its own.
+    pause: float = 0.5
 
     def __call__(self, request: WorkerRequest, *, python: str | None = None) -> WorkerResult:
         self.calls.append(request)
         out = Path(request.out_dir)
         out.mkdir(parents=True, exist_ok=True)
-        rows = en_rows(request) if request.files[0].id == EN else zh_rows(request)
+        claim_output(out, request)
+        if self.error is not None:
+            raise self.error
+        rows = en_rows(request) if request.files[0].id == EN else zh_rows(request, pause=self.pause)
         (out / HYPOTHESES_FILE).write_text("".join(row.model_dump_json() + "\n" for row in rows), encoding="utf-8")
         metrics = RunMetrics(
             hypothesis=request.engine.spec.id,
@@ -376,7 +389,10 @@ def test_cli_llm_spec_reaches_the_pipeline(session_kit, worker, monkeypatch) -> 
     result = invoke(session_kit, zh_yt(session_kit), monkeypatch, ZH, "--llm", "claude-cli:claude-sonnet-5-5")
     assert result.exit_code == 0, result.output
     assert (built[0].provider, built[0].model) == ("claude-cli", "claude-sonnet-5-5")
-    assert "punctuation: llm" in result.output and "llm: punctuation 1 call(s), 100 in / 20 out" in result.output
+    assert (
+        "punctuation: llm" in result.output
+        and "document LLM tokens: punctuation 1 call(s), 100 in / 20 out" in result.output
+    )
 
     bad = invoke(session_kit, zh_yt(session_kit), monkeypatch, ZH, "--llm", "sonnet")
     assert bad.exit_code == 1 and "PROVIDER:MODEL" in bad.output
@@ -407,3 +423,186 @@ def test_only_the_unpunctuated_stretch_of_a_punctuated_video_goes_to_the_llm(ses
     assert len(sent) >= 2 and " ".join(sent) in EN_OPENING, "only the unpunctuated opening is sent"
     assert doc.segments[0].text.startswith("So today") and doc.transcript.punctuation == "llm"
     assert [s.text for s in doc.segments[-2:]] == ["Then they fell sharply.", EN_REST[44:]]
+
+
+def set_info(kit, video: str, **fields: object) -> None:
+    info = kit.out / video / "info.json"
+    data = json.loads(info.read_text(encoding="utf-8"))
+    info.write_text(json.dumps({**data, **fields}, ensure_ascii=False), encoding="utf-8")
+
+
+def worker_dirs(kit, video: str = ZH) -> list[str]:
+    root = kit.out / video / ".stages" / "asr"
+    return sorted(str(path.relative_to(root)) for path in root.glob("*/*"))
+
+
+def test_a_changed_asr_request_decodes_into_a_fresh_folder_and_prunes_the_old_one(session_kit, worker) -> None:
+    yt = zh_yt(session_kit)
+    run(session_kit, yt)
+    (first,) = worker_dirs(session_kit)
+    # The folder V0 used for every request of an engine, holding another request's output: the worker refuses it.
+    legacy = session_kit.out / ZH / ".stages" / "asr" / "w-prod"
+    (legacy / "fingerprint.json").write_text('{"engine": "something else"}', encoding="utf-8")
+
+    set_info(session_kit, ZH, language="zh-Hant")
+    store.StageStore(session_kit.out / ZH).discard("context")
+    report, results, _ = run(session_kit, yt)
+    assert report.exit_code == 0, results[0].outcome
+    assert stored(results[0])["asr"] is False and len(worker.calls) == 2
+    (second,) = worker_dirs(session_kit)
+    assert second != first and worker.calls[1].files[0].language == "zh-Hant"
+    assert not (legacy / "fingerprint.json").exists(), "stale folders go once the new stage is stored"
+
+
+def test_an_interrupted_asr_run_resumes_in_its_own_folder(session_kit, worker) -> None:
+    yt = zh_yt(session_kit)
+    worker.error = EngineError("killed mid-decode")
+    report, _, _ = run(session_kit, yt)
+    assert report.exit_code == 1
+    worker.error = None
+    report, _, _ = run(session_kit, yt)
+    assert report.exit_code == 0
+    assert worker.calls[0].out_dir == worker.calls[1].out_dir and len(worker_dirs(session_kit)) == 1
+
+
+def test_the_memory_cap_reaches_the_worker_but_does_not_miss_the_stored_asr(session_kit, worker) -> None:
+    yt = zh_yt(session_kit)
+    capped = config.load_options(overrides={"asr": {"memory_cap_gib": 1.0}})
+    run(session_kit, yt, options=capped)
+    assert worker.calls[0].memory_cap_bytes == 1 << 30
+    store.StageStore(session_kit.out / ZH).discard("context")
+    _, results, _ = run(session_kit, yt)
+    assert stored(results[0])["asr"] is True and len(worker.calls) == 1
+
+
+def test_a_module_version_bump_redoes_its_stage_and_the_document(session_kit, worker, monkeypatch) -> None:
+    yt = zh_yt(session_kit)
+    llm = FakeLLM()
+    run(session_kit, yt, llm=llm)
+    monkeypatch.setattr(punctuate_module, "PROMPT_VERSION", punctuate_module.PROMPT_VERSION + "-bumped")
+    _, results, events = run(session_kit, yt, llm=llm)
+    assert "skip" not in [e.stage for e in events], "the context record names the module versions"
+    # Same reply, so the text after punctuation is unchanged and numeric is reused.
+    assert stored(results[0]) == {"asr": True, "normalize": True, "punctuate": False, "numeric": True}
+
+
+def test_correction_reruns_when_its_glossary_changes(session_kit, worker) -> None:
+    yt = zh_yt(session_kit)
+    correct = config.load_options(overrides={"text": {"correct": True}})
+    run(session_kit, yt, options=correct, llm=FakeLLM())
+    set_info(session_kit, ZH, tags=["估值"])
+    store.StageStore(session_kit.out / ZH).discard("context")
+    _, results, _ = run(session_kit, yt, options=correct, llm=FakeLLM())
+    assert stored(results[0])["correct"] is False and stored(results[0])["punctuate"] is True
+
+
+def test_numbers_without_independent_readings_are_called_unchecked(session_kit, worker, monkeypatch) -> None:
+    yt = zh_yt(session_kit)
+    yt.tracks[ZH] = {}
+    _, results, _ = run(session_kit, yt, llm=FakeLLM())
+    doc = only_document(results)
+    (notice,) = results[0].notices
+    assert notice.startswith("numbers not cross-checked: no captions in zh and no second opinion")
+    assert notice in doc.quality.warnings
+    cli = invoke(session_kit, zh_yt(session_kit), monkeypatch, "zhVideo0002")
+    assert "! numbers not cross-checked" in cli.output
+
+
+def test_a_run_without_captions_does_not_count_for_a_run_with_them(session_kit, worker) -> None:
+    yt = zh_yt(session_kit)
+    run(session_kit, yt, captions=False)
+    assert yt.labels("captions") == []
+    _, results, events = run(session_kit, yt)
+    assert "skip" not in [e.stage for e in events] and len(yt.labels("captions")) == 1
+    assert any(f.kind == "numeric_disputed" for s in only_document(results).segments for f in s.flags)
+
+
+def test_llm_usage_is_what_the_document_cost_even_when_every_batch_is_reused(session_kit, worker) -> None:
+    yt = zh_yt(session_kit)
+    _, first, _ = run(session_kit, yt, llm=FakeLLM())
+    stages_dir = session_kit.out / ZH / ".stages"
+    for name in ("punctuate.json", "numeric.json", "context.json"):
+        (stages_dir / name).unlink()
+    llm = FakeLLM()
+    _, again, _ = run(session_kit, yt, llm=llm)
+    assert llm.requests == [] and stored(again[0])["punctuate"] is False, "recomputed from batch checkpoints"
+    assert only_document(again).llm_usage == only_document(first).llm_usage != ()
+
+
+def test_a_resumed_partial_stage_counts_every_batch(session_kit, worker, monkeypatch) -> None:
+    monkeypatch.setattr(punctuate_module, "BATCH_CHARS", 8)
+    worker.pause = 1.0
+    yt = zh_yt(session_kit)
+    failing = FakeLLM()
+    original = failing.complete
+
+    def second_call_fails(request):
+        if len(failing.requests) == 1:
+            failing.requests.append(request)
+            raise LLMUnavailableError("synthetic outage")
+        return original(request)
+
+    failing.complete = second_call_fails  # type: ignore[method-assign]
+    report, _, _ = run(session_kit, yt, llm=failing)
+    assert report.exit_code == 1
+    llm = FakeLLM()
+    _, results, _ = run(session_kit, yt, llm=llm)
+    batches = len([r for r in llm.requests if '"items"' in r.user]) + 1
+    (punctuation,) = [u for u in only_document(results).llm_usage if u.stage == "punctuation"]
+    assert batches >= 3 and punctuation.calls == batches
+
+
+def test_a_missing_claude_cli_fails_before_any_request(session_kit, worker, monkeypatch) -> None:
+    monkeypatch.setattr(claude_cli.shutil, "which", lambda _name: None)
+    yt = zh_yt(session_kit)
+    options = config.load_options(overrides={"llm": {"provider": "claude-cli", "model": "claude-sonnet-5-5"}})
+    with pytest.raises(DependencyError, match="claude CLI not found"):
+        run(session_kit, yt, options=options)
+    assert yt.calls == [] and worker.calls == []
+
+
+def test_cli_llm_spec_switches_provider_over_the_configured_one(session_kit, worker, monkeypatch) -> None:
+    config_file = session_kit.home / ".config" / "ytverbatim" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text('[llm]\nprovider = "openai-compat"\nmodel = "m"\nbase_url = "http://127.0.0.1:8080/v1"\n')
+    built: list[config.LLMOptions] = []
+
+    def client_from_options(options: config.LLMOptions) -> FakeLLM:
+        built.append(options)
+        return FakeLLM()
+
+    monkeypatch.setattr(pipeline, "client_from_options", client_from_options)
+    monkeypatch.setattr(pipeline, "check_ready", lambda _options: None)
+    result = invoke(session_kit, zh_yt(session_kit), monkeypatch, ZH, "--llm", "claude-cli:claude-sonnet-5-5")
+    assert result.exit_code == 0, result.output
+    assert (built[0].provider, built[0].model, built[0].base_url) == ("claude-cli", "claude-sonnet-5-5", None)
+
+
+def test_a_skipped_video_gets_its_markdown_back_and_an_unloadable_document_is_rebuilt(session_kit, worker) -> None:
+    yt = zh_yt(session_kit)
+    run(session_kit, yt)
+    vdir = session_kit.out / ZH
+    expected = (vdir / "context.md").read_text(encoding="utf-8")
+    (vdir / "context.md").unlink()
+    _, _, events = run(session_kit, yt)
+    assert [e.stage for e in events] == ["skip"] and (vdir / "context.md").read_text(encoding="utf-8") == expected
+
+    broken = '{"schema_version": "9.0"}'
+    (vdir / "context.json").write_text(broken, encoding="utf-8")
+    record = json.loads((vdir / ".stages" / "context.json").read_text(encoding="utf-8"))
+    record["output"]["sha256"] = __import__("hashlib").sha256(broken.encode()).hexdigest()
+    (vdir / ".stages" / "context.json").write_text(json.dumps(record), encoding="utf-8")
+    report, results, events = run(session_kit, yt)
+    assert report.exit_code == 0 and "skip" not in [e.stage for e in events]
+    assert load_document(vdir / "context.json") == only_document(results)
+
+
+def test_captions_mode_says_why_it_cannot_choose_among_manual_tracks(session_kit, worker) -> None:
+    yt = session_kit.yt()
+    yt.language[EN] = None  # type: ignore[assignment]
+    yt.tracks[EN] = {"en": json.dumps(EN_MANUAL), "zh": json.dumps(EN_MANUAL)}
+    options = config.load_options(overrides={"asr": {"source": "captions"}})
+    _, results, _ = run(session_kit, yt, [EN], options=options)
+    assert results[0].notices[0] == (
+        "2 manual caption tracks and no declared video language to choose one; transcribed with ASR instead"
+    )
