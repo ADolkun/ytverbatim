@@ -10,6 +10,7 @@ from ytverbatim import __version__
 # subcommand never slows down (or breaks) the others.
 LAZY_COMMANDS: Mapping[str, str] = {
     "auth": "ytverbatim.cli.auth:auth",
+    "fetch": "ytverbatim.cli.fetch:fetch_command",
     "llm": "ytverbatim.cli.llm:llm",
 }
 
