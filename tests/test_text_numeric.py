@@ -18,6 +18,7 @@ from ytverbatim.text.numeric import (
     NumericStats,
     SecondOpinion,
     TimedText,
+    remap_flags,
     second_opinion_request,
     verify_numbers,
 )
@@ -196,7 +197,7 @@ def test_a_checkpoint_hit_skips_the_llm(tmp_path: Path) -> None:
     assert second.usage == ()
 
 
-def test_fix_that_would_change_prose_is_rejected(tmp_path: Path) -> None:
+def test_a_reading_with_another_unit_is_never_applied(tmp_path: Path) -> None:
     segments = [TimedText("他说一共是一百五十期的数据", 0.0, 3.0)]
     captions = manual((0.0, 3.0, "他说一共是150天的数据"))
     result = run(
@@ -205,7 +206,7 @@ def test_fix_that_would_change_prose_is_rejected(tmp_path: Path) -> None:
     assert result.texts == (segments[0].text,)
     (flag,) = result.flags[0]
     assert flag.kind == "numeric_disputed"
-    assert "more than the number" in flag.note
+    assert "kind or unit" in flag.note
 
 
 def words_for(text: str, start: float, end: float, conf: dict[str, float]) -> tuple[Word, ...]:
@@ -219,10 +220,8 @@ def words_for(text: str, start: float, end: float, conf: dict[str, float]) -> tu
     )
 
 
-@pytest.mark.parametrize(
-    ("conf", "kinds"), [(0.2, ["numeric_single_source", "low_confidence"]), (0.8, ["numeric_single_source"])]
-)
-def test_single_source_spans_flag_low_confidence_only_below_the_threshold(
+@pytest.mark.parametrize(("conf", "kinds"), [(0.2, ["low_confidence"]), (0.8, [])])
+def test_uncovered_spans_flag_low_confidence_alone_below_the_threshold(
     conf: float, kinds: list[str], tmp_path: Path
 ) -> None:
     text = "这只股票的目标价是120块"
@@ -230,11 +229,24 @@ def test_single_source_spans_flag_low_confidence_only_below_the_threshold(
     client = FakeClient()
     result = run([TimedText(text, 0.0, 3.0)], Evidence(PRIMARY, words=words), client, tmp_path)
     assert [f.kind for f in result.flags[0]] == kinds
-    assert all(span_text(result, 0, f) == "120块" for f in result.flags[0])
-    assert result.flags[0][0].readings == (Reading(source=PRIMARY, text="120块"),)
-    assert f"{conf:.2f}" in result.flags[0][0].note
+    assert all(span_text(result, 0, f) == "120块" and f"{conf:.2f}" in f.note for f in result.flags[0])
     assert result.stats == NumericStats(single_source=1)
     assert client.requests == []
+
+
+@pytest.mark.parametrize(
+    ("conf", "kinds"), [(0.2, ["numeric_single_source", "low_confidence"]), (0.8, ["numeric_single_source"])]
+)
+def test_spans_a_covering_source_did_not_hear_are_single_source(conf: float, kinds: list[str], tmp_path: Path) -> None:
+    text = "这只股票的目标价是120块"
+    words = words_for(text, 0.0, 3.0, {"120": conf})
+    captions = manual((0.0, 3.0, "这只股票的目标价是很高的"))
+    result = run(
+        [TimedText(text, 0.0, 3.0)], Evidence(PRIMARY, words=words, captions=(captions,)), FakeClient(), tmp_path
+    )
+    assert [f.kind for f in result.flags[0]] == kinds
+    assert result.flags[0][0].readings == (Reading(source=PRIMARY, text="120块"),)
+    assert f"{conf:.2f}" in result.flags[0][0].note
 
 
 def test_an_unalignable_span_becomes_single_source(tmp_path: Path) -> None:
@@ -298,11 +310,14 @@ def test_caption_word_timings_align_to_each_segment(tmp_path: Path) -> None:
         TimedText("Revenue grew to $50 billion this year.", 0.0, 5.5),
         TimedText("And margins hit 40%.", 6.0, 9.0),
     ]
-    client = FakeClient([verdicts((0, "$15", "low"))])
+    client = FakeClient([verdicts((0, "$15 billion", "low"))])
     result = run(segments, Evidence(PRIMARY, captions=(json3_track(),)), client, tmp_path, language="en")
     (disputed,) = result.flags[0]
     assert disputed.kind == "numeric_disputed"
-    assert disputed.readings == (Reading(source=PRIMARY, text="$50"), Reading(source="caption_auto", text="$15"))
+    assert disputed.readings == (
+        Reading(source=PRIMARY, text="$50 billion"),
+        Reading(source="caption_auto", text="$15 billion"),
+    )
     assert result.flags[1] == ()
     assert result.stats == NumericStats(agreed=1, disputed=1)
 
@@ -315,15 +330,15 @@ def test_second_opinion_readings_count_as_evidence(tmp_path: Path) -> None:
             chunk=0,
             start=0.0,
             end=6.0,
-            text="这只股票的目标价是一百二十块，市盈率二十倍",
+            text="这只股票的目标价是一百二十块，市盈率二十倍左右",
         ),
     ]
-    segments = [TimedText("这只股票的目标价是120块", 0.0, 3.0), TimedText("市盈率三十倍", 3.0, 6.0)]
+    segments = [TimedText("这只股票的目标价是120块", 0.0, 3.0), TimedText("市盈率三十倍左右", 3.0, 6.0)]
     client = FakeClient([verdicts((0, "二十倍", "high"))])
     evidence = Evidence(PRIMARY, second_opinion=SecondOpinion.from_hypotheses(rows))
     result = run(segments, evidence, client, tmp_path)
     assert result.flags[0] == ()
-    assert result.texts[1] == "市盈率二十倍"
+    assert result.texts[1] == "市盈率二十倍左右"
     (flag,) = result.flags[1]
     assert flag.kind == "numeric_fixed"
     assert flag.readings == (Reading(source=PRIMARY, text="三十倍"), Reading(source="asr2:other-engine", text="二十倍"))
@@ -352,8 +367,8 @@ def test_offsets_follow_a_length_changing_fix(tmp_path: Path) -> None:
 
 
 def test_spans_in_many_segments_are_batched(tmp_path: Path) -> None:
-    segments = [TimedText(f"第{k}段说涨了十五个百分点", k * 4.0, k * 4.0 + 4.0) for k in range(10)]
-    captions = manual(*((k * 4.0, k * 4.0 + 4.0, f"第{k}段说涨了五十个百分点") for k in range(10)))
+    segments = [TimedText(f"第{k}段说涨了十五个百分点左右", k * 4.0, k * 4.0 + 4.0) for k in range(10)]
+    captions = manual(*((k * 4.0, k * 4.0 + 4.0, f"第{k}段说涨了五十个百分点左右") for k in range(10)))
 
     def respond(request: LLMRequest) -> str:
         items = json.loads(request.user.split("ITEMS:\n", 1)[1])
@@ -362,7 +377,7 @@ def test_spans_in_many_segments_are_batched(tmp_path: Path) -> None:
     client = FakeClient(respond=respond)
     result = run(segments, Evidence(PRIMARY, captions=(captions,)), client, tmp_path)
     assert len(client.requests) == 2
-    assert all(text.endswith("五十个百分点") for text in result.texts)
+    assert all(text.endswith("五十个百分点左右") for text in result.texts)
     assert result.stats.fixed == 10
 
 
@@ -402,7 +417,218 @@ def test_second_opinion_request_splits_long_spans_and_skips_number_free_input(tm
     common = {"file_id": "f", "wav": tmp_path / "a.wav", "out_dir": tmp_path / "out", "language": None}
     request = second_opinion_request([TimedText("长句里有20%", 0.0, 49.0)], engine=chunked_engine(), **common)
     assert request is not None
-    assert request.files[0].chunks == (Chunk(0.0, 24.75, forced_cut=True), Chunk(24.75, 49.5))
+    # Seven characters over 49 s put 20% at 28-49 s; the last unit boundary before the 30 s limit is 28 s.
+    assert request.files[0].chunks == (Chunk(0.0, 28.0, forced_cut=True), Chunk(28.0, 49.5))
     assert second_opinion_request([TimedText("没有数字", 0.0, 3.0)], engine=chunked_engine(), **common) is None
     with pytest.raises(ValueError, match="whole files"):
         second_opinion_request([TimedText("20%", 0.0, 3.0)], engine=chunked_engine(None), **common)
+
+
+def eager_client() -> FakeClient:
+    """Picks the last listed reading with high confidence, so any pairing that reaches the LLM would be applied."""
+
+    def respond(request: LLMRequest) -> str:
+        items = json.loads(request.user.split("ITEMS:\n", 1)[1])
+        return verdicts(*((item["id"], item["readings"][-1], "high") for item in items))
+
+    return FakeClient(respond=respond)
+
+
+def test_a_number_from_the_neighbouring_sentence_is_never_paired(tmp_path: Path) -> None:
+    segments = [TimedText("去年营收增长了20%。", 0.0, 3.0), TimedText("30%的毛利率也很不错", 3.0, 6.0)]
+    captions = manual((0.0, 3.0, "去年营收增长了20%"), (3.0, 6.0, "的毛利率也很不错"))
+    client = eager_client()
+    result = run(segments, Evidence(PRIMARY, captions=(captions,)), client, tmp_path)
+    assert result.texts == tuple(s.text for s in segments)
+    assert result.flags[0] == ()
+    assert [(f.kind, span_text(result, 1, f)) for f in result.flags[1]] == [("numeric_single_source", "30%")]
+    assert result.stats == NumericStats(agreed=1, single_source=1)
+    assert client.requests == []
+
+
+def test_a_window_without_any_matching_unit_pairs_nothing(tmp_path: Path) -> None:
+    segments = [TimedText("去年营收增长了20%。", 0.0, 3.0), TimedText("30%。", 3.0, 4.0)]
+    captions = manual((0.0, 3.0, "去年营收增长了20%"), (3.0, 4.0, "对的"))
+    client = eager_client()
+    result = run(segments, Evidence(PRIMARY, captions=(captions,)), client, tmp_path)
+    assert result.texts == tuple(s.text for s in segments)
+    assert all(f.kind != "numeric_fixed" for flags in result.flags for f in flags)
+    assert [f.kind for f in result.flags[1]] == ["numeric_single_source"]
+    assert client.requests == []
+
+
+def test_an_edge_pair_disputes_but_never_fixes(tmp_path: Path) -> None:
+    segments = [TimedText("去年营收增长很多。", 0.0, 3.0), TimedText("30%的毛利率也很不错", 3.0, 6.0)]
+    captions = manual((0.0, 3.0, "去年营收增长了20%"), (3.0, 6.0, "的毛利率也很不错"))
+    client = eager_client()
+    result = run(segments, Evidence(PRIMARY, captions=(captions,)), client, tmp_path)
+    assert result.texts == tuple(s.text for s in segments)
+    (flag,) = result.flags[1]
+    assert flag.kind == "numeric_disputed"
+    assert "beside this span" in flag.note
+    assert flag.readings == (Reading(source=PRIMARY, text="30%"), Reading(source="caption_manual", text="20%"))
+
+
+def test_a_percent_heard_as_words_is_fixed_in_the_transcripts_form(tmp_path: Path) -> None:
+    segments = [TimedText("Margins hit 15% this year", 0.0, 3.0)]
+    captions = manual((0.0, 3.0, "margins hit 50 percent this year"))
+    client = FakeClient([verdicts((0, "50 percent", "high"))])
+    result = run(segments, Evidence(PRIMARY, captions=(captions,)), client, tmp_path, language="en")
+    assert result.texts == ("Margins hit 50% this year",)
+    (flag,) = result.flags[0]
+    assert flag.kind == "numeric_fixed"
+    assert span_text(result, 0, flag) == "50%"
+
+
+@pytest.mark.parametrize(
+    ("asr", "caption", "choice"),
+    [
+        ("Revenue reached $15 billion this year", "revenue reached 15 billion this year", "15 billion"),
+        ("Revenue reached 15 billion this year", "revenue reached $15 billion this year", "$15 billion"),
+        ("Margins hit 15% this year", "margins hit 50 this year", "50"),
+    ],
+)
+def test_a_fix_never_adds_or_drops_a_unit(asr: str, caption: str, choice: str, tmp_path: Path) -> None:
+    client = FakeClient([verdicts((0, choice, "high"))])
+    captions = manual((0.0, 3.0, caption))
+    result = run([TimedText(asr, 0.0, 3.0)], Evidence(PRIMARY, captions=(captions,)), client, tmp_path, language="en")
+    assert result.texts == (asr,)
+    (flag,) = result.flags[0]
+    assert flag.kind == "numeric_disputed"
+    assert "kind or unit" in flag.note
+
+
+def test_dollar_spellings_agree_and_magnitudes_dispute(tmp_path: Path) -> None:
+    agreeing = run(
+        [TimedText("目标价是15美元左右", 0.0, 3.0)],
+        Evidence(PRIMARY, captions=(manual((0.0, 3.0, "目标价是$15左右")),)),
+        FakeClient(),
+        tmp_path / "a",
+    )
+    assert agreeing.stats == NumericStats(agreed=1)
+    disputed = run(
+        [TimedText("Revenue reached $15 billion this year", 0.0, 3.0)],
+        Evidence(PRIMARY, captions=(manual((0.0, 3.0, "revenue reached $15 million this year")),)),
+        FakeClient([verdicts((0, "$15 million", "high"))]),
+        tmp_path / "b",
+        language="en",
+    )
+    assert disputed.stats == NumericStats(disputed=1, fixed=1)
+    assert disputed.texts == ("Revenue reached $0.015 billion this year",)
+
+
+def chinese_words(pieces: list[str], start: float, step: float, conf: dict[str, float] | None = None) -> list[Word]:
+    return [
+        Word(text=p, start=start + k * step, end=start + (k + 1) * step, conf=(conf or {}).get(p, 0.9))
+        for k, p in enumerate(pieces)
+    ]
+
+
+def test_chinese_digit_words_join_without_a_space(tmp_path: Path) -> None:
+    text = "目标价是1500块左右"
+    pieces = ["目标", "价", "是", "15", "00", "块", "左右"]
+    words = tuple(chinese_words(pieces, 0.0, 0.4, {"00": 0.1}))
+    other = ChunkHypothesis(
+        hypothesis="other-engine",
+        file="f",
+        chunk=0,
+        start=0.0,
+        end=2.8,
+        text="",
+        words=tuple(chinese_words(pieces, 0.0, 0.4)),
+    )
+    evidence = Evidence(PRIMARY, words=words, second_opinion=SecondOpinion.from_hypotheses([other]))
+    result = run([TimedText(text, 0.0, 2.8)], evidence, FakeClient(), tmp_path)
+    assert result.stats == NumericStats(agreed=1)
+    assert result.flags == ((),)
+    low = run([TimedText(text, 0.0, 2.8)], Evidence(PRIMARY, words=words), FakeClient(), tmp_path / "b")
+    assert [(f.kind, span_text(low, 0, f)) for f in low.flags[0]] == [("low_confidence", "1500块")]
+
+
+def test_second_opinion_from_no_rows_is_none() -> None:
+    assert SecondOpinion.from_hypotheses([]) is None
+
+
+def test_a_reply_missing_verdicts_is_used_but_not_checkpointed(tmp_path: Path) -> None:
+    segments = [TimedText("第一段涨了十五个百分点左右", 0.0, 4.0), TimedText("第二段跌了三十个百分点左右", 4.0, 8.0)]
+    captions = manual((0.0, 4.0, "第一段涨了五十个百分点左右"), (4.0, 8.0, "第二段跌了十三个百分点左右"))
+    evidence = Evidence(PRIMARY, captions=(captions,))
+    result = run(segments, evidence, FakeClient([verdicts((0, "五十个百分点", "high"))]), tmp_path)
+    assert result.texts[0] == "第一段涨了五十个百分点左右"
+    assert [f.kind for f in result.flags[1]] == ["numeric_disputed"]
+    assert not (tmp_path / "checkpoints").exists()
+
+
+def test_a_numeric_verdict_value_is_read_as_text(tmp_path: Path) -> None:
+    segments = [TimedText("一共是150期的数据", 0.0, 3.0)]
+    captions = manual((0.0, 3.0, "一共是160期的数据"))
+    reply = json.dumps({"verdicts": [{"id": 0, "value": 160, "confidence": "high", "reason": "context"}]})
+    result = run(segments, Evidence(PRIMARY, captions=(captions,)), FakeClient([reply]), tmp_path)
+    (flag,) = result.flags[0]
+    assert flag.kind == "numeric_disputed"
+    assert "'160'" in flag.note
+    assert "malformed" not in flag.note
+
+
+def test_remap_flags_follows_length_changing_edits() -> None:
+    before = "NVDA涨了十五个百分点，GAAP利润"
+    middle = "NVDA涨了50个百分点，GAAP利润"
+    after = "NVDA涨了50个百分点，GAAP利润5亿"
+    edits = (
+        Edit(stage="numeric", before=before, after=middle, llm=CLIENT_ID),
+        Edit(stage="numeric", before=middle, after=after, llm=CLIENT_ID),
+    )
+    gaap = before.index("GAAP")
+    span = before.index("十五")
+    flags = (
+        Flag(kind="entity_corrected", char_start=0, char_end=4, note="NVDA"),
+        Flag(kind="entity_corrected", char_start=gaap, char_end=gaap + 4, note="GAAP"),
+        Flag(kind="low_confidence", char_start=span, char_end=span + 1, note="inside the edit"),
+    )
+    moved = remap_flags(flags, edits)
+    assert [after[f.char_start : f.char_end] for f in moved] == ["NVDA", "GAAP", "50"]
+    assert remap_flags(flags, ()) == flags
+
+
+def test_second_opinion_merges_nearby_ranges_only(tmp_path: Path) -> None:
+    common = {"file_id": "f", "wav": tmp_path / "a.wav", "out_dir": tmp_path / "out", "language": None}
+    near = [TimedText("营收是三十亿", 0.0, 3.0), TimedText("闲聊", 3.0, 5.0), TimedText("利润是五亿", 5.0, 8.0)]
+    request = second_opinion_request(near, engine=chunked_engine(), **common)
+    assert request is not None
+    assert request.files[0].chunks == (Chunk(0.0, 8.5),)
+    far = [TimedText("营收是三十亿", 0.0, 3.0), TimedText("闲聊", 3.0, 7.5), TimedText("利润是五亿", 7.5, 10.0)]
+    request = second_opinion_request(far, engine=chunked_engine(), **common)
+    assert request is not None
+    assert request.files[0].chunks == (Chunk(0.0, 3.5), Chunk(7.0, 10.5))
+    capped = [TimedText("营收是三十亿", 0.0, 20.0), TimedText("利润是五亿", 21.0, 40.0)]
+    request = second_opinion_request(capped, engine=chunked_engine(), **common)
+    assert request is not None
+    assert request.files[0].chunks == (Chunk(0.0, 20.5), Chunk(20.5, 40.5))
+
+
+def long_speech_words(number_at: float, pause_at: float | None = None) -> list[Word]:
+    """One-second filler words from 0 to 49 s, with the number 15|00|万 starting at ``number_at``."""
+    words: list[Word] = []
+    t = 0.0
+    while t < 49.0:
+        if abs(t - number_at) < 1e-9:
+            words += [Word(text="15", start=t, end=t + 0.5), Word(text="00", start=t + 0.5, end=t + 1.0)]
+            words.append(Word(text="万", start=t + 1.0, end=t + 1.5))
+            t += 1.5
+            continue
+        gap = 0.5 if pause_at is not None and abs(t - pause_at) < 1e-9 else 0.0
+        words.append(Word(text="说", start=t, end=t + 1.0 - gap))
+        t += 1.0
+    return words
+
+
+def test_long_ranges_are_cut_at_a_pause_and_never_inside_a_number(tmp_path: Path) -> None:
+    common = {"file_id": "f", "wav": tmp_path / "a.wav", "out_dir": tmp_path / "out", "language": None}
+    segment = [TimedText("说" * 20 + "1500万" + "说" * 20, 0.0, 49.0)]
+    paused = second_opinion_request(segment, engine=chunked_engine(), words=long_speech_words(40.0, 20.0), **common)
+    assert paused is not None
+    assert paused.files[0].chunks == (Chunk(0.0, 20.75), Chunk(20.75, 49.5))
+    # No pause anywhere, and the word boundaries at 29.5 s (15|00) and 30 s (00|万) are inside the number.
+    straddling = second_opinion_request(segment, engine=chunked_engine(), words=long_speech_words(29.0), **common)
+    assert straddling is not None
+    assert straddling.files[0].chunks == (Chunk(0.0, 29.0, forced_cut=True), Chunk(29.0, 49.5))
