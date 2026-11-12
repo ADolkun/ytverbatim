@@ -17,6 +17,7 @@ from ytverbatim.asr import runner
 from ytverbatim.asr.chunks import Chunk
 from ytverbatim.asr.models import (
     ERROR_FILE,
+    FINGERPRINT_FILE,
     HYPOTHESES_FILE,
     METRICS_FILE,
     REQUEST_FILE,
@@ -76,8 +77,29 @@ def test_only_a_completed_run_of_the_same_request_counts_as_finished(tmp_path: P
     assert runner.finished(capped) == result.hypotheses
     other = request.model_copy(update={"files": (request.files[0].model_copy(update={"language": "zh"}),)})
     assert runner.finished(other) is None
+    moved = request.model_copy(update={"files": (request.files[0].model_copy(update={"wav": "elsewhere.wav"}),)})
+    assert runner.finished(moved) == result.hypotheses, "where the WAV lies does not change its decode"
+    result.hypotheses.rename(tmp_path / "aside.jsonl")
+    assert runner.finished(request) is None
+    (tmp_path / "aside.jsonl").rename(result.hypotheses)
     (tmp_path / "out" / METRICS_FILE).unlink()
     assert runner.finished(request) is None, "an interrupted run leaves no metrics"
+
+
+def test_a_folder_of_the_same_request_is_restamped_for_a_moved_wav_and_no_other(tmp_path: Path) -> None:
+    request = make_request(tmp_path)
+    runner.run_worker(request)
+    fingerprint = tmp_path / "out" / FINGERPRINT_FILE
+    stamped = fingerprint.read_text(encoding="utf-8")
+    other = request.model_copy(update={"files": (request.files[0].model_copy(update={"language": "zh"}),)})
+    runner.follow_moved_audio(other)
+    assert fingerprint.read_text(encoding="utf-8") == stamped
+
+    moved_wav = Path(request.files[0].wav).rename(tmp_path / "moved.wav")
+    moved = request.model_copy(update={"files": (request.files[0].model_copy(update={"wav": str(moved_wav)}),)})
+    runner.follow_moved_audio(moved)
+    again = runner.run_worker(moved)
+    assert (again.metrics.chunks_decoded, again.metrics.chunks_skipped) == (0, 2)
 
 
 def test_the_error_report_travels_to_the_parent(tmp_path: Path) -> None:
