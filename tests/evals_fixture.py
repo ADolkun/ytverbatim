@@ -1,6 +1,7 @@
 """A tiny synthetic eval directory: two silent files, plans, metadata, caption tracks and hypothesis rows."""
 
 import json
+import re
 import wave
 from collections.abc import Sequence
 from pathlib import Path
@@ -12,6 +13,7 @@ from evals.store import Layout, Plan, save_plan, widened_windows, write_rows
 from ytverbatim.asr.chunks import Chunk
 from ytverbatim.asr.models import ChunkHypothesis
 from ytverbatim.contract.models import Word
+from ytverbatim.llm.protocol import LLMRequest, LLMResponse, Usage
 
 ZH = "zhfile00001"
 EN = "enfile00001"
@@ -174,3 +176,24 @@ def write_pair(layout: Layout, control: str = "w-prod", challenger: str = "q-bas
         challenger,
         [*chunk_rows(challenger, ZH, ZH_CHALLENGER), *chunk_rows(challenger, EN, EN_CHALLENGER)],
     )
+
+
+class FakeJudge:
+    """A blind judge that takes the first of ``prefer`` among a span's options, else the first option listed."""
+
+    id = "fake:judge"
+
+    def __init__(self, prefer: Sequence[str] = ()) -> None:
+        self.prefer = tuple(prefer)
+        self.requests: list[LLMRequest] = []
+
+    def complete(self, request: LLMRequest) -> LLMResponse:
+        self.requests.append(request)
+        decisions = []
+        for block in request.user.split("\n\n")[1:]:
+            label = re.match(r"\[(s\d+)\]", block)
+            assert label, block
+            options = [m.group(2) for m in re.finditer(r"^ {2}(\d+)\. (.*)$", block, re.MULTILINE)]
+            chosen = next((p for p in self.prefer if p in options), options[0])
+            decisions.append({"span": label.group(1), "choice": options.index(chosen) + 1, "reason": "fluent"})
+        return LLMResponse(text=json.dumps({"decisions": decisions}), usage=Usage(10, 5), elapsed_s=0.1)

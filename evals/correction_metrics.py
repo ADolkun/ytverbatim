@@ -18,7 +18,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from evals.correction import BaseFile, CandidateFile
+from evals.correction import BASE, BaseFile, CandidateFile, audible_edits
 from evals.decide import Check
 from evals.judge import Verdict
 from evals.listen import LoggedDecision
@@ -30,7 +30,6 @@ from ytverbatim.contract.models import Flag
 from ytverbatim.errors import ConfigError
 from ytverbatim.text.numbers import quantity_tokens
 
-BASE_READING = "base"
 OVER_CORRECTION_MAX = 0.15
 MAX_NUMBER_VIOLATIONS = 0
 # A candidate must remove errors on the judge's reading: its net per hour must exceed this.
@@ -162,17 +161,13 @@ def number_violations(base: BaseFile, candidate: CandidateFile) -> int:
     )
 
 
-def audible_edits(spans: Sequence[Span], candidate: str) -> list[Span]:
-    return [s for s in spans if not s.format_only and s.reading(candidate).text != s.reading(BASE_READING).text]
-
-
 def judge_label(span: Span, verdict: Verdict, candidate: str) -> int | None:
     """+1 when the judge chose the candidate's reading, -1 for the base's, 0 for another's; None for needs_audio."""
     if verdict.needs_audio:
         return None
     if verdict.choice == span.reading(candidate).text:
         return 1
-    return -1 if verdict.choice == span.reading(BASE_READING).text else 0
+    return -1 if verdict.choice == span.reading(BASE).text else 0
 
 
 def _percentile_interval(draws: list[float], confidence: float) -> tuple[float, float]:
@@ -224,13 +219,13 @@ def judge_stats(
     low, high = _bootstrap_mean(labels, seed, resamples)
     return JudgeStats(
         **stats,
-        fix_precision=_proportion(counts[1], n),
-        over_correction=_proportion(counts[-1], n),
+        fix_precision=proportion(counts[1], n),
+        over_correction=proportion(counts[-1], n),
         net_per_hour=Estimate(value=(counts[1] - counts[-1]) / n * scale, low=low * scale, high=high * scale),
     )
 
 
-def _proportion(successes: int, trials: int) -> Estimate:
+def proportion(successes: int, trials: int) -> Estimate:
     low, high = wilson_interval(successes, trials)
     return Estimate(value=successes / trials, low=low, high=high)
 
@@ -416,6 +411,14 @@ def judge_agreement(labels: Mapping[str, int], answers: Sequence[Answer]) -> Agr
     return Agreement(agree=agree, decisive=len(decisive), rate=agree / len(decisive), low=low, high=high)
 
 
+def require_decided(human: HumanEstimates) -> None:
+    if human.undecided:
+        raise ConfigError(
+            f"the session has {human.undecided} of {human.spans} spans without a decision (1, 2, b or 0); "
+            "finish them with `listen`, then run `report` again"
+        )
+
+
 def decide(report: CorrectionReport) -> CorrectionDecision:
     """Apply the default-on rule; refuses while the owner's session has an undecided span."""
     chosen = pick(report.candidates)
@@ -438,11 +441,7 @@ def decide(report: CorrectionReport) -> CorrectionDecision:
             f"the session tests {human.candidate!r} but the judge picked {chosen.candidate!r}; "
             "rebuild the session with `session`"
         )
-    if human.undecided:
-        raise ConfigError(
-            f"the session has {human.undecided} of {human.spans} spans without a decision (1, 2, b or 0); "
-            "finish them with `listen`, then run `report` again"
-        )
+    require_decided(human)
     checks.append(Check(name="every span decided", passed=True, detail=f"{human.spans} spans"))
     estimate = human.overall
     if estimate is None:

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
-from evals_fixture import CHUNKS, EN, ZH, chunk_rows, make_eval, whole_file_rows
+from evals_fixture import CHUNKS, EN, ZH, FakeJudge, chunk_rows, make_eval, whole_file_rows
 
 from evals import correction, listen, run_correction
 from evals.correction import (
@@ -395,8 +395,15 @@ def test_complete_candidates_lists_only_finished_runs(tmp_path: Path, monkeypatc
     assert complete_candidates(layout, manifest) == [SONNET]
 
 
+def screened(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(run_correction, "judge_client", lambda: FakeJudge())
+    result = CliRunner().invoke(run_correction.main, ["screen"])
+    assert result.exit_code == 0, result.output
+
+
 def test_the_session_command_builds_the_session_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     layout, _ = with_runs(tmp_path, monkeypatch)
+    screened(monkeypatch)
     runner = CliRunner()
     built = runner.invoke(run_correction.main, ["session", "--candidate", "c-sonnet", "--seed", "2"])
     assert built.exit_code == 0, built.output
@@ -418,11 +425,11 @@ def test_the_session_command_builds_the_session_once(tmp_path: Path, monkeypatch
     assert (layout.session_dir("second") / KEY_FILE).exists()
 
 
-def test_the_session_command_needs_a_finished_candidate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_session_command_needs_a_screening(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     world(tmp_path / "eval", monkeypatch)
     result = CliRunner().invoke(run_correction.main, ["session", "--candidate", "c-sonnet"])
     assert isinstance(result.exception, ConfigError)
-    assert "run it first" in str(result.exception)
+    assert "run `screen` first" in str(result.exception)
 
 
 class Keys:
