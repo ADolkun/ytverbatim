@@ -1,7 +1,8 @@
 """Correction-LLM eval runner: ``uv run python -m evals.run_correction <command>``.
 
-Order: ``base --hyp H`` → ``correct --candidate C`` per candidate (then ``cleanup --candidate C`` for a local one).
-Every command is resumable and writes only under ``$YTVERBATIM_EVAL_DIR/correction``.
+Order: ``base --hyp H`` → ``correct --candidate C`` per candidate (then ``cleanup --candidate C`` for a local one) →
+``session --candidate C`` → ``listen``. Every command is resumable and writes only under ``$YTVERBATIM_EVAL_DIR``
+(``correction/``, and the session under ``ab/``).
 """
 
 import contextlib
@@ -12,19 +13,25 @@ import click
 
 from evals.correction import (
     CANDIDATES,
+    SESSION_N,
+    SESSION_NAME,
     Candidate,
     CandidateFile,
     build_base,
     cleanup_candidate,
+    complete_candidates,
     first_try_validity,
     load_failure,
     local_server,
     pending_files,
     run_candidate,
     run_dir,
+    session_for,
 )
+from evals.listen import listen as listen_loop
 from evals.manifest import load_manifest
 from evals.run_asr import default_hf_cache, layout
+from evals.session import write_session
 from evals.store import Layout
 from ytverbatim import config
 from ytverbatim.asr import registry
@@ -138,6 +145,41 @@ def cleanup(candidate_id: str, hf_cache: Path | None) -> None:
     candidate = CANDIDATES[candidate_id]
     freed = cleanup_candidate(layout(), load_manifest(), candidate, hf_cache or default_hf_cache())
     click.echo(f"deleted {candidate.model}: {freed / 1e9:.2f} GB freed")
+
+
+@main.command()
+@click.option(
+    "--candidate",
+    "candidate_id",
+    required=True,
+    type=click.Choice(sorted(CANDIDATES)),
+    help="The candidate whose audible edits are heard.",
+)
+@click.option("--n", "count", default=SESSION_N, show_default=True)
+@click.option("--seed", default=0, show_default=True)
+@click.option("--name", default=SESSION_NAME, show_default=True)
+def session(candidate_id: str, count: int, seed: int, name: str) -> None:
+    """Build the blind A/B session of one candidate's audible edits against the base."""
+    store, manifest = layout(), load_manifest()
+    candidates = complete_candidates(store, manifest)
+    if not candidates:
+        raise ConfigError("no candidate has finished `correct` for every file; run it first")
+    shown, key = session_for(store, manifest, candidates, CANDIDATES[candidate_id], n=count, seed=seed)
+    created = write_session(store, name, shown, key)
+    numeric = sum(e.stratum == "numeric" for e in key.entries)
+    by_language = {lang: sum(e.language == lang for e in key.entries) for lang in ("zh", "en")}
+    click.echo(
+        f"session {name!r} {'built' if created else 'already exists'}: {len(shown)} spans "
+        f"({numeric} numeric/entity; zh {by_language['zh']}, en {by_language['en']}) "
+        f"from {sum(key.population.values())} audible edits of {candidate_id}"
+    )
+
+
+@main.command()
+@click.option("--name", default=SESSION_NAME, show_default=True)
+def listen(name: str) -> None:
+    """Blind A/B in the terminal: one keypress per clip (the same loop as `run_asr listen`)."""
+    listen_loop(layout(), load_manifest(), name, getchar=click.getchar, echo=click.echo)
 
 
 def run() -> None:
