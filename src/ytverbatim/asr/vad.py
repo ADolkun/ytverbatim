@@ -1,25 +1,11 @@
 import importlib
-from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
 from ytverbatim.asr.audio import SAMPLE_RATE, Audio
-from ytverbatim.asr.chunks import Region
+from ytverbatim.asr.chunks import DEFAULT_VAD_PARAMS, SILERO_REPO, SILERO_REVISION, Region, VadParams
 from ytverbatim.errors import DependencyError
 
-SILERO_REPO = "mlx-community/silero-vad"
-# Pinned so the VAD weights, and therefore the chunk plan, cannot change under a recorded run.
-SILERO_REVISION = "7bc17f22d3c0451bd3a6cd71e759b009271ff49a"
-
-
-@dataclass(frozen=True, slots=True)
-class VadParams:
-    threshold: float = 0.5
-    min_speech_ms: int = 250
-    min_silence_ms: int = 300
-    speech_pad_ms: int = 100
-
-
-DEFAULT_VAD_PARAMS = VadParams()
+__all__ = ["DEFAULT_VAD_PARAMS", "SILERO_REPO", "SILERO_REVISION", "VadParams", "speech_regions"]
 
 
 class _SileroModel(Protocol):

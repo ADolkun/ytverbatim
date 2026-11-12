@@ -9,6 +9,22 @@ DEFAULT_WINDOW_PAUSE_S = 0.8
 DEFAULT_MAX_WINDOW_S = 300.0
 FRAME_S = 0.1
 
+# The VAD settings live here, beside the chunk planner they feed, so recording them in a document needs no numpy.
+SILERO_REPO = "mlx-community/silero-vad"
+# Pinned so the VAD weights, and therefore the chunk plan, cannot change under a recorded run.
+SILERO_REVISION = "7bc17f22d3c0451bd3a6cd71e759b009271ff49a"
+
+
+@dataclass(frozen=True, slots=True)
+class VadParams:
+    threshold: float = 0.5
+    min_speech_ms: int = 250
+    min_silence_ms: int = 300
+    speech_pad_ms: int = 100
+
+
+DEFAULT_VAD_PARAMS = VadParams()
+
 
 @dataclass(frozen=True, slots=True)
 class Region:
