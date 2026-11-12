@@ -388,10 +388,19 @@ def test_en_pieces_of_one_word_join_across_the_text_gap_the_engine_ignored() -> 
     assert (tokens[1].start, tokens[1].end) == (10.5, 11.5)
 
 
-def test_en_a_word_the_text_splits_differently_still_matches() -> None:
+def test_a_word_is_not_matched_across_a_space_between_latin_characters() -> None:
     tokens, complete = align("SO XX rose", ["SOXX", " rose"], "en")
-    assert complete
-    assert timing(tokens) == [("SO XX", True), (" rose", True)]
+    assert not complete
+    assert timing(tokens) == [("SO", False), (" XX", False), (" rose", True)]
+
+
+def test_a_word_that_reaches_into_the_next_text_run_leaves_both_runs_untimed() -> None:
+    tokens, complete = align("买XLP QQQ吧", ["买", "XL", "PQ", "QQ", "吧"], "zh")
+    assert not complete
+    assert timing(tokens) == [("买", True), ("XLP", False), (" QQQ", False), ("吧", True)]
+    tokens, complete = align("ETF SOXX", [" ETFS", "OXX"], "en")
+    assert not complete
+    assert [timed for _, timed in timing(tokens)] == [False] * len(tokens)
 
 
 def test_en_whole_words_keep_their_own_tokens_and_times() -> None:
@@ -451,9 +460,33 @@ def test_repeated_letters_are_claimed_by_one_word_only() -> None:
     assert not complete
     assert timing(tokens) == [("QQQ", True), (" QQQ", False)]
 
+
+def test_a_run_is_timed_whole_or_not_at_all() -> None:
     tokens, complete = align("QQQ", ["QQ", "QQ"], "en")
     assert not complete
-    assert timing(tokens) == [("QQ", True), ("Q", False)]
+    assert timing(tokens) == [("QQQ", False)]
+    # A correction that lengthened the run: the engine's "QQ" covers only part of "QQQ".
+    tokens, complete = align("参考一QQQ的走势", ["参", "考", "一", "QQ", "的", "走", "势"], "zh")
+    assert not complete
+    assert timing(tokens) == [
+        ("参", True),
+        ("考", True),
+        ("一", True),
+        ("QQQ", False),
+        ("的", True),
+        ("走", True),
+        ("势", True),
+    ]
+    tokens, complete = align("成交150万手", ["成", "交", "15", "万", "手"], "zh")
+    assert not complete
+    assert ("150", False) in timing(tokens) and ("15", True) not in timing(tokens)
+
+
+def test_a_word_cannot_take_the_start_of_the_next_run() -> None:
+    tokens, complete = align("saw ab cd ok", ["abc", "xd"], "en")
+    assert not complete
+    assert not any(token.timed for token in tokens)
+    assert "".join(token.text for token in tokens) == "saw ab cd ok"
 
 
 def test_text_without_a_matching_word_is_not_timed() -> None:
@@ -469,4 +502,21 @@ def test_alignment_of_a_long_text_stays_fast() -> None:
     started = time.perf_counter()
     tokens, complete = seg.aligned_tokens(text, words, 0.0, 1e6, language="en")
     assert complete and all(token.timed for token in tokens)
+    assert time.perf_counter() - started < 2.0
+
+
+def test_joined_pieces_never_end_before_they_start() -> None:
+    words = [Word(text="X", start=5.0, end=6.0), Word(text="LP", start=4.0, end=4.5)]
+    (token,), complete = seg.aligned_tokens("XLP", words, 0.0, 10.0, language="zh")
+    assert complete
+    assert (token.start, token.end) == (5.0, 6.0)
+
+
+def test_unrelated_text_and_words_cost_no_character_diff() -> None:
+    text = " ".join(f"{'abcdefghij'[i % 10]}{i}x" for i in range(6000))
+    words = pieces_of([f" w{i}z" for i in range(6000)], step=0.01)
+    started = time.perf_counter()
+    tokens, complete = seg.aligned_tokens(text, words, 0.0, 1e6, language="en")
+    assert not complete and not any(token.timed for token in tokens)
+    assert "".join(token.text for token in tokens) == text
     assert time.perf_counter() - started < 2.0

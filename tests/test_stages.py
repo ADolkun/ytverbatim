@@ -147,6 +147,23 @@ def test_latin_and_digit_pieces_the_engine_split_keep_their_times_without_interp
     assert timed["171.6"] == (10.0, 12.5)
 
 
+def test_a_correction_that_lengthens_a_ticker_interpolates_the_whole_run() -> None:
+    lead, tail = "参考一", "的走势" + "很好" * 20
+    chars = [*lead, "QQ", *tail]
+    words = tuple(Word(text=c, start=1.0 + i * 0.3, end=1.2 + i * 0.3) for i, c in enumerate(chars))
+    source = source_of([row(f"{lead}QQ{tail}", 0.0, 30.0, words)])
+    (stretch,) = source.stretches
+    after = f"{lead}QQQ{tail}"
+    edit = Edit(stage="correction", before=stretch.text, after=after, llm=LLM)
+    final = with_results((stretch,), [after], [[edit]], [[]])
+
+    doc = document(source, final)
+    assert sum("QQQ" in segment.text for segment in doc.segments) == 1
+    assert not any(segment.text.endswith("QQ") or segment.text.startswith("Q") for segment in doc.segments)
+    assert not any(w.text.startswith("QQ") for segment in doc.segments for w in segment.words or ())
+    assert any(kind == "timing_interpolated" for _, kind, _ in flagged(doc))
+
+
 def test_text_the_engine_never_timed_is_still_interpolated_and_flagged() -> None:
     words = tuple(Word(text=p, start=1.0 + i, end=1.5 + i) for i, p in enumerate(["好", "看", "的", "位", "置"]))
     source = source_of([row("好看XLP的位置", 0.0, 10.0, words)])
