@@ -66,19 +66,10 @@ _SECONDARY: tuple[tuple[Signal, re.Pattern[str]], ...] = tuple(
         (Signal.PREMIUM, r"detected youtube premium subscription"),
         (Signal.AUTH_COOKIES_FOUND, r"found youtube account cookies"),
         (Signal.AGE_VERIFICATION, r"youtube is requiring account age-verification"),
-        (Signal.COOKIE_DB_MISSING, r"could not find \w+ cookies database"),
-        (
-            Signal.KEYCHAIN,
-            r"find-generic-password failed|exception running find-generic-password"
-            r"|cannot decrypt v1[01] cookies: no key found",
-        ),
-        (Signal.DECRYPT_PARTIAL, r"extracted (\d+) cookies from (\w+) \((\d+) could not be decrypted\)"),
-        (Signal.COOKIE_LOAD, r"failed to load cookies"),
         (Signal.SKIP_CLIENT_NO_COOKIES, r'skipping client "\w+" since it does not support cookies'),
     )
 )
 
-_DECRYPT_PARTIAL = dict(_SECONDARY)[Signal.DECRYPT_PARTIAL]
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 # Never retried: retrying a bot, captcha, IP or rate signal digs the hole deeper, and an unknown error
@@ -94,22 +85,10 @@ class LineKind(StrEnum):
 
 
 @dataclass(frozen=True)
-class DecryptCounts:
-    extracted: int
-    browser: str
-    failed: int
-
-
-@dataclass(frozen=True)
 class Classification:
     primary: Signal | None
     secondary: tuple[Signal, ...]
     warnings: tuple[str, ...]
-    decrypt_partial: DecryptCounts | None
-
-    @property
-    def js_challenge_failed(self) -> bool:
-        return js_challenge_failed(self.primary, self.secondary)
 
 
 def js_challenge_failed(primary: Signal | None, secondary: Iterable[Signal]) -> bool:
@@ -136,7 +115,6 @@ def classify(stderr: str) -> Classification:
     primary_rank: int | None = None
     secondary: dict[Signal, None] = {}
     warnings: list[str] = []
-    decrypt: DecryptCounts | None = None
 
     for raw in _ANSI.sub("", stderr).splitlines():
         line = raw.strip()
@@ -156,13 +134,10 @@ def classify(stderr: str) -> Classification:
         for signal, pattern in _SECONDARY:
             if pattern.search(line):
                 secondary[signal] = None
-        if decrypt is None and (match := _DECRYPT_PARTIAL.search(line)):
-            decrypt = DecryptCounts(int(match.group(1)), match.group(2), int(match.group(3)))
 
     primary = _PRIMARY[primary_rank][0] if primary_rank is not None else None
     return Classification(
         primary=primary,
         secondary=tuple(s for s in secondary if s is not primary),
         warnings=tuple(warnings),
-        decrypt_partial=decrypt,
     )
