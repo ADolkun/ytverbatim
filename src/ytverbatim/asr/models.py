@@ -93,7 +93,11 @@ class WorkerRequest(_Model):
         return self
 
     def fingerprint(self) -> dict[str, JsonValue]:
-        """Everything that decides the decoded text; where the output and the weights live and the memory cap do not."""
+        """Everything that decides the decoded text; where the output and the weights live and the memory cap do not.
+
+        Worker folders are keyed by this alone, so a worker code change that alters the decoded text for the same
+        request decodes nothing again until a version field is added here (which moves every folder once).
+        """
         return self.model_dump(mode="json", exclude={"out_dir", "hf_hub_cache", "memory_cap_bytes"})
 
 
