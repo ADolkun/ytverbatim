@@ -7,6 +7,7 @@ works on tokens, so engines with and without word timings share one set of rules
 
 import bisect
 import difflib
+import itertools
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -46,6 +47,9 @@ _EN_PSEUDO_TOKEN = re.compile(r"\s*\S+")
 _COMMAS = ",，、"
 # What word alignment compares: a CJK character, or a run of other letters and digits (a "run").
 _ALIGN_RUNS = re.compile(f"[{_CJK}]|[^\\W_{_CJK}]+")
+# The longest stretch of unmatched characters, per side, that word alignment diffs character by character. Pieces of a
+# split run are a few characters; this is a sentence or two, and a diff of it takes about a millisecond.
+_MAX_CHARACTER_DIFF = 300
 # Punctuation between two aligned words goes to the word before it, except opening marks, which lead the next word.
 _OPENERS = "“‘(（「『《【〔["
 # A period inside a word ("example.com") is no break. Inside a sentence range a period before a lowercase word is an
@@ -154,12 +158,13 @@ def aligned_tokens(
 ) -> tuple[list[Token], bool]:
     """Tokens of `text` timed by the engine's `words` wherever a sequence diff matches them; True when all matched.
 
-    Letters and digits are compared casefolded, one character at a time, so punctuation, spacing and where a Latin or
-    digit run is split into pieces do not matter. A word matches when every one of its characters lines up with
-    consecutive text; its token takes the text's spelling and the word's times, clamped to `[start, end]`. Pieces of one
-    run ("X" and "LP", or "171" and "6" around a decimal point) become one token timed from the first piece to the last.
-    Text that no word matches is spread over the gap between the timed words around it, and those tokens are not
-    `timed`.
+    Letters and digits are compared casefolded, one character at a time, so punctuation and where a Latin or digit run
+    is split into pieces do not matter. A word matches when every one of its characters lines up with consecutive text
+    without a space between Latin or digit characters; its token takes the text's spelling and the word's times,
+    clamped to `[start, end]`. Pieces of one run ("X" and "LP", or "171" and "6" around a decimal point) become one
+    token timed from the first piece to the last. A Latin or digit run is never cut: it is timed by words that cover
+    all of it, or by none. Text that no word matches is spread over the gap between the timed words around it, and
+    those tokens are not `timed`.
     """
     text = text.strip()
     text_runs = [m.span() for m in _ALIGN_RUNS.finditer(text)]
@@ -181,6 +186,14 @@ def aligned_tokens(
     sizes = [0] * len(words)
     for owner in owners:
         sizes[owner] += 1
+    candidates = {
+        index: units
+        for index, units in hits.items()
+        if len(units) == sizes[index]
+        and units[-1] - units[0] == len(units) - 1
+        and not _spans_a_space(text, text_units, units)
+    }
+    accepted = _whole_runs(candidates, [b - a for a, b in text_runs])
 
     tokens: list[Token] = []
     complete = True
@@ -188,8 +201,8 @@ def aligned_tokens(
     left = start
     joinable = False
     for index, word in enumerate(words):
-        units = hits.get(index, [])
-        if not units or len(units) != sizes[index] or units[-1] - units[0] != len(units) - 1:
+        units = accepted.get(index)
+        if not units:
             continue
         first, last = text_units[units[0]][0], text_units[units[-1]][1]
         word_start = min(max(word.start, start), end)
@@ -198,7 +211,10 @@ def aligned_tokens(
             previous = tokens[-1]
             conf = [c for c in (previous.conf, word.conf) if c is not None]
             tokens[-1] = replace(
-                previous, text=previous.text + text[cursor:last], end=word_end, conf=min(conf) if conf else None
+                previous,
+                text=previous.text + text[cursor:last],
+                end=max(previous.end, word_end),
+                conf=min(conf) if conf else None,
             )
         else:
             lead, interpolated = _fill(tokens, text[cursor:first], left, word_start, language, origin)
@@ -214,6 +230,46 @@ def aligned_tokens(
     return tokens, complete and not interpolated
 
 
+def _spans_a_space(text: str, text_units: Sequence[tuple[int, int]], units: Sequence[int]) -> bool:
+    """Whether a word's characters sit on both sides of a space between Latin or digit characters."""
+    for before, after in itertools.pairwise(units):
+        gap = text[text_units[before][1] : text_units[after][0]]
+        if (
+            any(char.isspace() for char in gap)
+            and not _CJK_CHAR.match(text[text_units[before][0]])
+            and not _CJK_CHAR.match(text[text_units[after][0]])
+        ):
+            return True
+    return False
+
+
+def _whole_runs(candidates: dict[int, list[int]], run_sizes: Sequence[int]) -> dict[int, list[int]]:
+    """Drop every candidate word that touches a text run its accepted words do not cover whole, until none does.
+
+    `candidates` maps a word to the text units it matched; `run_sizes` are the lengths of the text's runs in order.
+    """
+    run_of = [run for run, size in enumerate(run_sizes) for _ in range(size)]
+    touching: dict[int, set[int]] = {}
+    covered = [0] * len(run_sizes)
+    for word, units in candidates.items():
+        for unit in units:
+            touching.setdefault(run_of[unit], set()).add(word)
+            covered[run_of[unit]] += 1
+    accepted = dict(candidates)
+    queue = [run for run in touching if covered[run] != run_sizes[run]]
+    while queue:
+        run = queue.pop()
+        for word in touching[run]:
+            if word not in accepted:
+                continue
+            for unit in accepted.pop(word):
+                other = run_of[unit]
+                covered[other] -= 1
+                if other != run and covered[other] != run_sizes[other]:
+                    queue.append(other)
+    return accepted
+
+
 def _matched_units(
     a: Sequence[str], a_runs: Sequence[int], b: Sequence[str], b_runs: Sequence[int]
 ) -> list[tuple[int, int]]:
@@ -221,7 +277,8 @@ def _matched_units(
 
     Whole runs are diffed first, which is cheap and anchors the alignment. Characters are then diffed only in the
     stretches between anchors that hold unmatched runs on both sides, so a misheard word cannot take characters from
-    its neighbours and the character diff never sees more than a few words.
+    its neighbours. A stretch longer than `_MAX_CHARACTER_DIFF` on either side is a rewritten passage, not a split
+    word, and is left unmatched: the diff is quadratic, and with no anchors a whole transcript would be one stretch.
     """
     a_at, b_at = _starts(a_runs), _starts(b_runs)
     a_keys = [tuple(a[a_at[i] : a_at[i + 1]]) for i in range(len(a_runs))]
@@ -230,7 +287,7 @@ def _matched_units(
     done_a = done_b = 0
     for block in difflib.SequenceMatcher(None, a_keys, b_keys, autojunk=False).get_matching_blocks():
         lo_a, hi_a, lo_b, hi_b = a_at[done_a], a_at[block.a], b_at[done_b], b_at[block.b]
-        if hi_a > lo_a and hi_b > lo_b:
+        if 0 < hi_a - lo_a <= _MAX_CHARACTER_DIFF and 0 < hi_b - lo_b <= _MAX_CHARACTER_DIFF:
             for inner in difflib.SequenceMatcher(
                 None, a[lo_a:hi_a], b[lo_b:hi_b], autojunk=False
             ).get_matching_blocks():
