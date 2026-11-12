@@ -42,6 +42,8 @@ class SubprocessRunner:
         cookie_args = ("--cookies", str(cookies)) if cookies is not None else ()
         return [
             sys.executable,
+            # -P: a yt_dlp/ or json.py in the caller's working directory must never shadow the installed one.
+            "-P",
             "-m",
             "yt_dlp",
             "--ignore-config",
