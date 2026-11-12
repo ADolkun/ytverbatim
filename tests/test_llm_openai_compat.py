@@ -130,11 +130,44 @@ def test_unusable_response_is_unavailable(body: bytes) -> None:
         client(StubOpener(body=body)).complete(LLMRequest(system="", user="Hi"))
 
 
-def test_truncated_or_empty_reply_is_an_output_error() -> None:
-    with pytest.raises(LLMOutputError, match="max_tokens"):
+def test_truncated_or_empty_reply_is_an_output_error_that_keeps_its_usage() -> None:
+    with pytest.raises(LLMOutputError, match="max_tokens") as truncated:
         client(StubOpener(body=reply(finish="length"))).complete(LLMRequest(system="", user="Hi"))
-    with pytest.raises(LLMOutputError, match="empty"):
+    assert (truncated.value.responded, truncated.value.usage) == (True, Usage(input_tokens=12, output_tokens=5))
+    with pytest.raises(LLMOutputError, match="empty") as empty:
         client(StubOpener(body=reply(content=""))).complete(LLMRequest(system="", user="Hi"))
+    assert empty.value.responded
+
+
+def test_no_reply_means_nothing_was_billed() -> None:
+    with pytest.raises(LLMUnavailableError) as caught:
+        client(StubOpener(raises=TimeoutError("timed out"))).complete(LLMRequest(system="", user="Hi"))
+    assert (caught.value.responded, caught.value.usage) == (False, None)
+
+
+@pytest.mark.parametrize(
+    "base_url", ["http://example.com/v1", "http://192.168.1.20:8080/v1", "ftp://127.0.0.1/v1", "127.0.0.1:8080"]
+)
+def test_a_key_is_never_sent_in_clear_text_off_this_machine(monkeypatch: pytest.MonkeyPatch, base_url: str) -> None:
+    monkeypatch.setenv("FAKE_LLM_KEY", "sk-fake-3")
+    with pytest.raises(ConfigError, match="https"):
+        OpenAICompatClient(base_url=base_url, model="m", api_key_env="FAKE_LLM_KEY")
+    opener = StubOpener()
+    status = openai_compat.readiness(base_url, "FAKE_LLM_KEY", opener=opener)
+    assert not status.ready
+    assert opener.requests == []
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    ["https://api.example.com/v1", "http://127.0.0.1:8080/v1", "http://localhost:11434/v1", "http://[::1]/v1"],
+)
+def test_a_key_may_go_over_https_or_to_loopback(base_url: str) -> None:
+    OpenAICompatClient(base_url=base_url, model="m", api_key_env="FAKE_LLM_KEY")
+
+
+def test_without_a_key_plain_http_anywhere_is_fine() -> None:
+    OpenAICompatClient(base_url="http://192.168.1.20:8080/v1", model="m")
 
 
 def test_constructor_requires_base_url_and_model() -> None:

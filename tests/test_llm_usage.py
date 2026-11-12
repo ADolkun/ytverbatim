@@ -1,6 +1,9 @@
 from dataclasses import dataclass
 
+import pytest
+
 from ytverbatim.contract.models import LLMUsage
+from ytverbatim.errors import LLMOutputError, LLMUnavailableError
 from ytverbatim.llm.protocol import LLMRequest, LLMResponse, Usage
 from ytverbatim.llm.usage import UsageMeter
 
@@ -52,3 +55,44 @@ def test_metered_client_records_every_completed_call() -> None:
 
 def test_empty_meter() -> None:
     assert UsageMeter().summary() == ()
+
+
+@dataclass
+class FailingClient:
+    error: Exception
+    name: str = "fake:failing"
+
+    @property
+    def id(self) -> str:
+        return self.name
+
+    def complete(self, request: LLMRequest) -> LLMResponse:
+        raise self.error
+
+
+def test_a_reply_rejected_after_it_arrived_is_still_billed() -> None:
+    meter = UsageMeter()
+    cut_off = LLMOutputError("cut off", responded=True, usage=Usage(30, 4096))
+    with pytest.raises(LLMOutputError):
+        meter.metered("correct", FailingClient(cut_off)).complete(LLMRequest(system="", user="a"))
+    assert meter.summary() == (
+        LLMUsage(stage="correct", client="fake:failing", calls=1, input_tokens=30, output_tokens=4096),
+    )
+
+
+def test_a_rejected_reply_with_unreported_usage_makes_the_totals_unknown() -> None:
+    meter = UsageMeter()
+    with pytest.raises(LLMOutputError):
+        meter.metered("s", FailingClient(LLMOutputError("empty", responded=True))).complete(
+            LLMRequest(system="", user="a")
+        )
+    assert meter.summary() == (
+        LLMUsage(stage="s", client="fake:failing", calls=1, input_tokens=None, output_tokens=None),
+    )
+
+
+def test_a_call_that_got_no_reply_is_not_recorded() -> None:
+    meter = UsageMeter()
+    with pytest.raises(LLMUnavailableError):
+        meter.metered("s", FailingClient(LLMUnavailableError("down"))).complete(LLMRequest(system="", user="a"))
+    assert meter.summary() == ()

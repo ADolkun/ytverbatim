@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 
 from ytverbatim.contract.models import LLMUsage
+from ytverbatim.errors import LLMError
 from ytverbatim.llm.protocol import LLMClient, LLMRequest, LLMResponse, Usage
 
 
@@ -31,7 +32,7 @@ class UsageMeter:
             tally.output_tokens += usage.output_tokens
 
     def metered(self, stage: str, client: LLMClient) -> LLMClient:
-        """`client`, with every completed call recorded under `stage`."""
+        """`client`, with every call that got a reply recorded under `stage`, including a reply it then rejected."""
         return _MeteredClient(client, stage, self)
 
     def summary(self) -> tuple[LLMUsage, ...]:
@@ -58,6 +59,12 @@ class _MeteredClient:
         return self._inner.id
 
     def complete(self, request: LLMRequest) -> LLMResponse:
-        response = self._inner.complete(request)
+        try:
+            response = self._inner.complete(request)
+        except LLMError as exc:
+            # A reply cut off at the token limit was still billed in full.
+            if exc.responded:
+                self._meter.record(self._stage, self._inner.id, exc.usage)
+            raise
         self._meter.record(self._stage, self._inner.id, response.usage)
         return response
