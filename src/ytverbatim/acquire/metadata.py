@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import cast
 
 from ytverbatim import atomic
+from ytverbatim.acquire.creator_note import DEFAULT_MAX_COMMENTS, CreatorNote, comment_args, creator_note_from_info
 from ytverbatim.errors import UnavailableError, YtDlpError, stderr_preview
 from ytverbatim.ids import video_url
 from ytverbatim.ytdlp.types import YtDlpRunner
@@ -39,6 +40,8 @@ class VideoMetadata:
     subtitle_langs: tuple[str, ...]
     # Only the original-language auto track: the others are machine translations of it.
     auto_caption_lang: str | None
+    # Set only when the extraction asked for comments and the uploader pinned one of their own.
+    creator_note: CreatorNote | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -55,10 +58,18 @@ def fetch_info(
     *,
     cookies: Path | None = None,
     timeout_s: float = DEFAULT_TIMEOUT_S,
+    creator_note: bool = False,
+    max_comments: int = DEFAULT_MAX_COMMENTS,
 ) -> VideoMetadata:
-    """Run the video's single extraction and keep the raw info JSON for `--load-info-json` reuse."""
+    """Run the video's single extraction and keep the raw info JSON for `--load-info-json` reuse.
+
+    `creator_note` folds a bounded comment page into that same extraction rather than a second one. It is
+    opt-in because comment pages are extra, rate-limit-prone requests, and yt-dlp fails the whole extraction
+    when they fail.
+    """
+    extra = comment_args(max_comments) if creator_note else ()
     result = runner.run(
-        ["-J", "--no-playlist", video_url(video_id)], cookies=cookies, timeout_s=timeout_s, label="metadata"
+        ["-J", "--no-playlist", *extra, video_url(video_id)], cookies=cookies, timeout_s=timeout_s, label="metadata"
     )
     info = _parse_info(result.stdout, result.returncode)
     if info.get("id") != video_id:
@@ -97,6 +108,7 @@ def trim_info(info: Mapping[str, object]) -> VideoMetadata:
         chapters=_chapters(info.get("chapters")),
         subtitle_langs=tuple(sorted(subtitles)),
         auto_caption_lang=_auto_original_lang(_mapping(info.get("automatic_captions")), language),
+        creator_note=creator_note_from_info(info),
     )
 
 

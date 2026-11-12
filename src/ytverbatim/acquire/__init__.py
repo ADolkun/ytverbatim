@@ -12,7 +12,7 @@ from ytverbatim.acquire.captions import (
     parse_vtt,
     select_caption_langs,
 )
-from ytverbatim.acquire.creator_note import CreatorNote, fetch_creator_note
+from ytverbatim.acquire.creator_note import CreatorNote
 from ytverbatim.acquire.expand import expand_target, expand_targets
 from ytverbatim.acquire.metadata import Chapter, VideoMetadata, fetch_info, info_path, load_metadata, trim_info
 
@@ -31,7 +31,6 @@ __all__ = [
     "expand_targets",
     "fetch_audio",
     "fetch_captions",
-    "fetch_creator_note",
     "fetch_info",
     "find_audio",
     "info_path",

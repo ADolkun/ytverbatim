@@ -1,11 +1,4 @@
-import json
-import logging
-
-import pytest
-
 from ytverbatim.acquire import creator_note
-from ytverbatim.errors import YtDlpError
-from ytverbatim.ytdlp.types import Signal
 
 PINNED = {
     "is_pinned": True,
@@ -32,30 +25,15 @@ def test_no_matching_comment_gives_none() -> None:
     assert creator_note.select_pinned_creator_comment(["junk", {"text": "plain"}]) is None
 
 
-def test_fetch_requests_a_bounded_comment_page(fakes) -> None:
-    runner = fakes.runner(lambda _args, _label: fakes.ok(json.dumps({"comments": [PINNED]})))
-    note = creator_note.fetch_creator_note(runner, "aaaaaaaaaaa", max_comments=10)
-    assert note is not None
-    args = runner.calls[0].args
-    assert "--write-comments" in args
-    assert "youtube:comment_sort=top;max_comments=10,10,0,0" in args
-    assert runner.calls[0].label == "creator-note"
+def test_note_comes_from_the_info_comments() -> None:
+    assert creator_note.creator_note_from_info({"comments": [PINNED]}) is not None
+    assert creator_note.creator_note_from_info({"comments": None}) is None
+    assert creator_note.creator_note_from_info({}) is None
 
 
-def test_ordinary_failure_is_skipped_with_a_warning(fakes, caplog: pytest.LogCaptureFixture) -> None:
-    runner = fakes.runner(fakes.raises(fakes.fail(Signal.TRANSIENT)))
-    with caplog.at_level(logging.WARNING):
-        assert creator_note.fetch_creator_note(runner, "aaaaaaaaaaa") is None
-    assert "creator note skipped" in caplog.text
-
-
-def test_unparseable_output_is_skipped(fakes) -> None:
-    runner = fakes.runner(lambda _args, _label: fakes.ok("not json"))
-    assert creator_note.fetch_creator_note(runner, "aaaaaaaaaaa") is None
-
-
-@pytest.mark.parametrize("signal", [Signal.BOT_CHECK, Signal.RATE_LIMITED, Signal.CAPTCHA, Signal.IP_BLOCKED])
-def test_push_back_signals_propagate(fakes, signal: Signal) -> None:
-    runner = fakes.runner(fakes.raises(fakes.fail(Signal.UNAVAILABLE, signal)))
-    with pytest.raises(YtDlpError):
-        creator_note.fetch_creator_note(runner, "aaaaaaaaaaa")
+def test_comment_args_request_a_bounded_page_without_replies() -> None:
+    assert creator_note.comment_args(10) == (
+        "--get-comments",
+        "--extractor-args",
+        "youtube:comment_sort=top;max_comments=10,all,0,0",
+    )
