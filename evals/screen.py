@@ -245,8 +245,13 @@ class Share(_Frozen):
 class Speed(_Frozen):
     rtf: float | None
     load_s: float | None
+    # Footprint comes from newer runs only, so a mixed history reports it for just those; the others are older.
+    peak_footprint_bytes: int | None
     peak_memory_bytes: int | None
     max_rss_bytes: int | None
+
+
+NO_SPEED = Speed(rtf=None, load_s=None, peak_footprint_bytes=None, peak_memory_bytes=None, max_rss_bytes=None)
 
 
 class HypothesisScreen(_Frozen):
@@ -306,14 +311,16 @@ def file_quality(video: Video, plan: Plan, rows: Sequence[ChunkHypothesis]) -> Q
 def speed(layout: Layout, hypothesis: str) -> Speed:
     history = read_history(layout, hypothesis)
     if not history:
-        return Speed(rtf=None, load_s=None, peak_memory_bytes=None, max_rss_bytes=None)
+        return NO_SPEED
     seconds = sum(r.file_seconds for r in history)
+    footprints = [r.metrics.peak_footprint_bytes for r in history if r.metrics.peak_footprint_bytes is not None]
     peaks = [r.metrics.peak_memory_bytes for r in history if r.metrics.peak_memory_bytes is not None]
     loads = [r.metrics.load_s for r in history if r.metrics.chunks_decoded]
     return Speed(
         # Decode time over the duration of the files decoded, so whole-file and chunked engines compare directly.
         rtf=sum(r.metrics.decode_s for r in history) / seconds if seconds else None,
         load_s=max(loads) if loads else None,
+        peak_footprint_bytes=max(footprints) if footprints else None,
         peak_memory_bytes=max(peaks) if peaks else None,
         max_rss_bytes=max(max(r.metrics.max_rss_bytes, r.children_max_rss_bytes) for r in history),
     )
@@ -485,9 +492,7 @@ def build_screen(
             reference_cer_raw=acc[h].reference_cer_raw,
             reference_mer=acc[h].reference_mer,
             caption_wer=acc[h].caption_wer,
-            speed=speed(layout, h)
-            if h != CAPTION_HYPOTHESIS
-            else Speed(rtf=None, load_s=None, peak_memory_bytes=None, max_rss_bytes=None),
+            speed=speed(layout, h) if h != CAPTION_HYPOTHESIS else NO_SPEED,
             judge=shares.get(h),
             disputes=sum(1 for s in spans if any(r.hypothesis == h for r in s.readings)),
         )
@@ -510,7 +515,7 @@ def build_screen(
 def screen_table(result: ScreenResult) -> str:
     header = (
         "| hypothesis | judge win share [95% CI] | n | needs audio | ref CER | rep/h | cap/h | nonspeech "
-        "| re-decoded | anomalies | RTF | peak GB |"
+        "| re-decoded | anomalies | RTF | peak GB (footprint / MLX / RSS) |"
     )
     lines = [header, "|" + "---|" * 12]
     for row in result.hypotheses:
@@ -521,7 +526,7 @@ def screen_table(result: ScreenResult) -> str:
             f"| {row.judge.needs_audio if row.judge else 0} | {_pct(row.reference_cer.get('zh'))} "
             f"| {total.repetition_per_hour:.2f} | {total.token_cap_per_hour:.2f} | {total.nonspeech_share:.2%} "
             f"| {total.redecode_share:.2%} | {total.decoder_anomalies} | {_num(row.speed.rtf)} "
-            f"| {_gb(row.speed.peak_memory_bytes)} |"
+            f"| {_memory(row.speed)} |"
         )
     return "\n".join(lines)
 
@@ -540,6 +545,10 @@ def _pct(rate: Rate | None) -> str:
 
 def _num(value: float | None) -> str:
     return f"{value:.3f}" if value is not None else "—"
+
+
+def _memory(speed: Speed) -> str:
+    return " / ".join(_gb(v) for v in (speed.peak_footprint_bytes, speed.peak_memory_bytes, speed.max_rss_bytes))
 
 
 def _gb(value: int | None) -> str:

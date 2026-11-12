@@ -11,12 +11,12 @@ from evals.listen import Choice, LoggedDecision
 from evals.normalize import Language
 from evals.report import ABResult, Report, WinStats, build_report, render_markdown
 from evals.screen import (
+    NO_SPEED,
     HypothesisScreen,
     Quality,
     Rate,
     Recommendation,
     ScreenResult,
-    Speed,
     build_screen,
     collect_spans,
 )
@@ -43,7 +43,7 @@ def screen_row(name: str, cer: float | None = 0.10, **extra: float) -> Hypothesi
     reference = {"zh": Rate(errors=round(cer * 1000), reference_units=1000)} if cer is not None else {}
     return HypothesisScreen(hypothesis=name, quality=quality(**extra), reference_cer=reference,
                             reference_cer_raw=reference, reference_mer=reference, caption_wer=None,
-                            speed=Speed(rtf=0.1, load_s=1.0, peak_memory_bytes=None, max_rss_bytes=None),
+                            speed=NO_SPEED.model_copy(update={"rtf": 0.1, "load_s": 1.0}),
                             judge=None, disputes=10)  # fmt: skip
 
 
@@ -217,3 +217,20 @@ def test_skips_count_as_undecided_until_revisited(tmp_path: Path, monkeypatch: p
     complete = build_report(layout, manifest, screen, "main", "t")
     assert complete.ab is not None and complete.ab.undecided == 0 and complete.ab.overall.skipped == 0
     run_asr.write_decision(complete, tmp_path / "results", "2025-01-01")
+
+
+def test_the_report_speed_table_has_a_column_per_memory_measure() -> None:
+    measured = NO_SPEED.model_copy(
+        update={
+            "peak_footprint_bytes": 9_000_000_000,
+            "peak_memory_bytes": 4_000_000_000,
+            "max_rss_bytes": 2_000_000_000,
+        }
+    )
+    older = screen_row("q-ctx").model_copy(update={"speed": measured.model_copy(update={"peak_footprint_bytes": None})})
+    base = report(WIN, WIN, NUMERIC_OK, NUMERIC_OK, older)
+    rows = (screen_row("w-prod").model_copy(update={"speed": measured}), older)
+    text = render_markdown(base.model_copy(update={"screen": base.screen.model_copy(update={"hypotheses": rows})}))
+    assert "| load s | peak footprint GB | MLX peak GB | max RSS GB |" in text
+    assert "| 9.00 | 4.00 | 2.00 |" in text
+    assert "| — | 4.00 | 2.00 |" in text

@@ -40,7 +40,11 @@ from ytverbatim.ytdlp.runner import redact
     help="LLM for punctuation, correction and numeric verdicts: PROVIDER:MODEL (claude-cli:claude-sonnet-5-5) or none.",
 )
 @click.option("--captions/--no-captions", default=True, show_default=True, help="Download caption tracks.")
-@click.option("--force", is_flag=True, help="Redo videos from scratch, discarding every stored stage.")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Recompute every stage from scratch, including paid LLM calls, discarding all stored results.",
+)
 @click.option("--ignore-cooldown", is_flag=True, help="Start even though a bot or rate-limit cooldown is active.")
 def run_command(  # noqa: PLR0913
     urls: tuple[str, ...],

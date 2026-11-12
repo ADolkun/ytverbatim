@@ -238,11 +238,12 @@ def render_markdown(report: Report) -> str:
         "",
         "## Speed and memory",
         "",
-        "| hypothesis | RTF (decode / file audio) | load s | MLX peak GB | max RSS GB |",
-        "|---|---|---|---|---|",
+        "| hypothesis | RTF (decode / file audio) | load s | peak footprint GB | MLX peak GB | max RSS GB |",
+        "|---|---|---|---|---|---|",
         *(
             f"| {h.hypothesis} | {_opt(h.speed.rtf, '.3f')} | {_opt(h.speed.load_s, '.1f')} "
-            f"| {_opt(_gb(h.speed.peak_memory_bytes), '.2f')} | {_opt(_gb(h.speed.max_rss_bytes), '.2f')} |"
+            f"| {_opt(_gb(h.speed.peak_footprint_bytes), '.2f')} | {_opt(_gb(h.speed.peak_memory_bytes), '.2f')} "
+            f"| {_opt(_gb(h.speed.max_rss_bytes), '.2f')} |"
             for h in screen.hypotheses
         ),
         "",
