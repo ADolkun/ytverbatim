@@ -1,0 +1,59 @@
+{
+ "wireMagic": "pb3",
+ "events": [
+  {
+   "tStartMs": 533,
+   "dDurationMs": 1013,
+   "segs": [
+    {
+     "utf8": "大家好 欢迎回来"
+    }
+   ]
+  },
+  {
+   "tStartMs": 2020,
+   "dDurationMs": 1222,
+   "segs": [
+    {
+     "utf8": "上次视频发布后"
+    }
+   ]
+  },
+  {
+   "tStartMs": 3323,
+   "dDurationMs": 2824,
+   "segs": [
+    {
+     "utf8": "有朋友关注到我嘴角上起了一个大泡"
+    }
+   ]
+  },
+  {
+   "tStartMs": 6307,
+   "dDurationMs": 1222,
+   "segs": [
+    {
+     "utf8": "提醒我注意健康"
+    }
+   ]
+  },
+  {
+   "tStartMs": 8370,
+   "dDurationMs": 1782,
+   "segs": [
+    {
+     "utf8": "谢谢大家的关心 今天"
+    }
+   ]
+  },
+  {
+   "tStartMs": 10232,
+   "dDurationMs": 1682,
+   "segs": [
+    {
+     "utf8": "随着账户的大涨"
+    }
+   ]
+  }
+ ]
+}
