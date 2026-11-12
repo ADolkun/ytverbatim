@@ -23,11 +23,11 @@ def test_ordinal_follows_di() -> None:
         ("一百五十期", "150期", "cjk_quantity"),
         ("二零二四年", "2024年", "cjk_quantity"),
         ("三十", "30", "cjk_quantity"),
-        ("两百块", "200块", "cjk_quantity"),
+        ("两百块", "200块", "currency"),
         ("兩百", "200", "cjk_quantity"),
         ("廿五", "25", "cjk_quantity"),
         ("三点五", "3.5", "cjk_quantity"),
-        ("三点五亿美元", "350000000美元", "cjk_quantity"),
+        ("三点五亿美元", "$350000000", "currency"),
         ("一个", "1个", "cjk_quantity"),
         ("五股", "5股", "cjk_quantity"),
         ("三个百分点", "3个百分点", "cjk_quantity"),
@@ -60,7 +60,7 @@ def test_unconvertible_run_keeps_its_surface() -> None:
         ("$1,500.50", "$1,500.50", "$1500.50", "currency"),
         ("200元", "200元", "200元", "currency"),
         ("3.5亿", "3.5亿", "350000000", "number"),
-        ("3万美元", "3万美元", "30000美元", "currency"),
+        ("3万美元", "3万美元", "$30000", "currency"),
         ("150期", "150期", "150期", "number"),
         ("3.5亿股", "3.5亿股", "350000000股", "number"),
     ],
@@ -107,13 +107,13 @@ def test_itn_rewrites_tokens_only() -> None:
 @pytest.mark.parametrize(
     ("text", "value"),
     [
-        ("2万亿美元", "2000000000000美元"),
-        ("两万亿美元", "2000000000000美元"),
+        ("2万亿美元", "$2000000000000"),
+        ("两万亿美元", "$2000000000000"),
         ("1.5万亿", "1500000000000"),
         ("一点五万亿", "1500000000000"),
         ("3.5亿", "350000000"),
         ("三点五亿", "350000000"),
-        ("2千万美元", "20000000美元"),
+        ("2千万美元", "$20000000"),
         ("5百万", "5000000"),
     ],
 )
@@ -198,3 +198,57 @@ def test_idioms_are_not_quantities(text: str) -> None:
 )
 def test_quantities_next_to_idiom_lookalikes_still_convert(text: str, value: str) -> None:
     assert itn(text) == value
+
+
+@pytest.mark.parametrize(
+    ("text", "surface", "value", "kind"),
+    [
+        ("$15 billion", "$15 billion", "$15000000000", "currency"),
+        ("15 billion", "15 billion", "15000000000", "number"),
+        ("$1.5B", "$1.5B", "$1500000000", "currency"),
+        ("2.5 Million", "2.5 Million", "2500000", "number"),
+        ("15K", "15K", "15000", "number"),
+        ("3bn", "3bn", "3000000000", "number"),
+        ("15 percent", "15 percent", "15%", "percent"),
+        ("15 dollars", "15 dollars", "$15", "currency"),
+        ("15 billion dollars", "15 billion dollars", "$15000000000", "currency"),
+    ],
+)
+def test_english_magnitudes_and_unit_words(text: str, surface: str, value: str, kind: str) -> None:
+    (token,) = quantity_tokens(text)
+    assert (token.surface, token.value_itn, token.kind) == (surface, value, kind)
+
+
+def test_dollar_amounts_agree_however_they_are_written() -> None:
+    values = {
+        quantity_tokens(text)[0].value_itn for text in ("$15", "15美元", "十五美元", "15 dollars", "fifteen dollars")
+    }
+    assert values == {"$15"}
+    assert quantity_tokens("$15 billion")[0].value_itn != quantity_tokens("$15 million")[0].value_itn
+
+
+def test_magnitude_words_need_a_word_boundary() -> None:
+    assert surfaces("15 millionaires and 15 percentage points") == ["15", "15"]
+
+
+@pytest.mark.parametrize(
+    ("text", "values"),
+    [
+        ("fifteen", ["15"]),
+        ("Twenty-five", ["25"]),
+        ("twenty five percent", ["25%"]),
+        ("two hundred and ten dollars", ["$210"]),
+        ("fifteen hundred", ["1500"]),
+        ("one million two hundred thousand", ["1200000"]),
+        ("nineteen ninety", ["19", "90"]),
+        ("five and six", ["5", "6"]),
+        ("one percent", ["1%"]),
+    ],
+)
+def test_spelled_out_english_numbers(text: str, values: list[str]) -> None:
+    assert [t.value_itn for t in quantity_tokens(text)] == values
+
+
+@pytest.mark.parametrize("text", ["no one knows", "one of them", "someone", "the tenant", "a million reasons"])
+def test_english_words_that_are_not_quantities(text: str) -> None:
+    assert quantity_tokens(text) == []

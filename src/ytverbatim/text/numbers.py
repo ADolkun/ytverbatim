@@ -1,4 +1,4 @@
-"""Quantity tokens: numbers, currency, percentages, tickers and Chinese numerals.
+"""Quantity tokens: numbers, currency, percentages, tickers, Chinese numerals and spelled-out English numbers.
 
 The patterns descend from the guards in ytscript's ``analyze/correct.py``. The Chinese rules are
 stricter than a plain numeral run, because many words contain numeral characters without being
@@ -7,7 +7,7 @@ quantities: idioms (``一样``, ``千万不要``, ``万一``), weekdays (``周�
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Literal
 
@@ -136,6 +136,46 @@ def _alternation(words: tuple[str, ...]) -> str:
     return "|".join(re.escape(w) for w in sorted(words, key=len, reverse=True))
 
 
+# The same dollar amount is written $15, 15 dollars or 15美元; all of them normalise to $15.
+_USD_WORDS = frozenset({"美元", "美金"})
+_EN_MAGNITUDE = {"thousand": 3, "million": 6, "billion": 9, "trillion": 12, "k": 3, "m": 6, "b": 9, "bn": 9}
+_EN_UNITS = dict(
+    zip(
+        [
+            "zero",
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "seven",
+            "eight",
+            "nine",
+            "ten",
+            "eleven",
+            "twelve",
+            "thirteen",
+            "fourteen",
+            "fifteen",
+            "sixteen",
+            "seventeen",
+            "eighteen",
+            "nineteen",
+        ],
+        range(20),
+        strict=True,
+    )
+)
+_EN_TENS = dict(
+    zip(["twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"], range(20, 100, 10), strict=True)
+)
+_EN_SCALES = {"thousand": 3, "million": 6, "billion": 9, "trillion": 12}
+_EN_NUMBER_WORD = _alternation((*_EN_UNITS, *_EN_TENS, "hundred", *_EN_SCALES))
+_NO_SCALE = 99
+_TEN, _HUNDRED = 10, 100
+_EN_PIECE = re.compile(rf"(?i:\b(?:{_EN_NUMBER_WORD}|and)\b)")
+
 _DIGIT = "[0-9０-９]"
 _NUMBER = rf"(?:{_DIGIT}+(?:,{_DIGIT}{{3}})*(?:\.{_DIGIT}+)?|\.{_DIGIT}+)"
 _NO_ALNUM_BEFORE = r"(?<![A-Za-z0-9])"
@@ -154,8 +194,12 @@ _TOKEN = re.compile(
             rf"(?P<numeric_ticker>{_NO_ALNUM_BEFORE}\d{{2,}}\.[A-Z]{{2,}}{_NO_ALNUM_AFTER})",
             rf"(?P<symbol>{_NO_ALNUM_BEFORE}[A-Z][A-Z0-9]+(?:\.[A-Z]+)?{_NO_ALNUM_AFTER})",
             rf"(?P<number>{_NO_ALNUM_BEFORE}(?P<sign>[-+−])?(?P<currency>[$¥€£])?(?P<sign2>[-+−])?"
-            rf"(?P<digits>{_NUMBER})(?:(?P<percent> ?[%％])"
+            rf"(?P<digits>{_NUMBER})"
+            r"(?P<en_magnitude>\s?(?i:thousand|million|billion|trillion)\b|(?:[Kk]|M|B|bn)(?![A-Za-z0-9]))?"
+            r"(?:(?P<percent> ?[%％]|\s?(?i:percent)\b)|(?P<dollars>\s?(?i:dollars?)\b)"
             rf"|(?P<magnitude>[百千][万亿萬億]*|[万亿萬億]+)?(?P<measure>{_alternation(_MEASURE_WORDS)})?))",
+            rf"(?P<spelled>(?<![A-Za-z0-9-])(?i:{_EN_NUMBER_WORD})(?:(?:[ -]|\s+and\s+)(?i:{_EN_NUMBER_WORD}))*"
+            r"(?![A-Za-z0-9-]))(?P<spelled_unit>\s+(?i:percent|dollars?)\b)?",
         )
     )
 )
@@ -244,22 +288,123 @@ def _cjk_token(match: re.Match[str]) -> QToken | None:
         itn = match.group(0)
     elif percent:
         itn = f"{value}%{unit}"
+    elif unit in _USD_WORDS:
+        itn = f"{'第' if ordinal else ''}${value}"
     else:
         itn = f"{'第' if ordinal else ''}{value}{unit}"
-    return QToken(match.start(), match.end(), match.group(0), itn, "percent" if percent else "cjk_quantity")
+    kind: QKind = "percent" if percent else "currency" if unit in _CURRENCY_WORDS else "cjk_quantity"
+    return QToken(match.start(), match.end(), match.group(0), itn, kind)
 
 
 def _number_token(match: re.Match[str]) -> QToken:
     digits = _ascii_digits(match.group("digits"))
     magnitude, percent = match.group("magnitude"), match.group("percent")
-    if magnitude:
-        digits = _plain(Decimal(digits) * Decimal(10) ** sum(_MAGNITUDE[ch] for ch in magnitude))
+    en_magnitude = (match.group("en_magnitude") or "").strip().casefold()
+    exponent = sum(_MAGNITUDE[ch] for ch in magnitude or "") + _EN_MAGNITUDE.get(en_magnitude, 0)
+    if exponent:
+        digits = _plain(Decimal(digits) * Decimal(10) ** exponent)
     sign = (match.group("sign") or match.group("sign2") or "").replace("−", "-")
     symbol = match.group("currency") or ""
     measure = match.group("measure") or ""
+    if match.group("dollars") or measure in _USD_WORDS:
+        symbol = symbol or "$"
+        measure = "" if measure in _USD_WORDS else measure
     itn = f"{sign}{symbol}{digits}{'%' if percent else ''}{measure}"
     kind: QKind = "percent" if percent else "currency" if symbol or measure in _CURRENCY_WORDS else "number"
     return QToken(match.start(), match.end(), match.group(0), itn, kind)
+
+
+def _spelled_tokens(match: re.Match[str]) -> list[QToken]:
+    """Split a run of English number words into numbers and convert each: fifteen, twenty-five, two hundred and ten.
+
+    Words that cannot continue the current number start the next one, so nineteen ninety is two numbers. A lone
+    "one" is a pronoun or determiner far more often than a quantity (no one, one of them), so it counts only with a
+    unit after it.
+    """
+    groups = _spelled_groups(
+        [(piece[0].casefold(), piece.start(), piece.end()) for piece in _EN_PIECE.finditer(match.group("spelled"))]
+    )
+    offset = match.start()
+    unit = match.group("spelled_unit")
+    tokens: list[QToken] = []
+    for number, group in enumerate(groups):
+        # The unit belongs to the last number only, and only when no word was dropped between them.
+        last = number == len(groups) - 1 and group.end == len(match.group("spelled"))
+        suffix = (unit or "").strip().casefold() if last else ""
+        if group.words == ["one"] and not suffix:
+            continue
+        stop = match.end() if suffix else offset + group.end
+        kind: QKind
+        if suffix == "percent":
+            itn, kind = f"{group.value}%", "percent"
+        elif suffix:
+            itn, kind = f"${group.value}", "currency"
+        else:
+            itn, kind = str(group.value), "number"
+        tokens.append(QToken(offset + group.start, stop, match.string[offset + group.start : stop], itn, kind))
+    return tokens
+
+
+@dataclass
+class _SpelledNumber:
+    start: int
+    end: int = 0
+    total: int = 0
+    current: int = 0
+    scale: int = _NO_SCALE
+    last: str = ""
+    words: list[str] = field(default_factory=list[str])
+
+    def accepts(self, word: str) -> bool:
+        if word in _EN_UNITS or word in _EN_TENS:
+            if self.last == "tens":
+                return 0 < _EN_UNITS.get(word, 0) < _TEN
+            return self.last in ("hundred", "scale", "and")
+        if word == "hundred":
+            return self.last in ("unit", "tens") and self.current < _HUNDRED
+        return self.last in ("unit", "tens", "hundred") and _EN_SCALES[word] < self.scale
+
+    def add(self, word: str, end: int) -> None:
+        self.words.append(word)
+        self.end = end
+        if word == "hundred":
+            self.current *= _HUNDRED
+            self.last = "hundred"
+        elif word in _EN_SCALES:
+            self.scale = _EN_SCALES[word]
+            self.total += self.current * 10**self.scale
+            self.current = 0
+            self.last = "scale"
+        else:
+            self.current += _EN_UNITS.get(word, 0) + _EN_TENS.get(word, 0)
+            self.last = "tens" if word in _EN_TENS else "unit"
+
+    @property
+    def value(self) -> int:
+        return self.total + self.current
+
+
+def _spelled_groups(pieces: list[tuple[str, int, int]]) -> list[_SpelledNumber]:
+    """Group number words into numbers; ``and`` only joins a hundred or a scale to the words after it."""
+    groups: list[_SpelledNumber] = []
+    group: _SpelledNumber | None = None
+    for word, start, end in pieces:
+        if word == "and":
+            if group is not None and group.last in ("hundred", "scale"):
+                group.last = "and"
+            else:
+                group = None
+            continue
+        if group is not None and group.accepts(word):
+            group.add(word, end)
+            continue
+        if word in _EN_UNITS or word in _EN_TENS:
+            group = _SpelledNumber(start)
+            group.add(word, end)
+            groups.append(group)
+        else:
+            group = None
+    return groups
 
 
 def quantity_tokens(text: str) -> list[QToken]:
@@ -268,7 +413,10 @@ def quantity_tokens(text: str) -> list[QToken]:
     A Chinese numeral run is a quantity only when it has two or more numeral characters, is
     attached to a measure word, or follows ``第``, and is neither an idiom nor a range of bare
     digits. ``value_itn`` is the inverse text normalization of the token: ``一百五十期`` becomes
-    ``150期``, ``3.5亿`` becomes ``350000000`` and ``2万亿`` becomes ``2000000000000``.
+    ``150期``, ``3.5亿`` becomes ``350000000`` and ``2万亿`` becomes ``2000000000000``. English
+    magnitudes scale the same way (``$1.5 billion`` and ``$1.5B`` become ``$1500000000``), a
+    dollar amount is ``$`` however it is written (``15 dollars``, ``15美元``), ``15 percent`` is
+    ``15%``, and spelled-out numbers convert (``twenty-five`` is ``25``).
     """
     tokens: list[QToken] = []
     for match in _TOKEN.finditer(text):
@@ -280,6 +428,8 @@ def quantity_tokens(text: str) -> list[QToken]:
                 tokens.append(token)
         elif match.group("number") is not None:
             tokens.append(_number_token(match))
+        elif match.group("spelled") is not None:
+            tokens.extend(_spelled_tokens(match))
         else:
             surface = match.group(0)
             tokens.append(QToken(match.start(), match.end(), surface, surface, "ticker"))

@@ -1,6 +1,6 @@
 import pytest
 
-from ytverbatim.text.guards import EntityChange, check_fix, symbol_changes
+from ytverbatim.text.guards import EntityChange, check_fix, check_numeric_fix, symbol_changes
 
 
 def rejected_by(original: str, fixed: str) -> str | None:
@@ -234,3 +234,34 @@ def test_symbol_changes_point_into_the_corrected_text() -> None:
 def test_symbol_changes_refuse_a_changed_count() -> None:
     with pytest.raises(ValueError, match="symbol count"):
         symbol_changes("NVDA and AMD", "NVDA")
+
+
+@pytest.mark.parametrize(
+    ("original", "fixed", "suspects"),
+    [
+        ("这只股票上周涨了十五个百分点，非常强劲", "这只股票上周涨了五十个百分点，非常强劲", ["十五个百分点"]),
+        ("一共是一百五十期", "一共是160期", ["一百五十期"]),
+        ("Margins hit 15% this year", "Margins hit 50% this year", ["15%"]),
+        ("watch NVDL and 20%", "watch NVDA and 20%", ["NVDL"]),
+    ],
+)
+def test_numeric_fix_confined_to_the_flagged_tokens_is_accepted(original: str, fixed: str, suspects: list[str]) -> None:
+    assert check_numeric_fix(original, fixed, suspects)
+
+
+@pytest.mark.parametrize(
+    ("original", "fixed", "suspects"),
+    [
+        ("营收增长了20%", "营收增长了20%", ["20%"]),
+        ("营收增长了20%", "", ["20%"]),
+        ("他说一共是一百五十期的数据", "他说一共是150天的数据", ["一百五十期"]),
+        ("营收增长了20%，利润增长了30%", "营收增长了25%，利润增长了35%", ["20%"]),
+        ("一百五十", "150", ["一百五十"]),
+        ("营收是15", "营收是15" + "0" * 30, ["15"]),
+    ],
+    ids=["echo", "empty", "prose", "unflagged-token", "cjk-dropped", "balloon"],
+)
+def test_numeric_fix_that_reaches_beyond_the_flagged_tokens_is_rejected(
+    original: str, fixed: str, suspects: list[str]
+) -> None:
+    assert not check_numeric_fix(original, fixed, suspects)
