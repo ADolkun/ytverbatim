@@ -38,6 +38,14 @@ def auth_source_file() -> Path:
     return auth_dir() / "source.json"
 
 
+def preflight_cache_file() -> Path:
+    return auth_dir() / "preflight.json"
+
+
+def cooldown_file() -> Path:
+    return auth_dir() / "cooldown.json"
+
+
 def snapshots_dir() -> Path:
     return _private(auth_dir() / "snapshots")
 

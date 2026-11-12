@@ -9,6 +9,7 @@ from ytverbatim import __version__
 # Subcommand name -> "module:attribute". Modules are imported on first use so a heavy
 # subcommand never slows down (or breaks) the others.
 LAZY_COMMANDS: Mapping[str, str] = {
+    "auth": "ytverbatim.cli.auth:auth",
     "llm": "ytverbatim.cli.llm:llm",
 }
 
