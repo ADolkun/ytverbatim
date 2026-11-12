@@ -386,6 +386,7 @@ def test_cli_llm_spec_reaches_the_pipeline(session_kit, worker, monkeypatch) -> 
         return llm
 
     monkeypatch.setattr(pipeline, "client_from_options", client_from_options)
+    monkeypatch.setattr(pipeline, "check_ready", lambda _options: None)
     result = invoke(session_kit, zh_yt(session_kit), monkeypatch, ZH, "--llm", "claude-cli:claude-sonnet-5-5")
     assert result.exit_code == 0, result.output
     assert (built[0].provider, built[0].model) == ("claude-cli", "claude-sonnet-5-5")
