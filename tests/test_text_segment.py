@@ -1,7 +1,9 @@
+import time
 from collections.abc import Sequence
 
 import pytest
 
+from ytverbatim.contract import Word
 from ytverbatim.text import segment as seg
 from ytverbatim.text.segment import Token
 
@@ -320,3 +322,151 @@ def test_a_stray_period_before_a_lowercase_word_does_not_hide_an_unpunctuated_st
     stretch = "hello everyone see example.com today. " + " ".join(f"word{n}" for n in range(60))
     parts = chunk_level(f"{EN_FILLER}{stretch}", "en")
     assert all(len(part.split()) <= 25 for part in parts[5:])
+
+
+def pieces_of(parts: Sequence[str], *, step: float = 0.5, first: float = 10.0) -> list[Word]:
+    return [Word(text=part, start=first + i * step, end=first + (i + 1) * step) for i, part in enumerate(parts)]
+
+
+def align(text: str, parts: Sequence[str], language: str) -> tuple[list[Token], bool]:
+    words = pieces_of(parts)
+    return seg.aligned_tokens(text, words, 9.0, 10.0 + len(words), language=language)
+
+
+def timing(tokens: Sequence[Token]) -> list[tuple[str, bool]]:
+    return [(token.text, token.timed) for token in tokens]
+
+
+def test_zh_a_ticker_split_into_pieces_is_one_timed_token() -> None:
+    text = "好，那我们看一下XLP的位置。"
+    tokens, complete = align(text, ["好，", "那", "我们", "看一下", "X", "LP", "的", "位", "置。"], "zh")
+    assert complete
+    assert timing(tokens) == [
+        ("好，", True),
+        ("那", True),
+        ("我们", True),
+        ("看一下", True),
+        ("XLP", True),
+        ("的", True),
+        ("位", True),
+        ("置。", True),
+    ]
+    ticker = tokens[4]
+    assert (ticker.start, ticker.end) == (12.0, 13.0)
+
+
+def test_zh_a_name_split_into_three_pieces_is_one_timed_token() -> None:
+    tokens, complete = align("他说Ryno很强", ["他", "说", "R", "y", "no", "很", "强"], "zh")
+    assert complete
+    assert timing(tokens) == [("他", True), ("说", True), ("Ryno", True), ("很", True), ("强", True)]
+    assert (tokens[2].start, tokens[2].end) == (11.0, 12.5)
+
+
+def test_zh_a_decimal_split_around_its_point_is_one_timed_token() -> None:
+    tokens, complete = align("成交171.6万手", ["成", "交", "17", "1.", "6", "万", "手"], "zh")
+    assert complete
+    assert timing(tokens) == [("成", True), ("交", True), ("171.6", True), ("万", True), ("手", True)]
+    assert (tokens[2].start, tokens[2].end) == (11.0, 12.5)
+
+
+def test_zh_a_ticker_never_absorbs_the_characters_next_to_it() -> None:
+    tokens, complete = align("QQQ的走势", ["QQ", "Q", "的", "走", "势"], "zh")
+    assert complete
+    assert timing(tokens) == [("QQQ", True), ("的", True), ("走", True), ("势", True)]
+
+
+def test_zh_pieces_keep_the_lowest_confidence() -> None:
+    words = [Word(text="X", start=1.0, end=1.5, conf=0.9), Word(text="LP", start=1.5, end=2.0, conf=0.4)]
+    (token,), complete = seg.aligned_tokens("XLP", words, 0.0, 3.0, language="zh")
+    assert complete and token.conf == 0.4
+
+
+def test_en_pieces_of_one_word_join_across_the_text_gap_the_engine_ignored() -> None:
+    tokens, complete = align("ETF SOXX", ["ETF", " SO", "XX"], "en")
+    assert complete
+    assert timing(tokens) == [("ETF", True), (" SOXX", True)]
+    assert (tokens[1].start, tokens[1].end) == (10.5, 11.5)
+
+
+def test_en_a_word_the_text_splits_differently_still_matches() -> None:
+    tokens, complete = align("SO XX rose", ["SOXX", " rose"], "en")
+    assert complete
+    assert timing(tokens) == [("SO XX", True), (" rose", True)]
+
+
+def test_en_whole_words_keep_their_own_tokens_and_times() -> None:
+    parts = [" Hello", " there,", " big", " world."]
+    tokens, complete = align("Hello there, big world.", parts, "en")
+    assert complete
+    assert timing(tokens) == [("Hello", True), (" there,", True), (" big", True), (" world.", True)]
+    assert [token.start for token in tokens] == [10.0, 10.5, 11.0, 11.5]
+
+
+def test_en_a_contraction_matches_whole_or_in_two_pieces() -> None:
+    expected = [("I", True), (" can't", True), (" go.", True)]
+    whole, complete = align("I can't go.", [" I", " can't", " go."], "en")
+    assert complete and timing(whole) == expected
+    split, complete = align("I can't go.", [" I", " can", "'t", " go."], "en")
+    assert complete and timing(split) == expected
+    assert (split[1].start, split[1].end) == (10.5, 11.5)
+
+
+def test_en_a_thousands_number_in_one_word_or_in_pieces_matches() -> None:
+    whole, complete = align("It costs 1,500 dollars.", [" It", " costs", " 1,500", " dollars."], "en")
+    assert complete and timing(whole)[2] == (" 1,500", True)
+    split, complete = align("It costs 1,500 dollars.", [" It", " costs", " 1", ",", "500", " dollars."], "en")
+    assert complete and timing(split)[2] == (" 1,500", True)
+    assert (split[2].start, split[2].end) == (11.0, 12.5)
+
+
+def test_en_dotted_abbreviations_match_as_one_word() -> None:
+    tokens, complete = align("The U.S. economy grew.", [" The", " U.S.", " economy", " grew."], "en")
+    assert complete
+    assert timing(tokens) == [("The", True), (" U.S.", True), (" economy", True), (" grew.", True)]
+
+
+def test_a_sentence_end_between_pieces_does_not_join_them() -> None:
+    tokens, complete = align("It ended. Next began.", [" It", " ended", ".", " Next", " began."], "en")
+    assert complete
+    assert timing(tokens) == [("It", True), (" ended.", True), (" Next", True), (" began.", True)]
+
+
+def test_a_misheard_word_stays_untimed_and_leaves_its_neighbours_alone() -> None:
+    tokens, complete = align("I saw Ryno today", [" I", " saw", " Rhino", " today"], "en")
+    assert not complete
+    assert timing(tokens) == [("I", True), (" saw", True), (" Ryno", False), (" today", True)]
+    assert [(token.start, token.end) for token in tokens if token.timed] == [(10.0, 10.5), (10.5, 11.0), (11.5, 12.0)]
+    # The untimed word is spread over the gap between the timed words around it.
+    assert (tokens[2].start, tokens[2].end) == (11.0, 11.5)
+
+
+def test_zh_a_misheard_name_does_not_take_characters_from_its_neighbours() -> None:
+    tokens, complete = align("他说Ryno很强", ["他", "说", "Rhino", "很", "强"], "zh")
+    assert not complete
+    assert timing(tokens) == [("他", True), ("说", True), ("Ryno", False), ("很", True), ("强", True)]
+
+
+def test_repeated_letters_are_claimed_by_one_word_only() -> None:
+    tokens, complete = align("QQQ QQQ", ["QQQ"], "en")
+    assert not complete
+    assert timing(tokens) == [("QQQ", True), (" QQQ", False)]
+
+    tokens, complete = align("QQQ", ["QQ", "QQ"], "en")
+    assert not complete
+    assert timing(tokens) == [("QQ", True), ("Q", False)]
+
+
+def test_text_without_a_matching_word_is_not_timed() -> None:
+    tokens, complete = align("今天看XLP", ["今", "天", "看"], "zh")
+    assert not complete
+    assert timing(tokens) == [("今", True), ("天", True), ("看", True), ("XLP", False)]
+
+
+def test_alignment_of_a_long_text_stays_fast() -> None:
+    text = " ".join(f"word{i % 97} and number {i}." for i in range(1000))
+    parts = [f" {piece}" for piece in text.split()]
+    words = pieces_of(parts, step=0.1)
+    started = time.perf_counter()
+    tokens, complete = seg.aligned_tokens(text, words, 0.0, 1e6, language="en")
+    assert complete and all(token.timed for token in tokens)
+    assert time.perf_counter() - started < 2.0

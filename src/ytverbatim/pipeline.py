@@ -88,7 +88,7 @@ _PIPELINE_VERSIONS: dict[str, int] = {
     "punctuate": 2,
     "correct": 1,
     "numeric": 1,
-    "context": 2,
+    "context": 3,
 }
 _GLOSSARY_MAX_TERMS = 20
 

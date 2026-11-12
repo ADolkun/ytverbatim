@@ -132,6 +132,29 @@ def test_a_corrected_word_is_interpolated_while_the_rest_keeps_engine_times() ->
     assert any("did not cover" in w for w in doc.quality.warnings)
 
 
+def test_latin_and_digit_pieces_the_engine_split_keep_their_times_without_interpolation() -> None:
+    pieces = ["好，", "看", "X", "LP", "的", "位", "置。", "成", "交", "17", "1.", "6", "万"]
+    words = tuple(Word(text=p, start=1.0 + i, end=1.5 + i) for i, p in enumerate(pieces))
+    source = source_of([row("好，看XLP的位置。成交171.6万", 0.0, 20.0, words)])
+    stored = [word.text for stretch in source.stretches for word in stretch.words]
+    assert stored == ["好，", "看", "XLP", "的", "位", "置。", "成", "交", "171.6", "万"]
+
+    doc = document(source, source.stretches)
+    assert flagged(doc) == []
+    assert not any("did not cover" in w for w in doc.quality.warnings)
+    timed = {w.text: (w.start, w.end) for segment in doc.segments for w in segment.words or ()}
+    assert timed["XLP"] == (3.0, 4.5)
+    assert timed["171.6"] == (10.0, 12.5)
+
+
+def test_text_the_engine_never_timed_is_still_interpolated_and_flagged() -> None:
+    words = tuple(Word(text=p, start=1.0 + i, end=1.5 + i) for i, p in enumerate(["好", "看", "的", "位", "置"]))
+    source = source_of([row("好看XLP的位置", 0.0, 10.0, words)])
+    doc = document(source, source.stretches)
+    assert flagged(doc) == [(0, "timing_interpolated", "好看XLP的位置")]
+    assert any("did not cover" in w for w in doc.quality.warnings)
+
+
 def test_numeric_edits_after_punctuation_land_in_the_final_text() -> None:
     source = source_of([row("营收增长了十五个百分点 利润也不错", 0.0, 6.0)])
     (stretch,) = source.stretches
