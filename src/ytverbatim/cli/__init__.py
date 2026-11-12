@@ -8,7 +8,9 @@ from ytverbatim import __version__
 
 # Subcommand name -> "module:attribute". Modules are imported on first use so a heavy
 # subcommand never slows down (or breaks) the others.
-LAZY_COMMANDS: Mapping[str, str] = {}
+LAZY_COMMANDS: Mapping[str, str] = {
+    "llm": "ytverbatim.cli.llm:llm",
+}
 
 
 class LazyGroup(click.Group):
