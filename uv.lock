@@ -1053,6 +1053,7 @@ whisper = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "numpy" },
     { name = "pyrefly" },
     { name = "pytest" },
     { name = "ruff" },
@@ -1077,6 +1078,7 @@ provides-extras = ["asr", "whisper"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "numpy" },
     { name = "pyrefly" },
     { name = "pytest" },
     { name = "ruff" },
