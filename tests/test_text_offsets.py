@@ -44,3 +44,9 @@ def test_changed_runs_are_whole_words_and_cjk_characters() -> None:
     assert changed_runs("适应率很高", "市盈率很高") == [ChangedRun(0, 2, "适应", "市盈")]
     assert changed_runs("大家好 欢迎", "大家好，欢迎。") == [ChangedRun(3, 4, " ", "，"), ChangedRun(6, 7, "", "。")]
     assert changed_runs("same", "same") == []
+
+
+def test_rare_cjk_characters_are_units_of_their_own() -> None:
+    # U+3400 (Extension A), U+F900 (compatibility) and U+20000 (Extension B) next to Latin letters.
+    assert changed_runs("a\u3400b", "a\u3400c") == [ChangedRun(2, 3, "b", "c")]
+    assert changed_runs("x\uf900\U00020000", "x\uf900\U00020001") == [ChangedRun(2, 3, "\U00020000", "\U00020001")]

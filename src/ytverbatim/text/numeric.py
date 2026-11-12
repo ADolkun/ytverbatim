@@ -46,8 +46,8 @@ from ytverbatim.text.numbers import QToken, quantity_tokens
 
 _log = logging.getLogger(__name__)
 
-# Part of every checkpoint key: bump it when the prompt changes meaning so cached verdicts are not reused.
-PROMPT_VERSION = "numeric-v1"
+# Part of every checkpoint and stage key: bump it on any prompt, guard or logic change so stored results are redone.
+PROMPT_VERSION = "numeric-v2"
 STAGE = "numeric"
 BATCH_SIZE = 8
 # Whisper word probability below which a span heard by one source only is also flagged `low_confidence`.
@@ -181,6 +181,13 @@ class _Verdicts(BaseModel):
     verdicts: list[_Verdict]
 
 
+class _Checkpoint(BaseModel):
+    """A batch's verdicts and what they cost, so a reused batch still counts toward the document's LLM usage."""
+
+    reply: _Verdicts
+    usage: tuple[LLMUsage, ...]
+
+
 @dataclass(frozen=True, slots=True)
 class _Unit:
     """An alignment unit: a whole quantity token, a CJK character or a Latin word. Offsets index the cleaned text."""
@@ -289,9 +296,9 @@ def verify_numbers(
     units: list[list[_Unit]] = []
     spans: list[dict[int, _Span]] = []
     for index, segment in enumerate(segments):
-        clean, offsets = _clean(segment.text)
+        clean, origins = _clean(segment.text)
         units.append(_units(clean))
-        spans.append(_segment_spans(index, segment, units[-1], offsets, evidence.primary))
+        spans.append(_segment_spans(index, segment, units[-1], origins, evidence.primary))
     pairs, _ = _claim(words, segments, units)
     for pair in pairs:
         spans[pair.segment][pair.mine].confidence = words.confs[pair.theirs]
@@ -317,7 +324,8 @@ def verify_numbers(
             disputed,
             segments,
             language=language,
-            client=meter.metered(STAGE, client),
+            client=client,
+            meter=meter,
             checkpoint_dir=checkpoint_dir,
         )
     texts, edits, flags, fixed = _apply(segments, ordered, decisions, client_id=client.id if client else None)
@@ -508,13 +516,13 @@ def _mostly_cjk(text: str) -> bool:
 
 
 def _segment_spans(
-    index: int, segment: TimedText, units: list[_Unit], offsets: list[int], primary: str
+    index: int, segment: TimedText, units: list[_Unit], origins: list[int], primary: str
 ) -> dict[int, _Span]:
     spans: dict[int, _Span] = {}
     for k, unit in enumerate(units):
         if unit.token is None:
             continue
-        start, end = offsets[unit.start], offsets[unit.end - 1] + 1
+        start, end = origins[unit.start], origins[unit.end - 1] + 1
         surface = segment.text[start:end]
         spans[k] = _Span(index, start, end, surface, [Reading(source=primary, text=surface)], [unit.token], [True])
     return spans
@@ -599,6 +607,7 @@ def _decide(
     *,
     language: str,
     client: LLMClient,
+    meter: UsageMeter,
     checkpoint_dir: Path,
 ) -> dict[int, _Decision]:
     """Decide each disputed span (keyed by its id in ``disputed``) with batched LLM verdicts."""
@@ -606,7 +615,7 @@ def _decide(
     for first in range(0, len(disputed), BATCH_SIZE):
         batch = disputed[first : first + BATCH_SIZE]
         user = _prompt(batch, segments, language)
-        reply = _verdicts(client, user, checkpoint_dir, expected=len(batch))
+        reply = _verdicts(client, meter, user, checkpoint_dir, expected=len(batch))
         verdicts: dict[int, _Verdict] = {}
         if reply is not None:
             for verdict in reply.verdicts:
@@ -640,7 +649,9 @@ def _prompt(batch: list[_Span], segments: Sequence[TimedText], language: str) ->
     )
 
 
-def _verdicts(client: LLMClient, user: str, checkpoint_dir: Path, *, expected: int) -> _Verdicts | None:
+def _verdicts(
+    client: LLMClient, meter: UsageMeter, user: str, checkpoint_dir: Path, *, expected: int
+) -> _Verdicts | None:
     """One batch's validated verdicts, from the checkpoint when present; None when the reply stayed malformed.
 
     Only a reply with a verdict for each of the ``expected`` items is checkpointed, so a later run asks again for the
@@ -650,22 +661,28 @@ def _verdicts(client: LLMClient, user: str, checkpoint_dir: Path, *, expected: i
     path = checkpoint_dir / f"{hashlib.sha256(key.encode()).hexdigest()}.json"
     if path.exists():
         try:
-            return _Verdicts.model_validate_json(path.read_bytes())
+            checkpoint = _Checkpoint.model_validate_json(path.read_bytes())
         except ValidationError:
             # Only this module writes these files, atomically; an unreadable one is stale, and redoing it is safe.
             _log.warning("numeric: ignoring an unreadable checkpoint %s", path.name)
+        else:
+            meter.merge(checkpoint.usage)
+            return checkpoint.reply
     request = LLMRequest(system=_SYSTEM, user=user, max_output_tokens=_MAX_OUTPUT_TOKENS, temperature=0.0)
+    batch = UsageMeter()
     try:
-        verdicts = complete_json(client, request, _Verdicts)
+        verdicts = complete_json(batch.metered(STAGE, client), request, _Verdicts)
     except LLMOutputError as exc:
         # Not checkpointed, so a later run asks again.
         _log.warning("numeric: no usable verdicts for a batch, flagging it instead: %s", exc)
         return None
+    finally:
+        meter.merge(batch.summary())
     if not set(range(expected)) <= {verdict.id for verdict in verdicts.verdicts}:
         _log.warning("numeric: a batch reply skipped some items; using it without a checkpoint")
         return verdicts
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    atomic.write_json(path, verdicts.model_dump())
+    atomic.write_json(path, _Checkpoint(reply=verdicts, usage=batch.summary()).model_dump(mode="json"))
     return verdicts
 
 
