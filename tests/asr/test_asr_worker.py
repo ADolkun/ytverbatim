@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 from fake_engine import RATE, definition, write_silence
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
 from ytverbatim.asr import worker
 from ytverbatim.asr.chunks import Chunk, Region
@@ -142,27 +142,21 @@ def test_resume_refuses_another_hypothesis_and_corrupt_lines(tmp_path: Path, wav
 
 
 @pytest.mark.parametrize(
-    ("change", "field"),
+    ("update", "job_update", "field"),
     [
-        ({"engine": definition(calls_log="elsewhere")}, "engine"),
-        ({"quality_guard": False}, "quality_guard"),
-        ({"language": "zh"}, "files"),
-        ({"context": AsrContext(system_prompt="other")}, "files"),
+        ({"engine": definition(calls_log="elsewhere")}, {}, "engine"),
+        ({"quality_guard": False}, {}, "quality_guard"),
+        ({}, {"language": "zh"}, "files"),
+        ({}, {"context": AsrContext(system_prompt="other")}, "files"),
     ],
 )
 def test_resume_refuses_a_request_that_differs_beyond_the_output_location(
-    tmp_path: Path, wav: Path, change: dict[str, object], field: str
+    tmp_path: Path, wav: Path, update: dict[str, object], job_update: dict[str, object], field: str
 ) -> None:
     job = FileJob(id="f1", wav=str(wav), language="en", chunks=(Chunk(0.0, 2.0),))
     worker.run_request(request(tmp_path, job))
     before = (tmp_path / "out" / HYPOTHESES_FILE).read_bytes()
-    job_change = {k: v for k, v in change.items() if k in ("language", "context")}
-    changed = WorkerRequest(
-        engine=change.get("engine", definition()),  # type: ignore[arg-type]
-        out_dir=str(tmp_path / "out"),
-        files=(job.model_copy(update=job_change),),
-        quality_guard=change.get("quality_guard", True),  # type: ignore[arg-type]
-    )
+    changed = request(tmp_path, job.model_copy(update=job_update)).model_copy(update=update)
     with pytest.raises(EngineError, match=rf"\({field} changed\).*fresh output directory"):
         worker.run_request(changed)
     assert (tmp_path / "out" / HYPOTHESES_FILE).read_bytes() == before
@@ -201,11 +195,11 @@ def test_the_language_policy_decides_what_the_engine_hears(tmp_path: Path, wav: 
 
 
 @pytest.mark.parametrize("policy", [None, "detect", True])
-def test_a_request_without_a_valid_language_policy_is_refused(tmp_path: Path, wav: Path, policy: object) -> None:
-    spec = definition().spec
-    variant = {} if policy is None else {"language": policy}
+def test_a_request_without_a_valid_language_policy_is_refused(tmp_path: Path, wav: Path, policy: JsonValue) -> None:
+    variant: dict[str, JsonValue] = {} if policy is None else {"language": policy}
+    engine = EngineDef(definition().spec, "fake_engine.create", variant)
     with pytest.raises(ValidationError, match="'auto' or 'pass'"):
-        request(tmp_path, FileJob(id="f1", wav=str(wav)), engine=EngineDef(spec, "fake_engine.create", variant))  # type: ignore[arg-type]
+        request(tmp_path, FileJob(id="f1", wav=str(wav)), engine=engine)
 
 
 def _renamed(spec: EngineSpec) -> EngineSpec:
