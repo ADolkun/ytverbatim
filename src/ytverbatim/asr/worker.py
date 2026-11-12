@@ -17,6 +17,7 @@ from typing import Protocol, cast
 from ytverbatim import atomic
 from ytverbatim.asr.audio import Audio, frame_energy, load_wav
 from ytverbatim.asr.chunks import Chunk, plan_chunks
+from ytverbatim.asr.guard import QualityGuard
 from ytverbatim.asr.models import (
     ERROR_FILE,
     HYPOTHESES_FILE,
@@ -216,7 +217,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # huggingface_hub reads this when it is first imported, which only happens inside an adapter.
         os.environ["HF_HUB_CACHE"] = request.hf_hub_cache
     try:
-        run_request(request)
+        run_request(request, guard=QualityGuard() if request.quality_guard else None)
     except Exception as exc:
         error = WorkerError(type=type(exc).__name__, message=str(exc), traceback=traceback.format_exc())
         out = Path(request.out_dir)
