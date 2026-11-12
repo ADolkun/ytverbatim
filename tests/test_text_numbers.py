@@ -134,6 +134,9 @@ def test_stacked_magnitudes_are_one_multiplier(text: str, value: str) -> None:
         ("五百亿一", "50010000000"),
         ("十亿五", "1050000000"),
         ("两万亿五", "2500000000000"),
+        ("一億五", "150000000"),
+        ("一萬億五", "1500000000000"),
+        ("廿亿五", "2050000000"),
         ("一万亿五", "1500000000000"),
         ("三亿五美元", "$350000000"),
         ("三亿零五", "300000005"),
@@ -149,6 +152,8 @@ def test_stacked_magnitudes_are_one_multiplier(text: str, value: str) -> None:
         ("二十五万三", "253000"),
         ("一点五亿", "150000000"),
         ("十点五万亿", "10500000000000"),
+        # cn2an reads a decimal after its own 万 shorthand; deferred to a later numerals unit with a stage bump.
+        ("一万五点五", "15000.5"),
     ],
 )
 def test_chinese_shorthand_and_compound_numerals(text: str, value: str) -> None:
@@ -158,12 +163,43 @@ def test_chinese_shorthand_and_compound_numerals(text: str, value: str) -> None:
 
 @pytest.mark.parametrize(
     "text",
-    ["七十六十五", "十六十四", "六十六十六", "七百九十九十七", "一万十五", "零十五", "亿三", "一亿亿五", "三亿二亿"],
+    [
+        "七十六十五",
+        "十六十四",
+        "六十六十六",
+        "七百九十九十七",
+        "一万十五",
+        "零十五",
+        "亿三",
+        "一亿亿五",
+        "三亿二亿",
+        "一亿两",
+        "一亿五点五",
+        "一亿五点五万",
+        "一亿五点五亿",
+    ],
 )
 def test_runs_that_are_not_one_number_keep_their_surface(text: str) -> None:
     (token,) = quantity_tokens(text)
     assert (token.surface, token.value_itn) == (text, text)
     assert itn(f"约{text}左右") == f"约{text}左右"
+
+
+# 一万亿 reads as 万亿 and 一万万亿 is no number, so a head with 万 only pairs with 亿 when 万 is not last.
+_SHORTHAND_CASES = [
+    (head, unit, exponent)
+    for head in ["一", "三", "十", "十一", "二十", "五百", "一千", "两千", "一万", "三万五千"]
+    for unit, exponent in [("亿", 8), ("万亿", 12)]
+    if not ((unit == "亿" and head.endswith("万")) or (unit == "万亿" and "万" in head))
+]
+
+
+@pytest.mark.parametrize(("head", "unit", "exponent"), _SHORTHAND_CASES)
+def test_digit_after_yi_takes_the_next_lower_unit(head: str, unit: str, exponent: int) -> None:
+    (whole,) = quantity_tokens(f"{head}{unit}")
+    for digit, name in enumerate("一二三四五六七八九", start=1):
+        (token,) = quantity_tokens(f"{head}{unit}{name}")
+        assert token.value_itn == str(int(whole.value_itn) + digit * 10 ** (exponent - 1))
 
 
 _NUMERAL_ALPHABET = "零一二两三四五六七八九十百千万亿点"

@@ -285,6 +285,9 @@ def _cjk_value(integer: str, fraction: str) -> str | None:
     whole = _integer_value(integer)
     if whole is None or not fraction:
         return whole
+    # 一亿五点五 mixes shorthand with a decimal and is not one number.
+    if _YI_SHORTHAND.fullmatch(integer):
+        return None
     # The magnitude after a decimal scales the whole number: 一点五万亿 is 1.5 × 10^12.
     parts = _FRACTION.fullmatch(fraction)
     if parts is None:
