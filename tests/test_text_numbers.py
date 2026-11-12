@@ -102,3 +102,99 @@ def test_digit_and_chinese_forms_of_a_quantity_share_one_value() -> None:
 
 def test_itn_rewrites_tokens_only() -> None:
     assert itn("一百五十期涨了百分之五，一样 3.5亿") == "150期涨了5%，一样 350000000"
+
+
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [
+        ("2万亿美元", "2000000000000美元"),
+        ("两万亿美元", "2000000000000美元"),
+        ("1.5万亿", "1500000000000"),
+        ("一点五万亿", "1500000000000"),
+        ("3.5亿", "350000000"),
+        ("三点五亿", "350000000"),
+        ("2千万美元", "20000000美元"),
+        ("5百万", "5000000"),
+    ],
+)
+def test_stacked_magnitudes_are_one_multiplier(text: str, value: str) -> None:
+    (token,) = quantity_tokens(text)
+    assert (token.surface, token.value_itn) == (text, value)
+
+
+@pytest.mark.parametrize("text", ["两三个", "三五个", "一一对应", "五五开", "三三两两", "四五十个", "三四百", "九七年"])
+def test_adjacent_bare_digits_are_a_range_or_an_idiom_not_one_number(text: str) -> None:
+    assert quantity_tokens(text) == []
+    assert itn(text) == text
+
+
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [
+        ("二〇一八年", "2018年"),
+        ("二零二四年", "2024年"),
+        ("一九九七年", "1997年"),
+        ("零零后", "00后"),
+        ("零点五", "0.5"),
+    ],
+)
+def test_digit_by_digit_years_and_codes(text: str, value: str) -> None:
+    assert itn(text) == value
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "千万不要",
+        "千万别",
+        "千万记住",
+        "万一",
+        "万万没想到",
+        "一一",
+        *(f"周{d}" for d in "一二三四五六日天"),
+        *(f"星期{d}" for d in "一二三四五六日天"),
+        "礼拜三",
+        "一些",
+        "一点儿",
+        "好一点",
+        "一点也不",
+        "一下",
+        "一定",
+        "一起",
+        "一直",
+        "一样",
+        "一般",
+        "一致",
+        "统一",
+        "唯一",
+        "一旦",
+        "一边",
+        "一次性",
+        "一成不变",
+        "一股脑",
+        "一个劲",
+        "一天到晚",
+        "三天两头",
+        "一五一十",
+    ],
+)
+def test_idioms_are_not_quantities(text: str) -> None:
+    assert quantity_tokens(text) == []
+    assert itn(text) == text
+
+
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [
+        ("每周一次", "每周1次"),
+        ("一千万元", "10000000元"),
+        ("三万一千", "31000"),
+        ("一点五", "1.5"),
+        ("一点钟", "1点钟"),
+        ("一亿两千万", "120000000"),
+        ("百分之三点五", "3.5%"),
+        ("一成", "1成"),
+    ],
+)
+def test_quantities_next_to_idiom_lookalikes_still_convert(text: str, value: str) -> None:
+    assert itn(text) == value
