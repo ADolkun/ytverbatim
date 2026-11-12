@@ -216,7 +216,13 @@ _PLACE_WORDS = frozenset("十百千万亿")
 _ZEROS = frozenset("〇零")
 # Two bare digits side by side (四五十, 三四百) are a range, never a positional numeral.
 _ADJACENT_DIGITS = re.compile("[一二两三四五六七八九]{2}")
+# One digit after 亿 or 万亿 is the next lower unit, as 五 in 一万五: 一亿五 is 1.5亿.
+_YI_SHORTHAND = re.compile("(?P<head>.*?(?P<unit>万?亿))(?P<digit>[一二三四五六七八九])")
 _FRACTION = re.compile(rf"([{''.join(_DIGIT_VALUE)}]+)([万亿]*)")
+
+
+def _magnitude_exponent(magnitudes: str) -> int:
+    return sum(_MAGNITUDE[ch] for ch in magnitudes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,14 +256,29 @@ def _is_quantity(integer: str, unit: str) -> bool:
     return "两" not in integer and (bool(_ZEROS & set(integer)) or (len(integer) == _YEAR_DIGITS and unit == "年"))
 
 
+def _cn2an_value(integer: str) -> Decimal | None:
+    # ValueError is cn2an's "not one number". Its speaking mode (一万五 is 15000) raises KeyError when the lower
+    # unit it wants is missing from its table, as after 十 (七十六十五, 一万十五).
+    try:
+        return Decimal(str(cn2an.cn2an(integer, "smart")))
+    except (ValueError, KeyError, InvalidOperation):
+        return None
+
+
 def _integer_value(integer: str) -> str | None:
     if not any(ch in _PLACE_WORDS for ch in integer):
         # Digit by digit, keeping leading zeros as the digit path keeps 0700: 零零后 is 00后.
         return "".join(_COUNTING_DIGITS[ch] for ch in integer)
-    try:
-        return _plain(Decimal(str(cn2an.cn2an(integer, "smart"))))
-    except (ValueError, InvalidOperation):
-        return None
+    shorthand = _YI_SHORTHAND.fullmatch(integer)
+    if shorthand is None:
+        value = _cn2an_value(integer)
+    else:
+        # cn2an's speaking mode has no unit below 亿, so the trailing digit of 一亿五 is placed here: 千万, or 千亿
+        # after 万亿.
+        head = _cn2an_value(shorthand["head"])
+        lower_unit = Decimal(10) ** (_magnitude_exponent(shorthand["unit"]) - 1)
+        value = None if head is None else head + int(_DIGIT_VALUE[shorthand["digit"]]) * lower_unit
+    return None if value is None else _plain(value)
 
 
 def _cjk_value(integer: str, fraction: str) -> str | None:
@@ -269,7 +290,7 @@ def _cjk_value(integer: str, fraction: str) -> str | None:
     if parts is None:
         return None
     decimals = "".join(_DIGIT_VALUE[ch] for ch in parts.group(1))
-    scale = sum(_MAGNITUDE[ch] for ch in parts.group(2))
+    scale = _magnitude_exponent(parts.group(2))
     return _plain(Decimal(f"{whole}.{decimals}") * Decimal(10) ** scale)
 
 
