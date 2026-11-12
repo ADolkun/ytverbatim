@@ -15,12 +15,15 @@ from pydantic import BaseModel, ConfigDict
 from evals.manifest import Manifest
 from evals.normalize import Language
 from evals.screen import Span, SpanReading, collect_spans
-from evals.store import Layout, dump_jsonl, now, write_json
+from evals.store import Layout, dump_jsonl, incomplete_files, now, write_json
+from ytverbatim.asr import registry
 from ytverbatim.errors import ConfigError
 
 DEFAULT_N = 150
 NUMERIC_SHARE = 0.4
 CLIP_PAD_S = 1.0
+# A shorter clip leaves the listener no context to place the words in.
+CLIP_MIN_S = 5.0
 SPANS_FILE = "spans.jsonl"
 KEY_FILE = "key.json"
 DECISIONS_FILE = "decisions.jsonl"
@@ -75,18 +78,38 @@ def stratum(span: Span) -> Stratum:
     return "numeric" if span.numeric else "other"
 
 
-def clip_window(reading: SpanReading, span: Span, duration_s: float, pad_s: float = CLIP_PAD_S) -> tuple[float, float]:
-    """Clip bounds from the control's own timing, padded; an empty control reading uses its neighbouring units."""
+def _bounds(reading: SpanReading) -> tuple[float, float] | None:
+    """Return a reading's own timing; an empty reading falls back to its neighbouring units."""
     if reading.start is not None and reading.end is not None:
-        start, end = reading.start, reading.end
-    elif reading.before is not None:
-        start = reading.before
-        end = reading.after if reading.after is not None else reading.before
-    elif reading.after is not None:
-        start = end = reading.after
-    else:
-        start, end = span.start, span.end
-    return max(0.0, start - pad_s), min(duration_s, end + pad_s)
+        return reading.start, reading.end
+    if reading.before is not None:
+        return reading.before, reading.after if reading.after is not None else reading.before
+    if reading.after is not None:
+        return reading.after, reading.after
+    return None
+
+
+def clip_window(
+    readings: Sequence[SpanReading],
+    span: Span,
+    duration_s: float,
+    pad_s: float = CLIP_PAD_S,
+    min_s: float = CLIP_MIN_S,
+) -> tuple[float, float]:
+    """Clip bounds covering every reading's timing, padded, widened to ``min_s`` around the centre, inside the file.
+
+    Taking the union keeps either engine from losing because the clip cut off words only it placed in time.
+    """
+    bounds = [b for b in map(_bounds, readings) if b is not None] or [(span.start, span.end)]
+    start, end = min(b[0] for b in bounds) - pad_s, max(b[1] for b in bounds) + pad_s
+    if end - start < min_s:
+        centre = (start + end) / 2
+        start, end = centre - min_s / 2, centre + min_s / 2
+    if start < 0:
+        start, end = 0.0, end - start
+    if end > duration_s:
+        start, end = start - (end - duration_s), duration_s
+    return max(0.0, start), min(duration_s, end)
 
 
 def _split[K: str](total: int, capacity: Mapping[K, int]) -> dict[K, int]:
@@ -158,6 +181,14 @@ def build_session(
 ) -> tuple[list[ShownSpan], SessionKey]:
     if control == challenger:
         raise ConfigError("the control and the challenger must differ")
+    # Disputes come only from files both engines finished, so a partial run would silently shrink the sample.
+    for hypothesis in (control, challenger):
+        missing = incomplete_files(layout, manifest, registry.get(hypothesis))
+        if missing:
+            raise ConfigError(
+                f"{hypothesis} is not complete for {len(missing)} of {len(manifest.videos)} files "
+                f"({', '.join(missing[:3])}); finish it with `asr --hyp {hypothesis}` first"
+            )
     spans = [s for s in collect_spans(layout, manifest, [control, challenger], pivot=control) if not s.format_only]
     if not spans:
         raise ConfigError(f"no disputes between {control} and {challenger}; are both runs complete on the same files?")
@@ -177,7 +208,7 @@ def build_session(
         side: Side = 1 if rng.random() < 0.5 else 2  # noqa: PLR2004 - a fair coin
         control_text, challenger_text = span.reading(control).text, span.reading(challenger).text
         options = (challenger_text, control_text) if side == 1 else (control_text, challenger_text)
-        start, end = clip_window(span.reading(control), span, durations[span.file])
+        start, end = clip_window((span.reading(control), span.reading(challenger)), span, durations[span.file])
         span_id = f"{number:03d}"
         shown.append(
             ShownSpan(

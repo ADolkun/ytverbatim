@@ -52,6 +52,8 @@ class ABResult(_Frozen):
     seed: int
     spans: int
     answered: int
+    # Spans whose latest decision is a skip, or that have none: `decide` refuses until this is zero.
+    undecided: int
     overall: WinStats
     by_language: dict[Language, WinStats]
     numeric: WinStats
@@ -103,11 +105,13 @@ def ab_result(layout: Layout, name: str, labels: dict[str, str]) -> ABResult:
     key: SessionKey = load_key(directory)
     shown = load_shown(directory)
     entries = {entry.id: entry for entry in key.entries}
+    # A revisited span is appended again; its latest decision is the one that counts.
     decisions = {d.span: d for d in read_decisions(directory)}
     unknown = sorted(set(decisions) - set(entries))
     if unknown:
         raise ConfigError(f"session {name!r} has decisions for unknown spans: {', '.join(unknown[:5])}")
     pairs = [(entries[span], decision) for span, decision in decisions.items()]
+    answered = sum(1 for _, decision in pairs if decision.choice != "skip")
 
     def where(keep: Callable[[KeyEntry], bool]) -> WinStats:
         return win_stats([(e, d) for e, d in pairs if keep(e)])
@@ -118,7 +122,8 @@ def ab_result(layout: Layout, name: str, labels: dict[str, str]) -> ABResult:
         challenger=key.challenger,
         seed=key.seed,
         spans=len(shown),
-        answered=len(pairs),
+        answered=answered,
+        undecided=len(entries) - answered,
         overall=where(lambda e: True),
         by_language={lang: where(lambda e, lang=lang: e.language == lang) for lang in LANGUAGES},
         numeric=where(lambda e: e.stratum == "numeric"),

@@ -40,6 +40,7 @@ from evals.store import (
     dump_jsonl,
     file_complete,
     hypotheses_on_disk,
+    incomplete_files,
     load_plan,
     now,
     require_plan,
@@ -193,26 +194,16 @@ def cleanup_hypothesis(
     if definition.spec.family in disk.DEFAULT_CACHE_FAMILIES:
         raise ConfigError(f"{hypothesis} uses the default Hugging Face cache, which cleanup never touches")
     disk.require_candidate_cache(cache)
-    missing = _incomplete(store, manifest, definition)
+    missing = incomplete_files(store, manifest, definition)
     if missing:
         raise ConfigError(f"{hypothesis} is not complete for {len(missing)} file(s) ({', '.join(missing[:3])}…)")
     repos = {w.repo for w in disk.weights(definition)}
     for other_id, other in registry.HYPOTHESES.items():
         if other_id == hypothesis or not repos & {w.repo for w in disk.weights(other)}:
             continue
-        if _incomplete(store, manifest, other):
+        if incomplete_files(store, manifest, other):
             raise ConfigError(f"{other_id} shares weights with {hypothesis} and still has files to run; run it first")
     return {repo: delete(cache, repo) for repo in sorted(repos)}
-
-
-def _incomplete(store: Layout, manifest: Manifest, definition: EngineDef) -> list[str]:
-    rows = rows_by_file(store, definition.spec.id)
-    missing = []
-    for video in manifest.videos:
-        plan = load_plan(store, video.id)
-        if plan is None or not file_complete(definition, plan, rows.get(video.id, [])):
-            missing.append(video.id)
-    return missing
 
 
 def build_captions(store: Layout, manifest: Manifest) -> dict[str, int]:
