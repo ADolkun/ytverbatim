@@ -8,9 +8,10 @@ _HOUR = 3600
 _WATCH_URL = "https://youtu.be/"
 
 # `_` only emphasises at a word edge; escaping it inside identifiers would just add noise. `&` is escaped only
-# where it would start an HTML entity, so "AT&T" and "R&D" stay untouched.
+# where it would start an HTML entity, so "AT&T" and "R&D" stay untouched. Every `~` is escaped, because GFM
+# strikes through text between single tildes as well as double ones.
 _ESCAPE = re.compile(
-    r"[\\`*\[\]<>]"
+    r"[\\`*\[\]<>~]"
     r"|(?<![^\W_])_"
     r"|_(?![^\W_])"
     r"|&(?=#\d+;|#[xX][0-9a-fA-F]+;|[A-Za-z][A-Za-z0-9]*;)"
