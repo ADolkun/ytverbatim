@@ -177,7 +177,7 @@ class Transcript(_Model):
 
 
 class Access(_Model):
-    auth_source: Literal["none", "chrome", "cookie-file"]
+    auth_source: Literal["none", "chrome", "brave", "chromium", "edge", "vivaldi", "cookie-file"]
     cookies_used: bool
     logged_in: bool | None
     premium: bool | None
@@ -291,8 +291,11 @@ class ContextDocument(_Model):
             if position == 0:
                 continue
             previous = self.segments[position - 1]
-            if segment.start < previous.start or segment.end < previous.end:
-                raise ValueError(f"segment {segment.id} is not monotonic with segment {previous.id}")
+            # Only starts are ordered: caption cues legitimately overlap or nest, so ends may go backwards.
+            if segment.start < previous.start:
+                raise ValueError(
+                    f"segment {segment.id} starts ({segment.start}) before segment {previous.id} ({previous.start})"
+                )
 
     def _check_runs(self) -> None:
         run_kinds: dict[str, str] = {}

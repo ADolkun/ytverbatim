@@ -8,6 +8,10 @@
           "enum": [
             "none",
             "chrome",
+            "brave",
+            "chromium",
+            "edge",
+            "vivaldi",
             "cookie-file"
           ],
           "title": "Auth Source",

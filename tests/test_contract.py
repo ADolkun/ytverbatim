@@ -2,11 +2,12 @@ import json
 from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 from pydantic import ValidationError
 
+from ytverbatim.auth import chromium
 from ytverbatim.contract import (
     SCHEMA_PATH,
     ContextDocument,
@@ -14,6 +15,7 @@ from ytverbatim.contract import (
     export_schema,
     load_document,
 )
+from ytverbatim.contract.models import Access
 from ytverbatim.errors import ContractError
 
 Raw = dict[str, Any]
@@ -209,6 +211,24 @@ def test_empty_document_is_valid() -> None:
     assert ContextDocument.model_validate(raw).segments == ()
 
 
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [(3.0, 4.0), (3.0, 7.0), (2.5, 6.0)],
+    ids=["nested", "overlapping", "identical"],
+)
+def test_overlapping_and_nested_cues_are_valid(start: float, end: float) -> None:
+    raw = make_raw()
+    raw["segments"][2]["start"] = start
+    raw["segments"][2]["end"] = end
+    doc = ContextDocument.model_validate(raw)
+    assert (doc.segments[2].start, doc.segments[2].end) == (start, end)
+
+
+def test_every_supported_auth_source_is_recordable() -> None:
+    recordable = set(get_args(Access.model_fields["auth_source"].annotation))
+    assert recordable == {"none", "cookie-file", *chromium.SUPPORTED_BROWSERS}
+
+
 def test_documents_are_frozen() -> None:
     doc = ContextDocument.model_validate(make_raw())
     with pytest.raises(ValidationError):
@@ -229,7 +249,7 @@ def _segment_ends_before_start(raw: Raw) -> None:
 
 
 def _segments_go_backwards(raw: Raw) -> None:
-    raw["segments"][2]["start"] = 3.0
+    raw["segments"][2]["start"] = 2.0
     raw["segments"][2]["end"] = 4.0
 
 
@@ -345,7 +365,7 @@ REJECTED: dict[str, tuple[Callable[[Raw], None], str]] = {
     "dense ids": (_bad_id, "dense"),
     "ids start at zero": (_bad_first_id, "dense"),
     "segment reversed": (_segment_ends_before_start, "before it starts"),
-    "segments monotonic": (_segments_go_backwards, "monotonic"),
+    "segment starts ordered": (_segments_go_backwards, "before segment 1"),
     "words monotonic": (_word_goes_backwards, "starts before the word"),
     "word reversed": (_word_ends_before_start, "before it starts"),
     "flag past text": (_flag_past_text, "past the"),
