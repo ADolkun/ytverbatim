@@ -5,7 +5,9 @@ from pathlib import Path
 import pytest
 
 from ytverbatim.acquire import metadata
+from ytverbatim.acquire.creator_note import CreatorNote
 from ytverbatim.errors import UnavailableError, YtDlpError
+from ytverbatim.ytdlp.types import Signal
 
 VIDEO_ID = "aaaaaaaaaaa"
 
@@ -101,6 +103,33 @@ def test_fetch_info_runs_one_extraction_and_saves_the_raw_json(fakes, tmp_path: 
     assert saved.read_text(encoding="utf-8") == raw
     assert stat.S_IMODE(saved.stat().st_mode) == 0o600
     assert metadata.load_metadata(tmp_path / "stage") == meta
+    assert "--get-comments" not in call.args
+    assert meta.creator_note is None
+
+
+PINNED = {"is_pinned": True, "author_is_uploader": True, "text": "Correction: 12%.", "author": "@example"}
+
+
+def test_creator_note_rides_on_the_same_extraction(fakes, tmp_path: Path) -> None:
+    runner = fakes.runner(lambda _args, _label: fakes.ok(json.dumps(info_dict(comments=[PINNED]))))
+
+    meta = metadata.fetch_info(runner, VIDEO_ID, tmp_path / "stage", creator_note=True, max_comments=5)
+
+    [call] = runner.calls
+    assert call.args[:2] == ["-J", "--no-playlist"]
+    assert call.args[call.args.index("--extractor-args") + 1] == "youtube:comment_sort=top;max_comments=5,all,0,0"
+    assert "--get-comments" in call.args
+    assert call.args[-1] == f"https://www.youtube.com/watch?v={VIDEO_ID}"
+    assert meta.creator_note == CreatorNote("Correction: 12%.", "@example", None, "")
+    assert metadata.load_metadata(tmp_path / "stage").creator_note == meta.creator_note
+
+
+@pytest.mark.parametrize("signal", [Signal.BOT_CHECK, Signal.RATE_LIMITED, Signal.CAPTCHA, Signal.IP_BLOCKED])
+def test_push_back_signals_propagate_when_the_note_is_requested(fakes, tmp_path: Path, signal: Signal) -> None:
+    runner = fakes.runner(fakes.raises(fakes.fail(signal)))
+    with pytest.raises(YtDlpError) as raised:
+        metadata.fetch_info(runner, VIDEO_ID, tmp_path / "stage", creator_note=True)
+    assert raised.value.primary is signal
 
 
 @pytest.mark.parametrize(("live_status", "kind"), [("is_live", "live"), ("is_upcoming", "upcoming")])
