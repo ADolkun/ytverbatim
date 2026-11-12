@@ -706,6 +706,8 @@ def _resolve(span: _Span, verdict: _Verdict | None, *, malformed: bool) -> _Deci
         return _Decision(None, f"LLM chose {chosen.surface!r}, which was heard beside this span, not for it; re-verify")
     if not _same_kind_and_unit(mine, chosen.token):
         return _Decision(None, f"LLM chose {chosen.surface!r}, whose kind or unit differs from the transcript's")
+    if _magnitude_only(mine, chosen.token):
+        return _Decision(None, f"LLM chose {chosen.surface!r}, which differs only in magnitude; re-verify")
     return _Decision(_restyle(mine, chosen.token.value_itn) or chosen.surface, reason)
 
 
@@ -727,6 +729,18 @@ def _same_kind_and_unit(mine: QToken, theirs: QToken) -> bool:
     if _SAME_KIND.get(mine.kind, mine.kind) != _SAME_KIND.get(theirs.kind, theirs.kind):
         return False
     return mine.kind == "ticker" or _unit(mine.value_itn) == _unit(theirs.value_itn)
+
+
+def _magnitude_only(mine: QToken, theirs: QToken) -> bool:
+    """Values a power of ten apart ($15 billion vs $15 million, 1.5万亿 vs 1.5亿, 15K vs 15M).
+
+    A misheard scale word is the costliest numeric error and context rarely settles it, so it is never auto-fixed.
+    """
+    a, b = _VALUE_NUMBER.search(mine.value_itn), _VALUE_NUMBER.search(theirs.value_itn)
+    if mine.kind == "ticker" or a is None or b is None or not Decimal(a[0]) or not Decimal(b[0]):
+        return False
+    ratio = (max(Decimal(a[0]), Decimal(b[0])) / min(Decimal(a[0]), Decimal(b[0]))).normalize()
+    return ratio != 1 and ratio.as_tuple().digits == (1,)
 
 
 def _unit(value: str) -> str:
