@@ -72,6 +72,7 @@ def test_argv_shape(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     assert fake.calls == [
         [
             sys.executable,
+            "-P",
             "-m",
             "yt_dlp",
             "--ignore-config",
@@ -91,7 +92,7 @@ def test_argv_shape(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 def test_argv_without_cookies_or_extras() -> None:
     argv = SubprocessRunner(js_args=()).argv(["-J", VID], cookies=None)
-    assert argv == [sys.executable, "-m", "yt_dlp", "--ignore-config", "--no-progress", "-J", VID]
+    assert argv == [sys.executable, "-P", "-m", "yt_dlp", "--ignore-config", "--no-progress", "-J", VID]
 
 
 def test_js_args_detected_once_when_not_given(monkeypatch: pytest.MonkeyPatch) -> None:
