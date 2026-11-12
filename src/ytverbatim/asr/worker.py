@@ -4,6 +4,7 @@ Everything that needs MLX happens here, never in the parent. `-P` keeps the work
 checkout in the current directory cannot shadow the installed package.
 """
 
+import json
 import math
 import os
 import resource
@@ -20,6 +21,7 @@ from ytverbatim.asr.chunks import Chunk, plan_chunks
 from ytverbatim.asr.guard import QualityGuard
 from ytverbatim.asr.models import (
     ERROR_FILE,
+    FINGERPRINT_FILE,
     HYPOTHESES_FILE,
     METRICS_FILE,
     ChunkHypothesis,
@@ -54,6 +56,7 @@ def run_request(request: WorkerRequest, *, engine: Engine | None = None, guard: 
     out.mkdir(parents=True, exist_ok=True)
     (out / ERROR_FILE).unlink(missing_ok=True)
     sink_path = out / HYPOTHESES_FILE
+    _claim_output(out, request)
     done = _read_done(sink_path, spec.id)
     session = _Session(request.engine, engine, guard)
     decoded = skipped = 0
@@ -101,13 +104,14 @@ class _Session:
     def decode(self, hypothesis: str, job: FileJob, audio: Audio, index: int, chunk: Chunk) -> ChunkHypothesis:
         engine = self._ready()
         samples = audio.slice(chunk.start, chunk.end)
+        language = self._definition.engine_language(job.language)
         started = time.perf_counter()
         try:
-            raw = engine.transcribe(samples, language=job.language, context=job.context)
+            raw = engine.transcribe(samples, language=language, context=job.context)
             guarded = (
                 GuardedChunk(raw)
                 if self._guard is None
-                else self._guard(engine, ChunkInput(samples, chunk.start, chunk.end, job.language, job.context), raw)
+                else self._guard(engine, ChunkInput(samples, chunk.start, chunk.end, language, job.context), raw)
             )
         except Exception as exc:
             where = f"{job.id} chunk {index} ({chunk.start:.1f}-{chunk.end:.1f}s)"
@@ -164,6 +168,42 @@ def _plan(job: FileJob, definition: EngineDef, audio: Audio) -> list[Chunk]:
     return plan_chunks(speech_regions(audio), audio.duration, max_chunk_s=max_chunk_s, frame_energy=frame_energy(audio))
 
 
+def default_guard(request: WorkerRequest) -> Guard | None:
+    """Return the guard `main` runs: none when the request opts out, flag-only for a whole-file hypothesis.
+
+    A whole-file hypothesis is the production control, so re-decoding part of it would stop it being one.
+    """
+    if not request.quality_guard:
+        return None
+    return QualityGuard(redecode=request.engine.spec.max_chunk_s is not None)
+
+
+def _claim_output(out: Path, request: WorkerRequest) -> None:
+    """Record which request this output directory belongs to, or refuse to resume one that belongs to another."""
+    path = out / FINGERPRINT_FILE
+    current = request.fingerprint()
+    if not path.exists():
+        hypotheses = out / HYPOTHESES_FILE
+        if hypotheses.exists() and hypotheses.stat().st_size > 0:
+            raise EngineError(
+                f"{out} holds {HYPOTHESES_FILE} but no {FINGERPRINT_FILE}, so what produced it is unknown; use a fresh "
+                "output directory"
+            )
+        atomic.write_json(path, current)
+        return
+    try:
+        stored: object = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise EngineError(f"{path} is unreadable: {exc}") from exc
+    if stored != current:
+        known = stored if isinstance(stored, dict) else {}
+        changed = sorted(key for key in current.keys() | known.keys() if current.get(key) != known.get(key))
+        raise EngineError(
+            f"{out} holds output of a different request ({', '.join(changed) or 'format'} changed); resuming would "
+            "mix the two, so use a fresh output directory"
+        )
+
+
 def _read_done(path: Path, hypothesis: str) -> dict[tuple[str, int], ChunkHypothesis]:
     if not path.exists():
         return {}
@@ -217,7 +257,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # huggingface_hub reads this when it is first imported, which only happens inside an adapter.
         os.environ["HF_HUB_CACHE"] = request.hf_hub_cache
     try:
-        run_request(request, guard=QualityGuard() if request.quality_guard else None)
+        run_request(request, guard=default_guard(request))
     except Exception as exc:
         error = WorkerError(type=type(exc).__name__, message=str(exc), traceback=traceback.format_exc())
         out = Path(request.out_dir)

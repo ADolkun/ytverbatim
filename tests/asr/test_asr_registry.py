@@ -41,7 +41,7 @@ def test_unknown_hypothesis_lists_the_known_ones() -> None:
 def test_build_engine_imports_the_factory_by_dotted_path() -> None:
     engine = registry.build_engine(definition(marker=1))
     assert isinstance(engine, FakeEngine)
-    assert engine.variant == {"marker": 1}
+    assert engine.variant == {"language": "pass", "marker": 1}
 
 
 def test_a_missing_adapter_is_a_dependency_error() -> None:
@@ -51,3 +51,18 @@ def test_a_missing_adapter_is_a_dependency_error() -> None:
     wrong_name = EngineDef(definition().spec, "fake_engine.nope", {})
     with pytest.raises(DependencyError, match="nope"):
         registry.build_engine(wrong_name)
+
+
+def test_whisper_passes_the_metadata_language_and_the_challengers_detect_their_own() -> None:
+    policies = {hypothesis_id: entry.language_policy() for hypothesis_id, entry in registry.HYPOTHESES.items()}
+    assert policies == {
+        "w-prod": "pass",
+        "w-vad": "pass",
+        "q-base": "auto",
+        "q-ctx": "auto",
+        "f-aed": "auto",
+        "m-4bit": "auto",
+    }
+    assert registry.get("q-base").engine_language("zh+en") is None
+    assert registry.get("w-prod").engine_language("zh") == "zh"
+    assert registry.get("w-prod").engine_language(None) is None

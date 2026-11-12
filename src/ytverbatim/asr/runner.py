@@ -56,10 +56,13 @@ def run_worker(request: WorkerRequest, *, python: str | None = None) -> WorkerRe
     out = Path(request.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     request_path = out / REQUEST_FILE
-    atomic.write_text(request_path, request.model_dump_json(indent=2) + "\n")
     limit = timeout_s(sum(_wav_seconds(Path(job.wav)) for job in request.files))
     hypothesis = request.engine.spec.id
     with worker_lock():
+        # Under the lock, so a run waiting its turn cannot overwrite the request a running worker was given, and a
+        # report left by an earlier run cannot be read as this worker's failure.
+        (out / ERROR_FILE).unlink(missing_ok=True)
+        atomic.write_text(request_path, request.model_dump_json(indent=2) + "\n")
         result = proc.run(worker_argv(request_path, python=python), timeout_s=limit)
     children_rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
     if result.returncode != 0:

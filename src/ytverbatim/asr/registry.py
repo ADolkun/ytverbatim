@@ -16,6 +16,9 @@ _WHISPER_REPO = "mlx-community/whisper-large-v3-mlx"
 _WHISPER_REVISION = "49e6aa286ad60c14352c404340ded53710378a11"
 
 # `emits_punctuation` is the vendors' claim for Qwen3 and MiMo and unverified for FireRed; the engine runs settle it.
+# Whisper passes the metadata language as production does. The challengers auto-detect: Qwen3 accepts only English
+# language names (§B2), FireRed has no language input, and MiMo knows only zh and en, so a metadata tag such as
+# "zh+en" would either abort the decode or force a wrong language.
 # Adapters are named by dotted path so that looking up a hypothesis never imports an engine library.
 _DEFINITIONS = (
     EngineDef(
@@ -31,7 +34,7 @@ _DEFINITIONS = (
             sample_rate=16_000,
         ),
         "ytverbatim.asr.engines.whisper_mlx.create",
-        {"mode": "whole_file"},
+        {"mode": "whole_file", "language": "pass"},
     ),
     EngineDef(
         EngineSpec(
@@ -46,7 +49,7 @@ _DEFINITIONS = (
             sample_rate=16_000,
         ),
         "ytverbatim.asr.engines.whisper_mlx.create",
-        {"mode": "chunk"},
+        {"mode": "chunk", "language": "pass"},
     ),
     EngineDef(
         EngineSpec(
@@ -61,7 +64,7 @@ _DEFINITIONS = (
             sample_rate=16_000,
         ),
         "ytverbatim.asr.engines.qwen3.create",
-        {"context": False},
+        {"context": False, "language": "auto"},
     ),
     EngineDef(
         EngineSpec(
@@ -76,7 +79,7 @@ _DEFINITIONS = (
             sample_rate=16_000,
         ),
         "ytverbatim.asr.engines.qwen3.create",
-        {"context": True},
+        {"context": True, "language": "auto"},
     ),
     EngineDef(
         EngineSpec(
@@ -91,7 +94,7 @@ _DEFINITIONS = (
             sample_rate=16_000,
         ),
         "ytverbatim.asr.engines.firered.create",
-        {"beam_size": 3},
+        {"beam_size": 3, "language": "auto"},
     ),
     EngineDef(
         EngineSpec(
@@ -106,7 +109,7 @@ _DEFINITIONS = (
             sample_rate=24_000,
         ),
         "ytverbatim.asr.engines.mimo.create",
-        dict(_MIMO_TOKENIZER),
+        {**_MIMO_TOKENIZER, "language": "auto"},
     ),
 )
 HYPOTHESES: Mapping[str, EngineDef] = {definition.spec.id: definition for definition in _DEFINITIONS}

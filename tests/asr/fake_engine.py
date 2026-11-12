@@ -23,7 +23,7 @@ def write_silence(path: Path, seconds: float) -> Path:
 
 def definition(max_chunk_s: float | None = 30.0, **variant: object) -> EngineDef:
     spec = EngineSpec("fake", "fake", "example/fake", "0" * 40, max_chunk_s, False, False, True, RATE)
-    return EngineDef(spec, "fake_engine.create", dict(variant))  # type: ignore[arg-type]
+    return EngineDef(spec, "fake_engine.create", {"language": "pass", **variant})  # type: ignore[arg-type]
 
 
 class FakeEngine:

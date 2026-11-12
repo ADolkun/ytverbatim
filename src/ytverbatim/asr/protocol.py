@@ -10,7 +10,8 @@ if TYPE_CHECKING:
     import numpy as np
     from numpy.typing import NDArray
 
-ChunkFlag = Literal["forced_cut", "token_cap_hit", "decoder_anomaly", "redecoded"]
+ChunkFlag = Literal["forced_cut", "token_cap_hit", "decoder_anomaly", "empty_output", "redecoded"]
+LanguagePolicy = Literal["auto", "pass"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,11 +35,25 @@ class EngineSpec:
 
 @dataclass(frozen=True, slots=True)
 class EngineDef:
-    """A hypothesis as the worker receives it: spec, adapter factory and variant parameters."""
+    """A hypothesis as the worker receives it: spec, adapter factory and variant parameters.
+
+    The variant's `language` is the engine's language policy: `pass` hands it the file's metadata language as
+    production does, `auto` always lets it detect the language itself.
+    """
 
     spec: EngineSpec
     factory: str
     variant: dict[str, JsonValue]
+
+    def language_policy(self) -> LanguagePolicy:
+        policy = self.variant.get("language")
+        if policy == "auto" or policy == "pass":
+            return policy
+        raise ValueError(f"{self.spec.id} needs the variant language set to 'auto' or 'pass', got {policy!r}")
+
+    def engine_language(self, language: str | None) -> str | None:
+        """Return the language hint this engine decodes with for a file whose metadata says `language`."""
+        return language if self.language_policy() == "pass" else None
 
 
 @dataclass(frozen=True, slots=True)
