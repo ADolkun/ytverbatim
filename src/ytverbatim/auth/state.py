@@ -5,6 +5,7 @@ class AuthState(StrEnum):
     NO_SOURCE = "no_source"
     BROWSER_NOT_FOUND = "browser_not_found"
     PROFILE_NOT_FOUND = "profile_not_found"
+    COOKIE_FILE_INVALID = "cookie_file_invalid"
     KEYCHAIN_DENIED = "keychain_denied"
     LOGGED_OUT = "logged_out"
     ROTATED = "rotated"
