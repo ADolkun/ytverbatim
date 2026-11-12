@@ -2,7 +2,7 @@
 
 Scans added lines (``--staged``), tracked files (``--all-tracked``) or explicit
 paths. Extra regexes come from the local, never-committed
-``<git-dir>/info/private-patterns`` file.
+``<git-common-dir>/info/private-patterns`` (shared by all worktrees) file.
 """
 
 from __future__ import annotations
@@ -84,7 +84,7 @@ def _git(*args: str) -> bytes:
 
 
 def load_local_patterns() -> list[tuple[str, re.Pattern[str]]]:
-    git_dir = Path(_git("rev-parse", "--git-dir").decode().strip())
+    git_dir = Path(_git("rev-parse", "--git-common-dir").decode().strip())
     patterns_file = git_dir / "info" / "private-patterns"
     if not patterns_file.is_file():
         return []
