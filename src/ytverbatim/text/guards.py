@@ -4,9 +4,8 @@ A correction may fix homophones and garbled terms; it must never change what the
 compares the original with the proposed text and rejects recognized data, negation or direction changes and
 destructive rewrites. They are conservative checks, not a proof of semantic equivalence.
 
-Ported from ytscript's ``analyze/correct.py`` with two guards loosened: an uppercase acronym or ticker may move to a
-near spelling (GAP→GAAP), and Chinese numerals are compared as quantities, so a word that merely contains a numeral
-character (一样, 一直) can be fixed.
+Ported from ytscript's ``analyze/correct.py`` with one guard loosened: an uppercase acronym or ticker may take one
+inserted or deleted letter or one adjacent transposition (GAP→GAAP, SMCI→MSCI), never a substituted letter.
 """
 
 import re
@@ -46,9 +45,6 @@ _CJK_RETENTION_FLOOR = 0.5
 # fix dominates a very short segment, so it applies only from a minimum length.
 _CJK_MIN_SIMILARITY = 0.65
 _CJK_RATIO_MIN_CHARS = 8
-# GAP→GAAP is one edit and SMCI→MSCI one transposition. Two edits already reach a different ticker (SAP→GAAP).
-_MAX_SYMBOL_DISTANCE = 1
-
 _CJK = re.compile(r"[\u4e00-\u9fff]")
 _CJK_NUMERAL_CHARS = "〇零一二两兩三四五六七八九十百千万萬亿億廿卅"
 _CJK_NUMERAL = re.compile(f"[{_CJK_NUMERAL_CHARS}]")
@@ -111,6 +107,32 @@ _ACTION_DIRECTION = re.compile(
     re.IGNORECASE,
 )
 _BUY_FORMS = frozenset({"买", "買", "buy", "buys", "buying", "bought"})
+# Opposite pairs grouped by what they describe, so 涨→降 counts as a flip but 多 next to 涨 does not. Each group holds
+# its two sides; the longest word matches first, so 做空 is never read as 空.
+_DIRECTION_GROUPS: dict[str, tuple[list[str], list[str]]] = {
+    "move": (
+        ["上涨", "涨", "漲", "升", "up", "rise", "rises", "rising", "rose", "risen", "higher"],
+        ["下跌", "跌", "降", "down", "fall", "falls", "falling", "fell", "fallen", "lower"],
+    ),
+    "amount": (
+        ["增加", "增", "increase", "increases", "increased", "increasing"],
+        ["减少", "減少", "减", "減", "decrease", "decreases", "decreased", "decreasing"],
+    ),
+    "stance": (["做多", "利好", "多", "牛", "long", "bullish"], ["做空", "利空", "空", "熊", "short", "bearish"]),
+    "result": (["盈", "gain", "gains", "gained", "gaining"], ["亏", "虧", "loss", "losses"]),
+}
+_DIRECTION_SIDE = {
+    word: (group, side)
+    for group, sides in _DIRECTION_GROUPS.items()
+    for side, words in enumerate(sides)
+    for word in words
+}
+_DIRECTION_WORD = re.compile(
+    "|".join(
+        re.escape(word) if _CJK.match(word) else rf"(?<![a-z0-9_]){word}(?![a-z0-9_])"
+        for word in sorted(_DIRECTION_SIDE, key=len, reverse=True)
+    )
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,7 +169,7 @@ def check_fix(original: str, fixed: str, *, min_keep_ratio: float = MIN_KEEP_RAT
         ("quantities", lambda: _quantity_runs(fixed) != _quantity_runs(original)),
         ("cjk_numerals", lambda: _cjk_numerals_changed(original, fixed)),
         ("negation", lambda: _negation_signature(fixed) != _negation_signature(original)),
-        ("direction", lambda: _direction_signature(fixed) != _direction_signature(original)),
+        ("direction", lambda: _direction_flipped(original, fixed)),
         ("symbols", lambda: _exact_symbols(fixed) != _exact_symbols(original)),
         ("cjk_retention", lambda: _cjk_retention_broken(original, fixed)),
         ("cjk_similarity", lambda: _cjk_similarity_broken(original, fixed)),
@@ -176,46 +198,32 @@ def symbol_changes(original: str, fixed: str) -> tuple[EntityChange, ...]:
     )
 
 
-def osa_distance(a: str, b: str) -> int:
-    """Optimal string alignment distance: insertions, deletions, substitutions and adjacent transpositions."""
-    previous2: list[int] = []
-    previous = list(range(len(b) + 1))
-    for i, char_a in enumerate(a, start=1):
-        current = [i, *([0] * len(b))]
-        for j, char_b in enumerate(b, start=1):
-            cost = 0 if char_a == char_b else 1
-            current[j] = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
-            if i > 1 and j > 1 and char_a == b[j - 2] and a[i - 2] == char_b:
-                current[j] = min(current[j], previous2[j - 2] + 1)
-        previous2, previous = previous, current
-    return previous[-1]
-
-
 def _is_near_symbol(before: str, after: str) -> bool:
-    limit = min(_MAX_SYMBOL_DISTANCE, min(len(before), len(after)) - 1)
-    return osa_distance(before, after) <= limit
+    """One inserted or deleted letter (GAP→GAAP) or one adjacent transposition (SMCI→MSCI).
+
+    A substituted letter, at any length, already names a different security or indicator (MS→GS, CPI→PPI).
+    """
+    if abs(len(before) - len(after)) == 1:
+        shorter, longer = sorted((before, after), key=len)
+        return any(longer[:i] + longer[i + 1 :] == shorter for i in range(len(longer)))
+    return (
+        before != after
+        and len(before) == len(after)
+        and any(before[:i] + before[i + 1] + before[i] + before[i + 2 :] == after for i in range(len(before) - 1))
+    )
 
 
 def _cjk_numerals_changed(original: str, fixed: str) -> bool:
-    """Quantities must keep their values in order, and no numeral may be swapped for another.
+    """Quantities must keep their values in order, and the ordered numeral characters must not change at all.
 
-    Tickers are left to the symbol guard. Quantity tokens skip words that merely contain a numeral (一样, 一直), so
-    the substitution check catches a bare numeral that changed value without forming a token, as in 买三送一→买四送一.
+    Tickers are left to the symbol guard. The character rule is deliberately blunt: it also refuses a fix that adds
+    a numeral (依样→一样), because telling that apart from a dropped or swapped one (买三送一→买送一) is guesswork.
     """
 
     def values(text: str) -> list[tuple[str, str]]:
         return [(token.value_itn, token.kind) for token in quantity_tokens(text) if token.kind != "ticker"]
 
-    if values(original) != values(fixed):
-        return True
-    opcodes = SequenceMatcher(None, original, fixed, autojunk=False).get_opcodes()
-    for tag, i1, i2, j1, j2 in opcodes:
-        if tag != "replace":
-            continue
-        old, new = _CJK_NUMERAL.findall(original[i1:i2]), _CJK_NUMERAL.findall(fixed[j1:j2])
-        if old and new and old != new:
-            return True
-    return False
+    return values(original) != values(fixed) or _CJK_NUMERAL.findall(original) != _CJK_NUMERAL.findall(fixed)
 
 
 def _numeric_spans(text: str) -> list[str]:
@@ -237,6 +245,34 @@ def _negation_signature(text: str) -> list[tuple[int, str]]:
 def _direction_signature(text: str) -> list[str]:
     normalized = unicodedata.normalize("NFKC", text).casefold()
     return ["buy" if match[0] in _BUY_FORMS else "sell" for match in _ACTION_DIRECTION.finditer(normalized)]
+
+
+def _direction_flipped(original: str, fixed: str) -> bool:
+    """Buy and sell must match exactly; any other opposite pair may gain or lose a word but never turn over.
+
+    Inserting or dropping 多 or up is common in a homophone fix (很都→很多), while a turn-over or reorder within a group
+    (上涨→下跌, up→down) leaves neither side's sequence contained in the other.
+    """
+    if _direction_signature(fixed) != _direction_signature(original):
+        return True
+    before, after = _direction_sides(original), _direction_sides(fixed)
+    return any(
+        not (_is_subsequence(before[group], after[group]) or _is_subsequence(after[group], before[group]))
+        for group in _DIRECTION_GROUPS
+    )
+
+
+def _direction_sides(text: str) -> dict[str, list[int]]:
+    sides: dict[str, list[int]] = {group: [] for group in _DIRECTION_GROUPS}
+    for match in _DIRECTION_WORD.finditer(unicodedata.normalize("NFKC", text).casefold()):
+        group, side = _DIRECTION_SIDE[match[0]]
+        sides[group].append(side)
+    return sides
+
+
+def _is_subsequence(short: list[int], long: list[int]) -> bool:
+    remaining = iter(long)
+    return all(item in remaining for item in short)
 
 
 def _exact_symbols(text: str) -> Counter[str]:

@@ -174,6 +174,7 @@ class _Run:
         checkpoint_dir: Path,
     ) -> None:
         self.texts = texts
+        self._originals = tuple(texts)
         self.edits: list[list[Edit]] = [[] for _ in texts]
         self.rejections: list[Rejection] = []
         self.meter = UsageMeter()
@@ -198,7 +199,9 @@ class _Run:
         current = self.texts[index]
         if proposed == current:
             return
-        verdict = check_fix(current, proposed)
+        # Guarding against the original, not the previous pass, keeps two allowed steps from adding up to a forbidden
+        # one (SAP→GAP→GAAP).
+        verdict = check_fix(self._originals[index], proposed)
         if verdict.rejected_by is not None:
             self.rejections.append(Rejection(index, pass_, current, proposed, verdict.rejected_by))
             return
