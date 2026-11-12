@@ -58,6 +58,11 @@ def llm_dir(provider: str) -> Path:
     return _private(_private(cache_dir() / "llm") / provider)
 
 
+def llm_workdir(provider: str) -> Path:
+    """Empty cwd for an LLM CLI child, so no project files or instructions are in reach."""
+    return _private(llm_dir(provider) / "cwd")
+
+
 def home_dir() -> Path:
     value = os.environ.get("YTVERBATIM_HOME")
     return Path(value).expanduser() if value else Path.home() / ".local" / "share" / _APP
