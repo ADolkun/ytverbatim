@@ -110,6 +110,22 @@ def test_a_quota_stop_resumes_where_it_left_off(spans: list, tmp_path: Path) -> 
     assert len(rest) == 2
 
 
+def test_a_torn_last_verdict_line_is_judged_again(spans: list, tmp_path: Path) -> None:
+    items = judge_items(spans, 10, seed=0)
+    directory = tmp_path / "judge"
+    judge.run_judge(FakeClient(), items, directory, model="m", batch_size=1)
+    path = directory / judge.VERDICTS_FILE
+    first, second = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    path.write_text(first + second[: len(second) // 2], encoding="utf-8")
+    assert len(judge.load_verdicts(directory)) == 1
+
+    client = FakeClient()
+    verdicts = judge.run_judge(client, items, directory, model="m", batch_size=1)
+    assert len(client.requests) == 1 and len(verdicts) == 2
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2 and all(json.loads(line) for line in lines)
+
+
 def test_needs_audio_counts_for_nobody(spans: list, tmp_path: Path) -> None:
     items = judge_items(spans, 10, seed=0)
     verdicts = judge.run_judge(FakeClient("audio"), items, tmp_path / "judge", model="m")

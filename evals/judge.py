@@ -9,6 +9,7 @@ run interrupted by quota resumes where it stopped.
 import hashlib
 import json
 import logging
+import os
 import random
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -100,11 +101,25 @@ def render_batch(items: Sequence[JudgeItem]) -> str:
 
 
 def load_verdicts(directory: Path) -> dict[str, Verdict]:
+    """Every complete verdict line; a last line torn by a crash mid-append is ignored and judged again."""
     path = directory / VERDICTS_FILE
     if not path.exists():
         return {}
-    verdicts = (Verdict.model_validate_json(line) for line in path.read_text(encoding="utf-8").splitlines() if line)
-    return {v.key: v for v in verdicts}
+    data = path.read_text(encoding="utf-8")
+    lines = data[: data.rfind("\n") + 1].splitlines()
+    return {v.key: v for v in (Verdict.model_validate_json(line) for line in lines if line)}
+
+
+def _append_verdicts(path: Path, verdicts: Sequence[Verdict]) -> None:
+    with path.open("a+b") as handle:
+        # Cut a torn last line first, or the next verdict would be glued onto it.
+        handle.seek(0)
+        data = handle.read()
+        if data and not data.endswith(b"\n"):
+            handle.truncate(data.rfind(b"\n") + 1)
+        handle.write("".join(v.model_dump_json() + "\n" for v in verdicts).encode("utf-8"))
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 class _Recorder:
@@ -147,8 +162,7 @@ def run_judge(
             break
         batch = pending[start : start + batch_size]
         verdicts = _judge_batch(client, batch, directory, model)
-        with (directory / VERDICTS_FILE).open("a", encoding="utf-8") as handle:
-            handle.writelines(v.model_dump_json() + "\n" for v in verdicts)
+        _append_verdicts(directory / VERDICTS_FILE, verdicts)
         cached.update((v.key, v) for v in verdicts)
         progress(f"judge call {calls + 1}: {min(start + batch_size, len(pending))}/{len(pending)} uncached spans done")
     return {item.span_id: cached[item.key(model)] for item in items if item.key(model) in cached}

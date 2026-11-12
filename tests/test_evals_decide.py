@@ -7,7 +7,7 @@ from evals_fixture import EN, EN_CHALLENGER, EN_CONTROL, ZH, ZH_CHALLENGER, ZH_C
 
 from evals import run_asr
 from evals.decide import decide
-from evals.listen import LoggedDecision
+from evals.listen import Choice, LoggedDecision
 from evals.normalize import Language
 from evals.report import ABResult, Report, WinStats, build_report, render_markdown
 from evals.screen import (
@@ -21,6 +21,7 @@ from evals.screen import (
     collect_spans,
 )
 from evals.session import DECISIONS_FILE, build_session, load_key, write_session
+from ytverbatim.errors import ConfigError
 
 HOUR = 3600.0
 
@@ -47,7 +48,14 @@ def screen_row(name: str, cer: float | None = 0.10, **extra: float) -> Hypothesi
 
 
 def report(
-    zh: WinStats, en: WinStats, zh_numeric: WinStats, en_numeric: WinStats, challenger: HypothesisScreen | None = None
+    zh: WinStats,
+    en: WinStats,
+    zh_numeric: WinStats,
+    en_numeric: WinStats,
+    challenger: HypothesisScreen | None = None,
+    *,
+    overall: WinStats | None = None,
+    undecided: int = 0,
 ) -> Report:
     rows = (screen_row("w-prod"), challenger or screen_row("q-ctx"))
     screen = ScreenResult(
@@ -56,8 +64,9 @@ def report(
         recommendation=Recommendation(control="w-prod", control_reason="", challenger="q-ctx", challenger_reason="",
                                       runner_up=None, challenger_ci_overlap=False),
     )  # fmt: skip
-    ab = ABResult(session="main", control="w-prod", challenger="q-ctx", seed=0, spans=150, answered=150,
-                  overall=stats(1, 1), by_language={"zh": zh, "en": en}, numeric=stats(1, 1),
+    ab = ABResult(session="main", control="w-prod", challenger="q-ctx", seed=0, spans=150,
+                  answered=150 - undecided, undecided=undecided, overall=overall or WIN,
+                  by_language={"zh": zh, "en": en}, numeric=stats(1, 1),
                   numeric_by_language={"zh": zh_numeric, "en": en_numeric}, by_file={})  # fmt: skip
     return Report(generated="t", files=(), screen=screen, ab=ab)
 
@@ -83,7 +92,7 @@ def test_a_clear_win_everywhere_replaces_whisper() -> None:
 def test_a_ci_that_includes_half_keeps_whisper() -> None:
     result = decide(report(TIE, TIE, NUMERIC_OK, NUMERIC_OK))
     assert result.engine == {"zh": "w-prod", "en": "w-prod"}
-    assert failed(report(TIE, TIE, NUMERIC_OK, NUMERIC_OK), "zh") == ["overall win rate"]
+    assert failed(report(TIE, TIE, NUMERIC_OK, NUMERIC_OK), "zh") == ["language win rate"]
 
 
 def test_numeric_inferiority_keeps_whisper() -> None:
@@ -121,6 +130,20 @@ def test_a_per_language_split_needs_that_language_to_pass_alone() -> None:
     assert result.engine == {"zh": "q-ctx", "en": "w-prod"}
     assert result.summary.startswith("per-language split")
     assert decide(report(TIE, WIN, NUMERIC_OK, NUMERIC_OK)).engine == {"zh": "w-prod", "en": "q-ctx"}
+
+
+def test_no_switch_without_an_overall_win() -> None:
+    result = decide(report(WIN, WIN, NUMERIC_OK, NUMERIC_OK, overall=TIE))
+    assert result.engine == {"zh": "w-prod", "en": "w-prod"}
+    assert failed(report(WIN, WIN, NUMERIC_OK, NUMERIC_OK, overall=TIE), "zh") == ["overall win rate (both languages)"]
+    # A per-language split also needs the overall bound: one strong language must carry the pooled rate past 0.5.
+    assert decide(report(WIN, TIE, NUMERIC_OK, NUMERIC_OK, overall=TIE)).engine == {"zh": "w-prod", "en": "w-prod"}
+    assert decide(report(WIN, TIE, NUMERIC_OK, NUMERIC_OK, overall=WIN)).engine == {"zh": "q-ctx", "en": "w-prod"}
+
+
+def test_decide_refuses_a_session_with_undecided_spans() -> None:
+    with pytest.raises(ConfigError, match="3 of 150 spans without a decision"):
+        decide(report(WIN, WIN, NUMERIC_OK, NUMERIC_OK, undecided=3))
 
 
 def test_no_session_keeps_the_control() -> None:
@@ -162,3 +185,35 @@ def test_the_report_and_results_hold_no_transcript_text_or_ids(tmp_path: Path, m
         assert not any(run in text for run in han)
         assert not any(re.search(rf"\b{re.escape(w)}\b", text) for w in words)
         assert "zh-01" in text and "en-01" in text
+
+
+def test_skips_count_as_undecided_until_revisited(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    layout, manifest = make_eval(tmp_path / "eval", monkeypatch)
+    write_pair(layout)
+    run_asr.build_captions(layout, manifest)
+    hypotheses = ["w-prod", "q-base"]
+    spans = collect_spans(layout, manifest, hypotheses)
+    screen = build_screen(layout, manifest, hypotheses, spans, {}, judge_model=None, judge_prompt_version=None,
+                          judge_seed=0, judge_sample=0, generated="t")  # fmt: skip
+    write_session(layout, "main", *build_session(layout, manifest, "w-prod", "q-base", n=6, seed=1))
+    key = load_key(layout.session_dir("main"))
+    path = layout.session_dir("main") / DECISIONS_FILE
+
+    def log(span: str, choice: Choice) -> None:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(LoggedDecision(span=span, choice=choice, at="t").model_dump_json() + "\n")
+
+    first, *rest = key.entries
+    log(first.id, "skip")
+    for entry in rest[:-1]:
+        log(entry.id, "1")
+    partial = build_report(layout, manifest, screen, "main", "t")
+    assert partial.ab is not None and partial.ab.undecided == 2 and partial.ab.answered == len(key.entries) - 2
+    with pytest.raises(ConfigError, match="2 of 6 spans without a decision"):
+        run_asr.write_decision(partial, tmp_path / "results", "2025-01-01")
+
+    log(rest[-1].id, "2")
+    log(first.id, "both")
+    complete = build_report(layout, manifest, screen, "main", "t")
+    assert complete.ab is not None and complete.ab.undecided == 0 and complete.ab.overall.skipped == 0
+    run_asr.write_decision(complete, tmp_path / "results", "2025-01-01")

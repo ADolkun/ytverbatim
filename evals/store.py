@@ -178,6 +178,17 @@ def file_complete(definition: EngineDef, plan: Plan, rows: Sequence[ChunkHypothe
     return len(done) == expected
 
 
+def incomplete_files(layout: Layout, manifest: Manifest, definition: EngineDef) -> list[str]:
+    """Manifest files with no plan or without this hypothesis's full output."""
+    rows = rows_by_file(layout, definition.spec.id)
+    missing = []
+    for video in manifest.videos:
+        plan = load_plan(layout, video.id)
+        if plan is None or not file_complete(definition, plan, rows.get(video.id, [])):
+            missing.append(video.id)
+    return missing
+
+
 def append_history(layout: Layout, hypothesis: str, record: RunRecord) -> None:
     path = layout.run_dir(hypothesis) / HISTORY_FILE
     with path.open("a", encoding="utf-8") as handle:

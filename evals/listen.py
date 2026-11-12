@@ -2,10 +2,14 @@
 
 Every decision is appended and synced before the next clip, so quitting or a crash loses nothing. The loop reads
 only ``spans.jsonl``; which option belongs to which engine stays in ``key.json``.
+
+A skip is not a decision: `decide` refuses while any span is skipped. Skipped spans come back after the rest, once
+per run, and every later run offers them again.
 """
 
 import os
 import tempfile
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,8 +38,8 @@ Cutter = Callable[[Path, float, float, Path], None]
 HELP = """Blind A/B listening: {remaining} of {total} spans left, about {minutes} min at ~{per_span} s each.
 Each clip plays once; then press ONE key:
   1 / 2  the reading you heard        b  both fine (equivalent)     0  both wrong
-  r      replay                       s  skip this span             q  save and quit
-Decisions save immediately; run the same command again to resume.
+  r      replay                       s  skip for now (comes back)  q  save and quit
+Decisions save immediately; run the same command again to resume. Every span needs 1, 2, b or 0 before `decide`.
 """
 
 
@@ -50,6 +54,7 @@ class LoggedDecision(BaseModel):
 @dataclass(frozen=True)
 class ListenResult:
     decided: int
+    # Spans still without a decision: never offered yet, or skipped.
     remaining: int
     quit: bool
 
@@ -105,23 +110,31 @@ def listen(
     if not (directory / SPANS_FILE).exists():
         raise ConfigError(f"no A/B session {name!r}; build it with `session` first")
     spans = load_shown(directory)
-    done = {d.span for d in read_decisions(directory)}
-    pending = [s for s in spans if s.id not in done]
+    latest = {d.span: d.choice for d in read_decisions(directory)}
+    decided_ids = {span for span, choice in latest.items() if choice != "skip"}
+    fresh = [s for s in spans if s.id not in latest]
+    skipped = [s for s in spans if latest.get(s.id) == "skip"]
+    queue = deque(fresh + skipped)
+    # A span skipped in this run comes back once at the end; the original skips already sit there.
+    offered_again = {s.id for s in skipped}
     wavs = {video.id: layout.wav(video) for video in manifest.videos}
     echo(
         HELP.format(
-            remaining=len(pending),
+            remaining=len(queue),
             total=len(spans),
-            minutes=round(len(pending) * SECONDS_PER_SPAN / 60),
+            minutes=round(len(queue) * SECONDS_PER_SPAN / 60),
             per_span=SECONDS_PER_SPAN,
         )
     )
+    if skipped:
+        echo(f"{len(skipped)} skipped spans come back after the {len(fresh)} new ones.")
     decided = 0
     with tempfile.TemporaryDirectory(prefix="ytverbatim-ab-") as scratch:
-        for offset, span in enumerate(pending):
+        while queue:
+            span = queue.popleft()
             clip = Path(scratch) / f"{span.id}.wav"
             cutter(wavs[span.file], span.clip_start, span.clip_end, clip)
-            echo(render(span, len(done) + offset + 1, len(spans)))
+            echo(render(span, len(decided_ids) + 1, len(spans)))
             player(clip)
             while True:
                 key = getchar().strip().lower()
@@ -129,12 +142,23 @@ def listen(
                     player(clip)
                 elif key == "q":
                     echo("saved; run listen again to resume")
-                    return ListenResult(decided, len(pending) - offset, quit=True)
+                    return ListenResult(decided, len(spans) - len(decided_ids), quit=True)
                 elif key in CHOICE_KEYS:
-                    _append(directory / DECISIONS_FILE, LoggedDecision(span=span.id, choice=CHOICE_KEYS[key], at=now()))
-                    decided += 1
+                    choice = CHOICE_KEYS[key]
+                    _append(directory / DECISIONS_FILE, LoggedDecision(span=span.id, choice=choice, at=now()))
+                    if choice == "skip":
+                        if span.id not in offered_again:
+                            offered_again.add(span.id)
+                            queue.append(span)
+                    else:
+                        decided_ids.add(span.id)
+                        decided += 1
                     break
                 else:
                     echo("keys: 1 2 b 0 r s q")
-    echo(f"session {name!r} complete: {len(spans)} spans")
-    return ListenResult(decided, 0, quit=False)
+    remaining = len(spans) - len(decided_ids)
+    if remaining:
+        echo(f"{remaining} spans are still skipped; run listen again to decide them before `decide`")
+    else:
+        echo(f"session {name!r} complete: {len(spans)} spans")
+    return ListenResult(decided, remaining, quit=False)

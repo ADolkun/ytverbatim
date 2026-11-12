@@ -1,6 +1,9 @@
 """The amended decision rule, applied per language view; anything short of a clear win keeps Whisper.
 
-A challenger replaces the control in a language only if, on that language's data:
+Nothing is decided until every A/B span has a decision (1, 2, both or neither); skips must be revisited.
+
+A challenger replaces the control anywhere only if its overall blind A/B win rate, over both languages, has a
+Wilson 95% lower bound above 0.5. It then replaces the control in a language only if, on that language's data:
 1. its blind A/B win rate has a Wilson 95% lower bound above 0.5;
 2. on numeric/entity spans its win rate is at least 0.5 with a lower bound above 0.40 (non-inferiority);
 3. its repetition, token-cap and non-speech rates are not worse than the control's beyond the tolerances below;
@@ -13,6 +16,7 @@ from pydantic import BaseModel, ConfigDict
 from evals.normalize import Language
 from evals.report import Report, WinStats
 from evals.screen import LANGUAGES, HypothesisScreen
+from ytverbatim.errors import ConfigError
 
 WIN_LOWER_BOUND = 0.5
 NUMERIC_POINT = 0.5
@@ -49,11 +53,11 @@ class Decision(_Frozen):
     summary: str
 
 
-def _win_check(stats: WinStats | None) -> Check:
+def _win_check(stats: WinStats | None, name: str) -> Check:
     if stats is None or stats.low is None or stats.rate is None:
-        return Check(name="overall win rate", passed=False, detail="no decisive A/B answers")
+        return Check(name=name, passed=False, detail="no decisive A/B answers")
     return Check(
-        name="overall win rate",
+        name=name,
         passed=stats.low > WIN_LOWER_BOUND,
         detail=f"{stats.rate:.3f}, lower bound {stats.low:.3f} (needs > {WIN_LOWER_BOUND})",
     )
@@ -120,10 +124,20 @@ def decide(report: Report) -> Decision:
             engine=dict.fromkeys(LANGUAGES, control),
             summary=f"no A/B session: {control or 'Whisper'} stays",
         )
+    if ab.undecided:
+        raise ConfigError(
+            f"session {ab.session!r} has {ab.undecided} of {ab.spans} spans without a decision (1, 2, b or 0); "
+            "finish them with `listen`, then run `report` again"
+        )
     control, challenger = report.screen.get(ab.control), report.screen.get(ab.challenger)
+    overall = _win_check(ab.overall, "overall win rate (both languages)")
     languages: list[LanguageDecision] = []
     for language in LANGUAGES:
-        checks = [_win_check(ab.by_language.get(language)), _numeric_check(ab.numeric_by_language.get(language))]
+        checks = [
+            overall,
+            _win_check(ab.by_language.get(language), "language win rate"),
+            _numeric_check(ab.numeric_by_language.get(language)),
+        ]
         if control is None or challenger is None:
             checks.append(Check(name="screening", passed=False, detail="the pair is missing from the screening"))
         else:
@@ -155,7 +169,8 @@ def render_decision(decision: Decision) -> str:
         lines += [f"| {c.name} | {'pass' if c.passed else 'fail'} | {c.detail} |" for c in language.checks]
         lines.append("")
     lines += [
-        "Rule: overall Wilson 95% lower bound > 0.5; numeric/entity point estimate >= 0.5 with lower bound > 0.40; "
+        "Rule: every span decided; Wilson 95% lower bound > 0.5 overall and in the language; "
+        "numeric/entity point estimate >= 0.5 with lower bound > 0.40; "
         f"repetition and token-cap rates within +{REPETITION_TOLERANCE_PER_HOUR}/h and non-speech output within "
         f"+{NONSPEECH_TOLERANCE:.1%} of the control; reference CER within +{CER_TOLERANCE:.0%} point. "
         "Otherwise Whisper stays.",
