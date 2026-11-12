@@ -159,7 +159,7 @@ def test_a_checkpoint_hit_skips_the_llm(tmp_path: Path) -> None:
     assert again.requests == []
     assert second.texts == first.texts
     assert second.edits == first.edits
-    assert second.usage == ()
+    assert second.usage == first.usage and first.usage, "a reused batch still counts toward the cost"
 
 
 def test_checkpoints_are_keyed_by_client_and_batch_text(tmp_path: Path) -> None:

@@ -27,8 +27,8 @@ from ytverbatim.text.guards import GuardName, check_fix, symbol_changes
 
 _log = logging.getLogger(__name__)
 
-# Part of every checkpoint key: bump it when a prompt changes meaning so cached replies are not reused.
-PROMPT_VERSION = "correction-v1"
+# Part of every checkpoint and stage key: bump it on any prompt, guard or logic change so stored results are redone.
+PROMPT_VERSION = "correction-v2"
 BATCH_CHARS = 1800
 # Mean per-word probability below which a sentence gets the second, low-confidence pass.
 SECOND_PASS_MIN_CONFIDENCE = 0.5
@@ -83,6 +83,13 @@ class _Fix(BaseModel):
 class _Fixes(BaseModel):
     model_config = ConfigDict(strict=True)
     fixed: list[_Fix]
+
+
+class _Checkpoint(BaseModel):
+    """A batch's validated reply and what it cost, so a reused batch still counts toward the document's LLM usage."""
+
+    reply: _Fixes
+    usage: tuple[LLMUsage, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,15 +232,22 @@ class _Run:
         path = self._checkpoint_dir / f"{hashlib.sha256(key.encode()).hexdigest()}.json"
         if path.exists():
             try:
-                return _Fixes.model_validate_json(path.read_bytes())
+                checkpoint = _Checkpoint.model_validate_json(path.read_bytes())
             except ValidationError:
                 # Only this module writes these files, atomically; an unreadable one is stale, and redoing it is safe.
                 _log.warning("correction: ignoring an unreadable checkpoint %s", path.name)
+            else:
+                self.meter.merge(checkpoint.usage)
+                return checkpoint.reply
         stage = STAGE if pass_ == "first" else SECOND_PASS_STAGE
         request = LLMRequest(system=system, user=user, max_output_tokens=_MAX_OUTPUT_TOKENS, temperature=0.0)
-        fixes = complete_json(self.meter.metered(stage, self._client), request, _Fixes)
+        batch = UsageMeter()
+        try:
+            fixes = complete_json(batch.metered(stage, self._client), request, _Fixes)
+        finally:
+            self.meter.merge(batch.summary())
         self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        atomic.write_json(path, fixes.model_dump())
+        atomic.write_json(path, _Checkpoint(reply=fixes, usage=batch.summary()).model_dump(mode="json"))
         return fixes
 
 

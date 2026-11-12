@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from ytverbatim.contract.models import LLMUsage
@@ -31,6 +32,14 @@ class UsageMeter:
         if tally.output_tokens is not None:
             tally.output_tokens += usage.output_tokens
 
+    def merge(self, usages: Iterable[LLMUsage]) -> None:
+        """Add totals recorded earlier, such as those stored with a checkpointed batch."""
+        for usage in usages:
+            tally = self._tallies.setdefault((usage.stage, usage.client), _Tally())
+            tally.calls += usage.calls
+            tally.input_tokens = _add(tally.input_tokens, usage.input_tokens)
+            tally.output_tokens = _add(tally.output_tokens, usage.output_tokens)
+
     def metered(self, stage: str, client: LLMClient) -> LLMClient:
         """`client`, with every call that got a reply recorded under `stage`, including a reply it then rejected."""
         return _MeteredClient(client, stage, self)
@@ -46,6 +55,10 @@ class UsageMeter:
             )
             for (stage, client_id), tally in self._tallies.items()
         )
+
+
+def _add(total: int | None, more: int | None) -> int | None:
+    return None if total is None or more is None else total + more
 
 
 class _MeteredClient:

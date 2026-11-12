@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from ytverbatim.contract.models import LLMUsage
 from ytverbatim.errors import LLMOutputError
 from ytverbatim.llm.protocol import LLMRequest, LLMResponse, Usage
 from ytverbatim.text import punctuate as punctuate_module
@@ -124,6 +125,11 @@ def test_zh_tagged_text_without_cjk_gets_the_english_style(tmp_path: Path) -> No
         ("we hold nvda and amd", "We hold NVDA, and AMD."),
         ("S&P 500 rose 3.5%", "S&P 500 rose 3.5%."),
         ("全角，标点。", "全角,标点."),
+        ("prices rose 12 today", "Prices rose 12. Today."),
+        ("in 2018 in midterm years", "In 2018, in midterm years."),
+        ("上涨了12 今天收盘", "上涨了12，今天收盘。"),
+        ("rose 1,000 points", "Rose 1,000 points."),
+        ("a 10-K filing", "A 10-K filing."),
     ],
 )
 def test_guard_accepts_punctuation_spacing_and_case_changes(before: str, after: str) -> None:
@@ -146,6 +152,34 @@ def test_guard_accepts_punctuation_spacing_and_case_changes(before: str, after: 
 )
 def test_guard_rejects_changed_letters_characters_and_digits(before: str, after: str) -> None:
     assert guard_violation(before, after) is not None
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ("rose 1,000 points", "rose 1，000 points."),
+        ("rates at 3.5 now", "rates at 3．5 now."),
+        ("fell -5% today", "fell 5% today."),
+        ("about 1/2 of it", "about 12 of it."),
+        ("at 3:30 pm", "at 330 pm."),
+        ("the 10-K filing", "the 10K filing."),
+        ("the 1000 shares", "the 1,000 shares."),
+        ("we hold NVDA", "We hold nvda."),
+        ("the Fed met", "the fed met."),
+    ],
+)
+def test_guard_rejects_number_punctuation_and_lowercasing(before: str, after: str) -> None:
+    assert guard_violation(before, after) is not None
+
+
+def test_guard_names_a_lowercased_letter() -> None:
+    assert guard_violation("we hold NVDA", "We hold nvda.") == 'lowercased "NVDA"'
+
+
+def test_the_prompt_forbids_touching_punctuation_at_numbers(tmp_path: Path) -> None:
+    client = FakeClient([reply((0, "Hello, everyone."))])
+    run(["hello everyone"], client, tmp_path, "en")
+    assert "next to a number" in client.requests[0].system and "Never lowercase" in client.requests[0].system
 
 
 def test_guard_diff_names_the_change() -> None:
@@ -189,12 +223,15 @@ def test_checkpoint_hit_skips_the_llm(tmp_path: Path) -> None:
     assert second.requests == []
     assert result.texts == ("大家好，欢迎回来。",)
     assert len(result.edits[0]) == 1
-    assert result.usage == ()
+    # The stored batch still counts: usage is what the result cost, not what this call spent.
+    assert result.usage == (
+        LLMUsage(stage="punctuation", client=CLIENT_ID, calls=1, input_tokens=100, output_tokens=20),
+    )
 
 
 def test_checkpoint_is_keyed_by_client_and_prompt_version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     run(["大家好 欢迎回来"], FakeClient([reply((0, "大家好，欢迎回来。"))]), tmp_path)
-    monkeypatch.setattr(punctuate_module, "PROMPT_VERSION", "punctuation-v2")
+    monkeypatch.setattr(punctuate_module, "PROMPT_VERSION", punctuate_module.PROMPT_VERSION + "-bumped")
     other = FakeClient([reply((0, "大家好，欢迎回来。"))])
     run(["大家好 欢迎回来"], other, tmp_path)
     assert len(other.requests) == 1
