@@ -46,9 +46,8 @@ _CJK_RETENTION_FLOOR = 0.5
 # fix dominates a very short segment, so it applies only from a minimum length.
 _CJK_MIN_SIMILARITY = 0.65
 _CJK_RATIO_MIN_CHARS = 8
-# GAP→GAAP is one edit and SMCI→MSCI one transposition. A two-letter symbol may move by one edit only: two edits
-# would replace it outright.
-_MAX_SYMBOL_DISTANCE = 2
+# GAP→GAAP is one edit and SMCI→MSCI one transposition. Two edits already reach a different ticker (SAP→GAAP).
+_MAX_SYMBOL_DISTANCE = 1
 
 _CJK = re.compile(r"[\u4e00-\u9fff]")
 _CJK_NUMERAL_CHARS = "〇零一二两兩三四五六七八九十百千万萬亿億廿卅"
