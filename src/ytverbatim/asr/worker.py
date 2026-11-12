@@ -264,14 +264,16 @@ def _require_same_chunk(existing: ChunkHypothesis, chunk: Chunk) -> None:
         )
 
 
-def bound_allocator(mlx: MlxAllocator, memory_cap_bytes: int | None) -> None:
+def bound_allocator(
+    mlx: MlxAllocator, memory_cap_bytes: int | None, *, cache_limit_bytes: int = CACHE_LIMIT_BYTES
+) -> None:
     """Keep MLX's freed-buffer cache small and steer its scheduling under the cap.
 
     MLX defaults both limits to about the whole of RAM, so without this the cache alone can grow until the machine
     stops. The memory limit is a soft scheduling guideline: past it MLX waits for queued work to finish before it
     allocates more, but it still allocates. The parent's watch is the hard stop.
     """
-    mlx.set_cache_limit(CACHE_LIMIT_BYTES)
+    mlx.set_cache_limit(cache_limit_bytes)
     if memory_cap_bytes is not None:
         mlx.set_memory_limit(int(memory_cap_bytes * MLX_LIMIT_FRACTION))
 
