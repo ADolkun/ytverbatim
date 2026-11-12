@@ -6,16 +6,18 @@ whole batch and starts a cooldown instead of being retried, least of all with co
 """
 
 import contextlib
+import fcntl
 import json
 import logging
+import os
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
-from typing import Literal, cast
+from typing import Literal, Protocol, cast
 
 from ytverbatim import atomic, ids, paths
 from ytverbatim.acquire.audio import INFO_MAX_AGE_S, WAV_NAME, fetch_audio, find_audio, to_wav16k, validate_audio
@@ -29,6 +31,7 @@ from ytverbatim.auth.cooldown import (
     STOP_STATES,
     Cooldown,
     GuardedRunner,
+    active_cooldown,
     check_cooldown,
     read_cooldown,
     start_cooldown,
@@ -43,6 +46,7 @@ from ytverbatim.contract.models import Access
 from ytverbatim.errors import (
     AuthError,
     BatchStopError,
+    BusyError,
     DependencyError,
     MediaValidationError,
     ProcTimeout,
@@ -73,6 +77,7 @@ METADATA_FILE = "metadata.json"
 CAPTIONS_DIR = "captions"
 TRACKS_FILE = "tracks.json"
 REPORT_FILE = "batch_report.json"
+LOCK_NAME = ".lock"
 _REPORT_VERSION = 1
 
 # Any other AuthError is about the auth source itself: once one happens, every later cookied request in the
@@ -581,14 +586,56 @@ def sleep_args(video_count: int) -> tuple[str, ...]:
     return SLEEP_PRESET if video_count >= 2 else SINGLE_VIDEO_SLEEP_ARGS  # noqa: PLR2004
 
 
-def _default_runner(sleep: Sequence[str]) -> YtDlpRunner:
+def default_runner(sleep: Sequence[str]) -> YtDlpRunner:
     return SubprocessRunner(sleep_args=sleep)
+
+
+@contextlib.contextmanager
+def video_lock(vdir: Path) -> Generator[None]:
+    """Hold the video directory exclusively, or raise `BusyError` at once; waiting could mean hours of ASR."""
+    vdir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(vdir / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise BusyError(f"another ytverbatim run is processing {vdir.name}") from None
+        yield
+    finally:
+        os.close(fd)
 
 
 @dataclass(frozen=True)
 class PlannedVideo:
     video_id: str
     cookies_first: bool
+
+
+class VideoHook(Protocol):
+    """What `fetch` does with each planned video; `ytverbatim run` plugs its whole per-video pipeline in here.
+
+    `done` must answer without any request: during a cooldown a batch whose videos are all done still runs.
+    `__call__` records the video's own failures in the outcome and raises only what ends the batch.
+    """
+
+    def done(self, video_id: str) -> bool: ...
+
+    def __call__(self, session: "FetchSession", planned: PlannedVideo) -> VideoOutcome: ...
+
+
+@dataclass(frozen=True)
+class _FetchOnly:
+    out: Path
+
+    def done(self, video_id: str) -> bool:
+        return False
+
+    def __call__(self, session: "FetchSession", planned: PlannedVideo) -> VideoOutcome:
+        try:
+            with video_lock(paths.video_dir(planned.video_id, self.out)):
+                return session.fetch_video(planned.video_id, cookies_first=planned.cookies_first)
+        except BusyError as exc:
+            return VideoOutcome(planned.video_id, VideoStatus.ERROR, error="busy", detail=str(exc))
 
 
 def _channel_keys(entries: Iterable[str]) -> set[str]:
@@ -649,21 +696,28 @@ def fetch(
     source: CookieSource | None,
     out: Path | None = None,
     options: FetchOptions | None = None,
-    runner_factory: Callable[[Sequence[str]], YtDlpRunner] = _default_runner,
+    runner_factory: Callable[[Sequence[str]], YtDlpRunner] = default_runner,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], datetime] = utcnow,
     on_video: Callable[[VideoOutcome], None] | None = None,
+    hook: VideoHook | None = None,
 ) -> BatchReport:
     """Fetch every video behind `targets` into `<out>/<id>/` and write `<out>/batch_report.json`.
 
-    Raises `BatchStopError` before any request while a cooldown is active, and `AuthError(NO_SOURCE)` for
-    policy `always` without a source. Per-video failures, and a batch stop mid-run, land in the report.
+    Each video runs under its directory lock, through `hook` when one is given. Raises `BatchStopError` before
+    any request while a cooldown is active (unless every target is a video the hook reports done), or when
+    planning itself met a stop; and `AuthError(NO_SOURCE)` for policy `always` without a source. Per-video
+    failures, and a batch stop mid-run, land in the report.
     """
     options = options or FetchOptions()
     out = out if out is not None else paths.default_output_root()
+    run_video = hook if hook is not None else _FetchOnly(out)
     started = clock()
-    if not options.ignore_cooldown:
-        check_cooldown(started)
+    waived = False
+    if not options.ignore_cooldown and (cooldown := active_cooldown(started)) is not None:
+        if not _all_done(targets, run_video):
+            raise BatchStopError(cooldown.signal, cooldown.until)
+        waived = True
     if options.policy == "always" and source is None:
         raise AuthError(AuthState.NO_SOURCE, "--policy always needs an auth source")
 
@@ -682,7 +736,10 @@ def fetch(
                 outcomes.append(VideoOutcome(planned.video_id, VideoStatus.NOT_ATTEMPTED))
                 continue
             try:
-                outcome = session.fetch_video(planned.video_id, cookies_first=planned.cookies_first)
+                # The cooldown was waived only because nothing needed a request; a video undone since must not fetch.
+                if waived and not run_video.done(planned.video_id):
+                    check_cooldown(clock())
+                outcome = run_video(session, planned)
             except BatchStopError as exc:
                 stopped = exc
                 outcome = VideoOutcome(
@@ -700,6 +757,11 @@ def fetch(
     return report
 
 
+def _all_done(targets: Sequence[str], hook: VideoHook) -> bool:
+    refs = [ids.classify(target) for target in targets]
+    return all(ref is not None and ref.kind is ids.RefKind.VIDEO and hook.done(ref.id) for ref in refs)
+
+
 __all__ = [
     "ESCALATE_SIGNALS",
     "STOP_STATES",
@@ -709,13 +771,16 @@ __all__ = [
     "FetchSession",
     "PlannedVideo",
     "Policy",
+    "VideoHook",
     "VideoOutcome",
     "VideoStatus",
     "check_cooldown",
+    "default_runner",
     "fetch",
     "plan_videos",
     "read_cooldown",
     "sleep_args",
     "start_cooldown",
     "stop_fix",
+    "video_lock",
 ]

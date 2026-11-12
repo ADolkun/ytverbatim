@@ -20,4 +20,11 @@ def __getattr__(name: str) -> object:
     module = _LAZY.get(name)
     if module is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    return getattr(import_module(module), name)
+    value = getattr(import_module(module), name)
+    # Cached so the next lookup is an ordinary attribute and never reaches __getattr__ again.
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted({*globals(), *_LAZY})

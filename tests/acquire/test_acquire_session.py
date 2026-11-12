@@ -294,6 +294,16 @@ def test_cooldown_refuses_to_start_unless_ignored(session_kit) -> None:
     assert run(session_kit, session_kit.yt(), [PUBLIC_2], now=NOW + timedelta(hours=2)).exit_code == 0
 
 
+def test_fetch_takes_the_per_video_lock_that_run_uses(session_kit) -> None:
+    yt = session_kit.yt()
+    with session.video_lock(session_kit.out / PUBLIC):
+        report = run(session_kit, yt, [PUBLIC, PUBLIC_2])
+    first, second = report.videos
+    assert (first.status, first.error) == (VideoStatus.ERROR, "busy") and PUBLIC in first.detail
+    assert second.status is VideoStatus.OK
+    assert {call.video_id for call in yt.labels("metadata")} == {PUBLIC_2}
+
+
 def test_cooldown_doubles_on_repeats_and_is_capped(session_kit) -> None:
     now = NOW
     durations: list[float] = []

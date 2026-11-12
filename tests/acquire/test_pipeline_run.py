@@ -1,6 +1,7 @@
 import json
+import logging
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -9,12 +10,14 @@ from click.testing import CliRunner
 
 from ytverbatim import config, pipeline
 from ytverbatim.acquire import session
+from ytverbatim.acquire.metadata import Chapter, VideoMetadata
+from ytverbatim.asr import registry
 from ytverbatim.asr import runner as asr_runner
 from ytverbatim.asr.models import HYPOTHESES_FILE, ChunkHypothesis, RunMetrics, WorkerRequest
 from ytverbatim.asr.runner import WorkerResult
 from ytverbatim.cli import main
 from ytverbatim.contract import ContextDocument, Word, load_document
-from ytverbatim.errors import BusyError, ConfigError, EngineError
+from ytverbatim.errors import BusyError, ConfigError, ContractError, DependencyError, EngineError
 from ytverbatim.pipeline import ProgressEvent, VideoResult, process, process_many, video_lock
 from ytverbatim.ytdlp.types import Signal
 
@@ -75,6 +78,8 @@ class FakeWorker:
     seen_wav: list[bool] = field(default_factory=list[bool])
     stale_output: list[bool] = field(default_factory=list[bool])
     error: EngineError | None = None
+    # A line appended to the hypotheses of the named file, to stand in for a corrupt row.
+    garbage: dict[str, str] = field(default_factory=dict[str, str])
 
     def __call__(self, request: WorkerRequest, *, python: str | None = None) -> WorkerResult:
         self.calls.append(request)
@@ -85,7 +90,10 @@ class FakeWorker:
             raise self.error
         out.mkdir(parents=True, exist_ok=True)
         rows = whole_file_rows(request) if request.engine.spec.max_chunk_s is None else chunked_rows(request)
-        (out / HYPOTHESES_FILE).write_text("".join(row.model_dump_json() + "\n" for row in rows), encoding="utf-8")
+        lines = [row.model_dump_json() for row in rows]
+        if request.files[0].id in self.garbage:
+            lines.append(self.garbage[request.files[0].id])
+        (out / HYPOTHESES_FILE).write_text("".join(line + "\n" for line in lines), encoding="utf-8")
         metrics = RunMetrics(
             hypothesis=request.engine.spec.id,
             files=1,
@@ -98,6 +106,19 @@ class FakeWorker:
             max_rss_bytes=0,
         )
         return WorkerResult(out / HYPOTHESES_FILE, metrics, 0, 0.0)
+
+
+@pytest.fixture(autouse=True)
+def engine_installed(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Report every engine library as installed; the list collects the modules that were asked about."""
+    asked: list[str] = []
+
+    def find_spec(name: str) -> object:
+        asked.append(name)
+        return object()
+
+    monkeypatch.setattr(registry, "find_spec", find_spec)
+    return asked
 
 
 @pytest.fixture
@@ -334,8 +355,136 @@ def test_a_playlist_runs_every_video(session_kit, worker: FakeWorker) -> None:
     assert all((session_kit.out / v / "context.md").is_file() for v in yt.playlist)
 
 
+def batch_ids(kit) -> list[tuple[str, str]]:
+    batch = json.loads((kit.out / "batch_report.json").read_text(encoding="utf-8"))
+    return [(video["id"], video["status"]) for video in batch["videos"]]
+
+
+def test_a_chapter_ending_before_it_starts_fails_that_video_only(
+    session_kit, worker: FakeWorker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = pipeline.load_metadata
+
+    def backwards_chapters(vdir: Path) -> VideoMetadata:
+        metadata = real(vdir)
+        return replace(metadata, chapters=(Chapter("Backwards", 50.0, 10.0),)) if vdir.name == PUBLIC else metadata
+
+    monkeypatch.setattr(pipeline, "load_metadata", backwards_chapters)
+    report, results, _ = run(session_kit, session_kit.yt(), [PUBLIC, "pubVideo002"])
+    first, second = (r.outcome for r in results)
+    assert first.error == "contract" and "does not fit the contract" in first.detail
+    assert isinstance(results[0].error, ContractError)
+    assert second.status is session.VideoStatus.OK and report.exit_code == 1
+    assert batch_ids(session_kit) == [(PUBLIC, "error"), ("pubVideo002", "ok")]
+    assert not (session_kit.out / PUBLIC / "context.json").exists()
+    with pytest.raises(ContractError):
+        process(PUBLIC, out=session_kit.out, runner_factory=lambda _sleep: session_kit.yt())
+
+
+def test_a_malformed_hypothesis_row_fails_that_video_only(session_kit, worker: FakeWorker) -> None:
+    worker.garbage[PUBLIC] = '{"hypothesis": "w-prod", "file": "pubVideo001", "chunk": "zero"'
+    report, results, _ = run(session_kit, session_kit.yt(), [PUBLIC, "pubVideo002"])
+    first, second = (r.outcome for r in results)
+    assert first.error == "contract" and "hypotheses.jsonl line 2" in first.detail
+    assert second.status is session.VideoStatus.OK and report.exit_code == 1
+    assert batch_ids(session_kit) == [(PUBLIC, "error"), ("pubVideo002", "ok")]
+
+
+def test_an_os_error_is_a_per_video_error_and_process_raises_it_unchanged(
+    session_kit, worker: FakeWorker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = Path.unlink
+
+    def unlink(self: Path, missing_ok: bool = False) -> None:
+        if self.name == "audio.wav" and self.parent.name == PUBLIC:
+            raise PermissionError(13, "synthetic: permission denied", str(self))
+        real(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    report, results, _ = run(session_kit, session_kit.yt(), [PUBLIC, "pubVideo002"])
+    first, second = (r.outcome for r in results)
+    assert first.error == "os_error" and first.detail.startswith("PermissionError:")
+    assert str(session_kit.home) not in first.detail
+    assert second.status is session.VideoStatus.OK and report.exit_code == 1
+    assert batch_ids(session_kit) == [(PUBLIC, "error"), ("pubVideo002", "ok")]
+    with pytest.raises(PermissionError):
+        process(PUBLIC, out=session_kit.out, runner_factory=lambda _sleep: session_kit.yt(), force=True)
+
+
+def test_a_stop_seen_while_expanding_a_playlist_stops_before_any_video(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    yt.playlist = ["plVideo0001", "plVideo0002"]
+    yt.secondary[("expand", False)] = (Signal.BOT_CHECK,)
+    with pytest.raises(session.BatchStopError) as stopped:
+        run(session_kit, yt, ["https://www.youtube.com/playlist?list=PLsynthetic"])
+    assert stopped.value.signal is Signal.BOT_CHECK
+    assert yt.labels("metadata") == [] and worker.calls == []
+    assert session.read_cooldown() is not None
+
+
+def test_process_returns_a_finished_document_despite_a_stop_on_a_successful_call(
+    session_kit, worker: FakeWorker, caplog: pytest.LogCaptureFixture
+) -> None:
+    yt = session_kit.yt()
+    yt.secondary[("metadata", False)] = (Signal.BOT_CHECK,)
+    with caplog.at_level(logging.WARNING, logger="ytverbatim.pipeline"):
+        doc = process(PUBLIC, out=session_kit.out, runner_factory=lambda _sleep: yt)
+    assert isinstance(doc, ContextDocument) and len(doc.segments) == 2
+    assert "back off" in caplog.text
+    cooldown = session.read_cooldown()
+    assert cooldown is not None and cooldown.signal is Signal.BOT_CHECK
+
+
+def test_a_missing_engine_extra_fails_before_any_request(
+    session_kit, worker: FakeWorker, monkeypatch: pytest.MonkeyPatch, engine_installed: list[str]
+) -> None:
+    monkeypatch.setattr(registry, "find_spec", lambda name: None)
+    yt = session_kit.yt()
+    with pytest.raises(DependencyError, match=r"ytverbatim\[whisper\]"):
+        run(session_kit, yt)
+    with pytest.raises(DependencyError, match=r"ytverbatim\[asr\]"):
+        run(session_kit, yt, options=engine_options("q-base"))
+    with pytest.raises(DependencyError, match=r"ytverbatim\[whisper,asr\]"):
+        run(session_kit, yt, options=engine_options("w-vad"))
+    assert yt.calls == [] and worker.calls == []
+
+
+def test_the_dependency_check_asks_for_the_adapter_modules(session_kit, worker: FakeWorker, engine_installed) -> None:
+    run(session_kit, session_kit.yt())
+    assert engine_installed == ["mlx_whisper"]
+
+
+def test_a_context_from_another_engine_is_transcribed_again(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    run(session_kit, yt)
+    _, results, events = run(session_kit, yt, options=engine_options("q-base"))
+    assert [call.engine.spec.id for call in worker.calls] == ["w-prod", "q-base"]
+    assert "skip" not in [e.stage for e in events]
+    doc = load_document(session_kit.out / PUBLIC / "context.json")
+    assert doc.transcript.runs[0].engine == "q-base" and results[0].document == doc
+
+    _, again, _ = run(session_kit, yt, options=engine_options("q-base"))
+    assert len(worker.calls) == 2 and again[0].outcome.reused == ("context",)
+
+
+def test_a_cooldown_does_not_refuse_a_batch_that_needs_no_request(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    run(session_kit, yt)
+    calls = len(yt.calls)
+    session.start_cooldown(Signal.RATE_LIMITED, NOW)
+
+    report, results, _ = run(session_kit, yt)
+    assert report.exit_code == 0 and results[0].outcome.reused == ("context",)
+    assert len(yt.calls) == calls
+    with pytest.raises(session.BatchStopError):
+        run(session_kit, yt, [PUBLIC, "pubVideo002"])
+    with pytest.raises(session.BatchStopError):
+        run(session_kit, yt, options=engine_options("q-base"))
+    assert len(yt.calls) == calls
+
+
 def invoke(kit, yt, monkeypatch: pytest.MonkeyPatch, *args: str):
-    monkeypatch.setattr(pipeline, "SubprocessRunner", lambda *, sleep_args=(): yt)
+    monkeypatch.setattr(session, "SubprocessRunner", lambda *, sleep_args=(): yt)
     return CliRunner().invoke(main, ["run", "--out", str(kit.out), *args])
 
 
