@@ -34,7 +34,7 @@ def run_command(
     """Turn videos, playlists or channels into context.json and context.md.
 
     Fetches each video, transcribes it locally and writes both files next to the downloaded media. A video
-    that already has a context.json is skipped unless --force is given.
+    that already has a context.json from the selected engine is skipped unless --force is given.
     Exit codes: 0 ok, 1 some videos failed, 2 auth error, 3 batch stopped (cooldown).
     """
     bad = [url for url in urls if ids.classify(url) is None]

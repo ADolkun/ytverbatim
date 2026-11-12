@@ -5,43 +5,38 @@ subprocess; everything between the worker's chunk rows and the contract document
 """
 
 import collections
-import contextlib
-import fcntl
 import json
 import logging
-import os
 import shutil
 import time
-from collections.abc import Callable, Collection, Generator, Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
-from datetime import UTC, date, datetime
+from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import asdict, dataclass, field, replace
+from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
 
 import opencc
-from pydantic import JsonValue
+from pydantic import JsonValue, ValidationError
 
 from ytverbatim import __version__, atomic, config, ids, paths
 from ytverbatim.acquire.audio import WAV_NAME
 from ytverbatim.acquire.metadata import VideoMetadata, info_path, load_metadata
 from ytverbatim.acquire.session import (
-    REPORT_FILE,
     BatchReport,
     FetchOptions,
     FetchSession,
     PlannedVideo,
     VideoOutcome,
     VideoStatus,
-    check_cooldown,
-    plan_videos,
-    sleep_args,
-    stop_fix,
+    default_runner,
+    fetch,
+    video_lock,
 )
 from ytverbatim.asr import chunks, registry
 from ytverbatim.asr import runner as asr_runner
 from ytverbatim.asr.models import ChunkHypothesis, FileJob, WorkerRequest
 from ytverbatim.asr.protocol import EngineDef
-from ytverbatim.auth.cooldown import guarded
+from ytverbatim.auth.cooldown import utcnow
 from ytverbatim.auth.source import CookieSource, resolve_source
 from ytverbatim.auth.state import AuthState
 from ytverbatim.contract import (
@@ -75,14 +70,13 @@ from ytverbatim.errors import (
 )
 from ytverbatim.render import render_markdown
 from ytverbatim.text import segment as seg
-from ytverbatim.ytdlp.runner import SubprocessRunner, redact
+from ytverbatim.ytdlp.runner import redact
 from ytverbatim.ytdlp.types import YtDlpRunner
 
 log = logging.getLogger(__name__)
 
 CONTEXT_JSON = "context.json"
 CONTEXT_MD = "context.md"
-LOCK_NAME = ".lock"
 STAGES_DIR = ".stages"
 UNDETERMINED_LANGUAGE = "und"
 
@@ -103,14 +97,8 @@ class VideoResult:
     document: ContextDocument | None = None
     markdown: Path | None = None
     elapsed_s: float = 0.0
-
-
-def _default_runner(sleep: Sequence[str]) -> YtDlpRunner:
-    return SubprocessRunner(sleep_args=sleep)
-
-
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
+    # The exception behind a failed outcome when the pipeline caught one, so `process` can raise it unchanged.
+    error: Exception | None = None
 
 
 def process(
@@ -122,12 +110,13 @@ def process(
     captions: bool = True,
     force: bool = False,
     progress: Callable[[ProgressEvent], None] | None = None,
-    runner_factory: Callable[[Sequence[str]], YtDlpRunner] = _default_runner,
+    runner_factory: Callable[[Sequence[str]], YtDlpRunner] = default_runner,
 ) -> ContextDocument:
-    """Produce the context document for one video, reusing it when `context.json` already exists.
+    """Produce the context document for one video, reusing it when `context.json` already exists from this engine.
 
-    Raises the video's own error (`AuthError`, `EngineError`, ...), or `BatchStopError` when YouTube asked
-    us to back off. `auth` is an auth spec as for `--auth`; without it the configured source applies.
+    Raises the video's own error (`AuthError`, `EngineError`, `ContractError`, ...), or `BatchStopError` when
+    YouTube asked us to back off before the video was done. `auth` is an auth spec as for `--auth`; without it
+    the configured source applies.
     """
     ref = ids.classify(url)
     if ref is None or ref.kind is not ids.RefKind.VIDEO:
@@ -144,12 +133,17 @@ def process(
         on_video=results.append,
         runner_factory=runner_factory,
     )
+    (result,) = results
+    if result.document is not None:
+        if report.stopped is not None:
+            # The cooldown file is already written, so later runs wait; this video itself finished.
+            log.warning("%s is done, but YouTube asked to back off: %s", ref.id, report.stopped)
+        return result.document
     if report.stopped is not None:
         raise report.stopped
-    (result,) = results
-    if result.document is None:
-        raise _error_for(result.outcome)
-    return result.document
+    if result.error is not None:
+        raise result.error
+    raise _error_for(result.outcome)
 
 
 def process_many(  # noqa: PLR0913
@@ -163,23 +157,20 @@ def process_many(  # noqa: PLR0913
     ignore_cooldown: bool = False,
     progress: Callable[[ProgressEvent], None] | None = None,
     on_video: Callable[[VideoResult], None] | None = None,
-    runner_factory: Callable[[Sequence[str]], YtDlpRunner] = _default_runner,
+    runner_factory: Callable[[Sequence[str]], YtDlpRunner] = default_runner,
     sleep: Callable[[float], None] = time.sleep,
-    clock: Callable[[], datetime] = _utcnow,
+    clock: Callable[[], datetime] = utcnow,
 ) -> BatchReport:
     """Run every video behind `targets` into `<out>/<id>/` and write `<out>/batch_report.json`.
 
-    Refuses to start during a cooldown (`BatchStopError`), like `fetch`. Per-video failures land in the report;
-    a batch stop mid-run ends the batch and is recorded as well.
+    Raises `DependencyError` when the engine's extra is missing and refuses a cooldown (`BatchStopError`), both
+    before any request; the batch itself is `fetch`'s, with this pipeline as its per-video hook. Per-video
+    failures land in the report; a batch stop mid-run ends the batch and is recorded as well.
     """
     options = options or config.load_options()
     definition = _definition(options)
+    registry.check_dependencies(definition)
     out = out if out is not None else paths.default_output_root()
-    started = clock()
-    if not ignore_cooldown:
-        check_cooldown(started)
-    if options.auth.policy == "always" and source is None:
-        raise AuthError(AuthState.NO_SOURCE, "--policy always needs an auth source")
     fetch_options = FetchOptions(
         policy=options.auth.policy,
         captions=captions,
@@ -187,40 +178,25 @@ def process_many(  # noqa: PLR0913
         max_videos=options.ytdlp.max_videos_per_run,
         ignore_cooldown=ignore_cooldown,
     )
-    videos, capped = plan_videos(guarded(runner_factory(()), clock), targets, source=source, options=fetch_options)
-    session = FetchSession(
-        runner_factory(sleep_args(len(videos))), source=source, out=out, options=fetch_options, sleep=sleep, clock=clock
-    )
     settings = _Settings(definition, out, force, options.text.chapters == "youtube", progress or _no_progress, clock)
-    outcomes: list[VideoOutcome] = []
-    stopped: BatchStopError | None = None
-    try:
-        for planned in videos:
-            if stopped is not None:
-                outcomes.append(VideoOutcome(planned.video_id, VideoStatus.NOT_ATTEMPTED))
-                continue
-            began = time.monotonic()
-            try:
-                result = _run_video(session, planned, settings)
-            except BatchStopError as exc:
-                stopped = exc
-                result = VideoResult(
-                    VideoOutcome(
-                        planned.video_id, VideoStatus.ERROR, error=exc.signal.value, fix=stop_fix(exc.signal, exc.until)
-                    )
-                )
-            result = replace(result, elapsed_s=time.monotonic() - began)
-            outcomes.append(result.outcome)
-            if on_video is not None:
-                on_video(result)
-            # A stop seen on a successful call lets that video finish but no later one start.
-            if stopped is None:
-                stopped = session.pending_stop()
-    finally:
-        report = BatchReport(tuple(outcomes), stopped, capped, started, clock())
-        out.mkdir(parents=True, exist_ok=True)
-        atomic.write_json(out / REPORT_FILE, report.to_json())
-    return report
+    hook = _RunHook(settings)
+
+    def emit(outcome: VideoOutcome) -> None:
+        result = hook.results.pop(outcome.video_id, None)
+        if on_video is not None:
+            on_video(result if result is not None else VideoResult(outcome))
+
+    return fetch(
+        targets,
+        source=source,
+        out=out,
+        options=fetch_options,
+        runner_factory=runner_factory,
+        sleep=sleep,
+        clock=clock,
+        on_video=emit,
+        hook=hook,
+    )
 
 
 def _no_progress(_event: ProgressEvent) -> None:
@@ -243,15 +219,51 @@ def _definition(options: config.Options) -> EngineDef:
     return registry.get(options.asr.engine)
 
 
+@dataclass
+class _RunHook:
+    """`fetch`'s per-video hook for `run`; keeps each video's full result for `process_many`'s `on_video`."""
+
+    settings: _Settings
+    results: dict[str, VideoResult] = field(default_factory=dict[str, VideoResult])
+
+    def done(self, video_id: str) -> bool:
+        try:
+            return _reusable(paths.video_dir(video_id, self.settings.out), self.settings) is not None
+        except (ContractError, OSError):
+            return False
+
+    def __call__(self, session: FetchSession, planned: PlannedVideo) -> VideoOutcome:
+        began = time.monotonic()
+        result = _run_video(session, planned, self.settings)
+        self.results[planned.video_id] = replace(result, elapsed_s=time.monotonic() - began)
+        return result.outcome
+
+
+def _reusable(vdir: Path, settings: _Settings) -> ContextDocument | None:
+    """Return the finished document, unless `--force` is set or it holds no run of the selected engine."""
+    context = vdir / CONTEXT_JSON
+    if settings.force or not context.is_file():
+        return None
+    document = load_document(context)
+    wanted = _run_id(settings.definition)
+    if all(run.id != wanted for run in document.transcript.runs):
+        log.info("%s holds no %s run; transcribing it again", context, wanted)
+        return None
+    return document
+
+
+def _run_id(definition: EngineDef) -> str:
+    return f"asr:{definition.spec.id}"
+
+
 def _run_video(session: FetchSession, planned: PlannedVideo, settings: _Settings) -> VideoResult:
     video_id = planned.video_id
     vdir = paths.video_dir(video_id, settings.out)
     try:
         with video_lock(vdir):
-            context = vdir / CONTEXT_JSON
-            if not settings.force and context.is_file():
+            document = _reusable(vdir, settings)
+            if document is not None:
                 settings.emit(ProgressEvent(video_id, "skip", f"{CONTEXT_JSON} exists"))
-                document = load_document(context)
                 outcome = VideoOutcome(
                     video_id,
                     VideoStatus.OK,
@@ -267,46 +279,38 @@ def _run_video(session: FetchSession, planned: PlannedVideo, settings: _Settings
             return VideoResult(outcome, _transcribe(vdir, outcome.access, settings), vdir / CONTEXT_MD)
     except (BatchStopError, DependencyError):
         raise
-    except YtverbatimError as exc:
-        return VideoResult(VideoOutcome(video_id, VideoStatus.ERROR, error=_error_kind(exc), detail=redact(str(exc))))
+    except (YtverbatimError, ValueError, OSError) as exc:
+        detail = str(exc) if isinstance(exc, YtverbatimError) else f"{type(exc).__name__}: {exc}"
+        outcome = VideoOutcome(video_id, VideoStatus.ERROR, error=_error_kind(exc), detail=redact(detail))
+        return VideoResult(outcome, error=exc)
 
 
-def _error_kind(exc: YtverbatimError) -> str:
-    if isinstance(exc, BusyError):
-        return "busy"
-    if isinstance(exc, EngineError):
-        return "engine"
-    if isinstance(exc, ContractError):
-        return "contract"
-    if isinstance(exc, MediaValidationError):
-        return "media_invalid"
-    return "error"
+def _error_kind(exc: Exception) -> str:
+    match exc:
+        case BusyError():
+            return "busy"
+        case EngineError():
+            return "engine"
+        case ContractError():
+            return "contract"
+        case MediaValidationError():
+            return "media_invalid"
+        case OSError():
+            return "os_error"
+        case ValueError():
+            return "invalid_value"
+        case _:
+            return "error"
 
 
 def _error_for(outcome: VideoOutcome) -> YtverbatimError:
+    """Rebuild the error of a failure the fetch session recorded only as an outcome."""
     detail = outcome.detail or outcome.error or "failed"
     if outcome.auth_error and outcome.error is not None:
         return AuthError(AuthState(outcome.error), outcome.detail)
-    if outcome.error == "busy":
-        return BusyError(detail)
-    if outcome.error == "engine":
-        return EngineError(detail)
+    if outcome.error == "media_invalid":
+        return MediaValidationError(detail)
     return YtverbatimError(f"{outcome.video_id}: {outcome.error}: {detail}")
-
-
-@contextlib.contextmanager
-def video_lock(vdir: Path) -> Generator[None]:
-    """Hold the video directory exclusively, or raise `BusyError` at once; waiting could mean hours of ASR."""
-    vdir.mkdir(parents=True, exist_ok=True)
-    fd = os.open(vdir / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise BusyError(f"another ytverbatim run is processing {vdir.name}") from None
-        yield
-    finally:
-        os.close(fd)
 
 
 def _transcribe(vdir: Path, access: Access, settings: _Settings) -> ContextDocument:
@@ -342,11 +346,14 @@ def _transcribe(vdir: Path, access: Access, settings: _Settings) -> ContextDocum
 
 
 def _read_rows(path: Path, video_id: str) -> list[ChunkHypothesis]:
-    rows = [
-        ChunkHypothesis.model_validate_json(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    rows: list[ChunkHypothesis] = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            rows.append(ChunkHypothesis.model_validate_json(line))
+        except ValidationError as exc:
+            raise ContractError(f"{path.name} line {number} is not a valid hypothesis row:\n{exc}") from exc
     return sorted((row for row in rows if row.file == video_id), key=lambda row: row.chunk)
 
 
@@ -370,10 +377,29 @@ def build_document(
     chapters: bool,
     created_at: datetime,
 ) -> ContextDocument:
-    """Turn one engine's chunk rows into a validated document; no I/O."""
+    """Turn one engine's chunk rows into a validated document; no I/O.
+
+    Raises `ContractError` when the inputs cannot make a valid document, such as a chapter that ends before it starts.
+    """
+    try:
+        return _build(metadata, tags, access, definition, rows, chapters=chapters, created_at=created_at)
+    except ValidationError as exc:
+        raise ContractError(f"{metadata.video_id}: the transcript does not fit the contract:\n{exc}") from exc
+
+
+def _build(
+    metadata: VideoMetadata,
+    tags: Sequence[str],
+    access: Access,
+    definition: EngineDef,
+    rows: Sequence[ChunkHypothesis],
+    *,
+    chapters: bool,
+    created_at: datetime,
+) -> ContextDocument:
     spec = definition.spec
     language = _language(rows, metadata.language)
-    tokens, warnings = _tokens(rows, language)
+    tokens, interpolated, warnings = _tokens(rows, language)
     sentences = seg.segment_tokens(tokens, language)
     text = " ".join(sentence.text for sentence in sentences)
     script = _script(language, text)
@@ -383,7 +409,7 @@ def build_document(
         warnings.append("no speech was transcribed")
 
     run = TranscriptRun(
-        id=f"asr:{spec.id}",
+        id=_run_id(definition),
         kind="asr",
         engine=spec.id,
         model_repo=spec.repo,
@@ -398,7 +424,7 @@ def build_document(
     paragraph_of = [index for index, (first, last) in enumerate(paragraph_ranges) for _ in range(first, last + 1)]
     anomalies = {row.chunk: row for row in rows if _ANOMALY_FLAG in row.flags}
     segments = tuple(
-        _segment(index, sentence, run, paragraph_of[index], chapter_of[index], anomalies)
+        _segment(index, sentence, run, paragraph_of[index], chapter_of[index], anomalies, interpolated)
         for index, sentence in enumerate(sentences)
     )
     paragraphs = tuple(
@@ -443,48 +469,52 @@ def _language(rows: Sequence[ChunkHypothesis], declared: str | None) -> str:
     return declared or UNDETERMINED_LANGUAGE
 
 
-def _squash(text: str) -> str:
-    return "".join(text.split())
+def _tokens(rows: Sequence[ChunkHypothesis], language: str) -> tuple[list[seg.Token], set[int], list[str]]:
+    """Return the tokens, the chunks whose word timings had to be partly interpolated, and timing warnings.
 
-
-def _tokens(rows: Sequence[ChunkHypothesis], language: str) -> tuple[list[seg.Token], list[str]]:
-    """Word tokens where the engine's word times reproduce its text, else chunk-level tokens."""
+    Tokens carry the engine's word times wherever its words line up with its text; the rest is interpolated. A chunk
+    without any word timings is spread over the chunk, which the warning covers rather than a flag on every segment.
+    """
+    zh = seg.uses_zh_rules(" ".join(row.text for row in rows), language)
     tokens: list[seg.Token] = []
-    interpolated = mismatched = 0
+    interpolated: set[int] = set()
+    chunk_level = 0
     for row in rows:
         text = row.text.strip()
         if not text:
             continue
         words = [word for word in row.words if word.text.strip()]
-        if words and _squash("".join(word.text for word in words)) == _squash(text):
-            piece = [seg.Token(w.text, w.start, w.end, w.conf, origin=row.chunk) for w in words]
+        if words:
+            piece, complete = seg.aligned_tokens(text, words, row.start, row.end, language=language, origin=row.chunk)
+            if not complete:
+                interpolated.add(row.chunk)
         else:
-            interpolated += 1
-            mismatched += bool(words)
+            chunk_level += 1
             piece = seg.pseudo_tokens(text, row.start, row.end, language=language, origin=row.chunk)
         # Chunk texts are stripped, so "end." and "Next" would otherwise fuse and hide the sentence break.
-        if (
-            tokens
-            and piece
-            and not seg.is_zh(language)
-            and not tokens[-1].text[-1:].isspace()
-            and not piece[0].text[:1].isspace()
-        ):
+        if tokens and piece and not zh and not tokens[-1].text[-1:].isspace() and not piece[0].text[:1].isspace():
             piece[0] = replace(piece[0], text=f" {piece[0].text}")
         tokens += piece
     warnings: list[str] = []
-    if interpolated:
+    if chunk_level:
         warnings.append(
-            f"timing is chunk-level for {interpolated} chunk(s): segment times are spread over each chunk "
+            f"timing is chunk-level for {chunk_level} chunk(s): segment times are spread over each chunk "
             "in proportion to characters"
         )
-    if mismatched:
-        warnings.append(f"word timings did not match the text in {mismatched} chunk(s) and were not used")
-    return _monotonic(tokens), warnings
+    if interpolated:
+        warnings.append(
+            f"word timings did not cover the text in {len(interpolated)} chunk(s); the uncovered words are timed "
+            "between their timed neighbours and their segments are flagged timing_interpolated"
+        )
+    return _monotonic(tokens), interpolated, warnings
 
 
 def _monotonic(tokens: Sequence[seg.Token]) -> list[seg.Token]:
-    """Segment starts must not go backwards, and engines occasionally emit a word that does."""
+    """Segment starts must not go backwards, and engines occasionally emit a word that does.
+
+    Word times are already clamped to their chunk, so a bogus late start can hold later ones back only to its
+    chunk's end.
+    """
     out: list[seg.Token] = []
     floor = 0.0
     for token in tokens:
@@ -532,16 +562,23 @@ def _segment(
     paragraph: int,
     chapter: int | None,
     anomalies: Mapping[int, ChunkHypothesis],
+    interpolated: Collection[int],
 ) -> Segment:
-    timed = all(token.timed for token in sentence.tokens)
-    words = (
-        tuple(
-            Word(text=t.text.strip(), start=t.start, end=t.end, conf=t.conf) for t in sentence.tokens if t.text.strip()
-        )
-        if timed
-        else None
+    words = tuple(
+        Word(text=t.text.strip(), start=t.start, end=t.end, conf=t.conf)
+        for t in sentence.tokens
+        if t.timed and t.text.strip()
     )
     flags: list[Flag] = []
+    if any(not t.timed and t.origin in interpolated for t in sentence.tokens):
+        flags.append(
+            Flag(
+                kind="timing_interpolated",
+                char_start=0,
+                char_end=len(sentence.text),
+                note="some words here had no engine timing; their times are interpolated from the words around them",
+            )
+        )
     for chunk, row in anomalies.items():
         span = sentence.span_of(chunk)
         if span is not None:
@@ -558,7 +595,7 @@ def _segment(
         start=sentence.start,
         end=sentence.end,
         text=sentence.text,
-        words=words,
+        words=words or None,
         source=SourceRef(kind=run.kind, run=run.id),
         flags=tuple(sorted(flags, key=lambda f: f.char_start)),
         paragraph=paragraph,
@@ -595,10 +632,7 @@ def _upload_date(raw: str | None) -> date | None:
 
 
 def _vad_info() -> dict[str, JsonValue]:
-    # Imported here: asr.vad needs numpy (the asr extra), which a whole-file run never does.
-    from ytverbatim.asr import vad
-
-    return {"repo": vad.SILERO_REPO, "revision": vad.SILERO_REVISION, **asdict(vad.DEFAULT_VAD_PARAMS)}
+    return {"repo": chunks.SILERO_REPO, "revision": chunks.SILERO_REVISION, **asdict(chunks.DEFAULT_VAD_PARAMS)}
 
 
 def _chunking_info(max_chunk_s: float | None, rows: Sequence[ChunkHypothesis]) -> dict[str, JsonValue] | None:

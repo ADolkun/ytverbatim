@@ -1,3 +1,5 @@
+import subprocess
+import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
@@ -8,6 +10,7 @@ from ytverbatim.asr import registry
 from ytverbatim.asr.models import ChunkHypothesis
 from ytverbatim.asr.protocol import ChunkFlag
 from ytverbatim.contract import Access, ContextDocument, Word, dump_document, load_document
+from ytverbatim.errors import ContractError
 from ytverbatim.pipeline import build_document
 from ytverbatim.render import render_markdown
 
@@ -142,11 +145,77 @@ def test_engines_without_word_times_get_chunk_level_timing_and_a_warning() -> No
     assert doc.segments[0].flags == ()
 
 
-def test_words_that_do_not_reproduce_the_text_fall_back_to_chunk_level() -> None:
+def test_words_missing_from_the_end_are_interpolated_up_to_the_chunk_end() -> None:
     doc = build([row(0, "Alpha beta gamma.", 0, 3, chunk_words=words([" Alpha", " beta"]))])
     (segment,) = doc.segments
-    assert segment.words is None and segment.text == "Alpha beta gamma."
-    assert any("did not match" in warning for warning in doc.quality.warnings)
+    assert segment.text == "Alpha beta gamma." and (segment.start, segment.end) == (0.0, 3.0)
+    assert segment.words is not None and [(w.text, w.start, w.end) for w in segment.words] == [
+        ("Alpha", 0.0, 0.4),
+        ("beta", 0.4, 0.8),
+    ]
+    (flag,) = segment.flags
+    assert (flag.kind, flag.char_start, flag.char_end) == ("timing_interpolated", 0, len(segment.text))
+    assert any("did not cover" in warning for warning in doc.quality.warnings)
+
+
+def test_one_dropped_word_mid_file_keeps_every_other_time_exact() -> None:
+    pieces = [" The", " market", " rose", " today.", " Then", " it", " fell", " sharply.", " Prices", " recovered."]
+    ws = words(pieces, 1.0, 0.5)
+    kept = ws[:5] + ws[6:]  # the engine's words lack " it"
+    doc = build([row(0, "".join(pieces), 0.0, 100.0, chunk_words=kept)])
+
+    assert [s.text for s in doc.segments] == ["The market rose today.", "Then it fell sharply.", "Prices recovered."]
+    timed = {w.text: (w.start, w.end) for s in doc.segments for w in s.words or ()}
+    assert timed == {w.text.strip(): (w.start, w.end) for w in kept}
+    first, second, third = doc.segments
+    assert first.flags == () and third.flags == ()
+    assert [f.kind for f in second.flags] == ["timing_interpolated"]
+    assert second.words is not None and [w.text for w in second.words] == ["Then", "fell", "sharply."]
+    assert (second.start, second.end) == (ws[4].start, ws[7].end)
+
+
+def test_words_that_match_nothing_still_fall_back_to_chunk_level_timing() -> None:
+    text = "Alpha beta gamma. Delta epsilon."
+    doc = build([row(0, text, 10.0, 20.0, chunk_words=words([" Something", " else"], 10.0))])
+    first, second = doc.segments
+    assert first.words is None and second.words is None
+    assert (first.start, second.end) == (10.0, 20.0)
+    assert first.end == pytest.approx(10.0 + 10.0 * 15 / 28, abs=1e-3)
+    assert all([f.kind for f in s.flags] == ["timing_interpolated"] for s in doc.segments)
+
+
+def test_word_times_are_clamped_to_their_chunk() -> None:
+    first = (Word(text=" One", start=0.5, end=1.0), Word(text=" two.", start=999.0, end=999.5))
+    second = words([" Three", " four."], 11.0, 0.5)
+    doc = build(
+        [
+            row(0, " One two.", 0, 10, hypothesis="w-vad", chunk_words=first),
+            row(1, " Three four.", 10, 20, hypothesis="w-vad", chunk_words=second),
+        ],
+        engine="w-vad",
+    )
+    one, three = doc.segments
+    assert one.words is not None and one.words[1].start == 10.0 and one.end == 10.0
+    assert three.words is not None and [(w.start, w.end) for w in three.words] == [(11.0, 11.5), (11.5, 12.0)]
+
+
+def test_a_chapter_that_ends_before_it_starts_is_a_contract_error() -> None:
+    pieces = [" One.", " Two."]
+    with pytest.raises(ContractError, match="synthVid001"):
+        build(
+            [row(0, "".join(pieces), 0, 3, chunk_words=words(pieces))],
+            meta=metadata(chapters=[Chapter("Backwards", 5.0, 1.0)]),
+        )
+
+
+def test_zh_tagged_english_joins_chunks_with_a_space_and_uses_english_rules() -> None:
+    rows = [
+        row(0, "The market rose today.", 0, 4, hypothesis="q-base", language="zh"),
+        row(1, "Then it fell.", 4.2, 9, hypothesis="q-base", language="zh"),
+    ]
+    doc = build(rows, engine="q-base", meta=metadata(language="zh"))
+    assert [s.text for s in doc.segments] == ["The market rose today.", "Then it fell."]
+    assert doc.transcript.punctuation == "engine"
 
 
 def test_mandarin_without_punctuation_is_cut_at_pauses_and_flagged_unpunctuated() -> None:
@@ -316,3 +385,11 @@ def test_the_library_surface_is_exported_lazily() -> None:
     assert ytverbatim.Options.__module__ == "ytverbatim.config"
     with pytest.raises(AttributeError):
         _ = ytverbatim.nonexistent  # type: ignore[attr-defined]
+    assert {"process", "Options", "ContextDocument", "__version__"} <= set(dir(ytverbatim))
+    assert "process" in vars(ytverbatim), "a resolved name is cached in the module"
+
+
+def test_importing_the_package_loads_neither_the_pipeline_nor_its_heavy_dependencies() -> None:
+    probe = "import sys, ytverbatim; print(sorted({'ytverbatim.pipeline', 'yt_dlp', 'pydantic'} & set(sys.modules)))"
+    result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == "[]"
