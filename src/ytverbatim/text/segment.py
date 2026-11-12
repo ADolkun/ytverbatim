@@ -171,9 +171,11 @@ def aligned_tokens(
     text_units = [(i, i + 1) for a, b in text_runs for i in range(a, b)]
     word_units: list[str] = []
     word_run_sizes: list[int] = []
+    word_run_of: list[int] = []
     owners: list[int] = []
     for index, word in enumerate(words):
         for run in _ALIGN_RUNS.findall(word.text):
+            word_run_of += [len(word_run_sizes)] * len(run)
             word_run_sizes.append(len(run))
             word_units += (char.casefold() for char in run)
             owners += [index] * len(run)
@@ -184,14 +186,17 @@ def aligned_tokens(
     for text_unit, word_unit in pairs:
         hits.setdefault(owners[word_unit], []).append(text_unit)
     sizes = [0] * len(words)
-    for owner in owners:
+    firsts = [0] * len(words)
+    for position, owner in enumerate(owners):
+        if not sizes[owner]:
+            firsts[owner] = position
         sizes[owner] += 1
     candidates = {
         index: units
         for index, units in hits.items()
         if len(units) == sizes[index]
         and units[-1] - units[0] == len(units) - 1
-        and not _spans_a_space(text, text_units, units)
+        and not _spans_a_space(text, text_units, units, word_run_of[firsts[index] : firsts[index] + sizes[index]])
     }
     accepted = _whole_runs(candidates, [b - a for a, b in text_runs])
 
@@ -230,15 +235,19 @@ def aligned_tokens(
     return tokens, complete and not interpolated
 
 
-def _spans_a_space(text: str, text_units: Sequence[tuple[int, int]], units: Sequence[int]) -> bool:
-    """Whether a word's characters sit on both sides of a space between Latin or digit characters."""
-    for before, after in itertools.pairwise(units):
+def _spans_a_space(
+    text: str, text_units: Sequence[tuple[int, int]], units: Sequence[int], word_runs: Sequence[int]
+) -> bool:
+    """Whether the text puts a space inside one of the word's own runs ("ETFS" over "ETF S").
+
+    `word_runs` is the run each of the word's characters belongs to. A space where the word itself has a run boundary
+    ("AT&T" over "AT & T") is only spacing.
+    """
+    for k, (before, after) in enumerate(itertools.pairwise(units)):
+        if word_runs[k] != word_runs[k + 1]:
+            continue
         gap = text[text_units[before][1] : text_units[after][0]]
-        if (
-            any(char.isspace() for char in gap)
-            and not _CJK_CHAR.match(text[text_units[before][0]])
-            and not _CJK_CHAR.match(text[text_units[after][0]])
-        ):
+        if any(char.isspace() for char in gap):
             return True
     return False
 
