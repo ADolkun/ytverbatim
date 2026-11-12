@@ -91,7 +91,7 @@ def test_a_passing_redecode_replaces_the_whole_chunk() -> None:
     audio = tone(DURATION, quiet=(4.9, 5.1))
     engine = ScriptedEngine([first, second])
     guarded = QualityGuard()(engine, chunk_input(audio, language="zh"), looping())
-    assert guarded.flags == ()
+    assert guarded.flags == ("redecoded",)
     merged = guarded.raw
     assert merged.text == "你好世界"
     assert merged.language == "zh"
@@ -150,14 +150,14 @@ def test_a_still_failing_redecode_is_the_only_one_and_the_chunk_is_flagged() -> 
     engine = ScriptedEngine([looping()])
     guarded = QualityGuard()(engine, chunk_input(tone(DURATION)), looping())
     assert len(engine.heard) == 2
-    assert guarded.flags == ("decoder_anomaly", "token_cap_hit")
+    assert guarded.flags == ("redecoded", "decoder_anomaly", "token_cap_hit")
 
 
 def test_the_attempt_with_fewer_failures_is_kept() -> None:
     worse = RawChunk(LOOP_TEXT, generated_tokens=64, max_tokens=64)
     engine = ScriptedEngine([RawChunk(LOOP_TEXT, generated_tokens=5, max_tokens=64), sound()])
     guarded = QualityGuard()(engine, chunk_input(tone(DURATION)), worse)
-    assert guarded.flags == ("decoder_anomaly",)
+    assert guarded.flags == ("redecoded", "decoder_anomaly")
     assert LOOP_TEXT in guarded.raw.text
     assert guarded.raw.text.endswith("a sound decode")
 
@@ -166,13 +166,13 @@ def test_text_beats_silence_when_both_attempts_fail() -> None:
     original = looping()
     guarded = QualityGuard()(ScriptedEngine([RawChunk(""), RawChunk("")]), chunk_input(tone(DURATION)), original)
     assert guarded.raw is original
-    assert guarded.flags == ("decoder_anomaly", "token_cap_hit")
+    assert guarded.flags == ("redecoded", "decoder_anomaly", "token_cap_hit")
 
 
 def test_a_loop_across_the_cut_is_caught_in_the_merged_text() -> None:
     half = " ".join(["repeat risk"] * 5)
     guarded = QualityGuard()(ScriptedEngine([sound(half)]), chunk_input(tone(DURATION)), looping())
-    assert guarded.flags == ("decoder_anomaly",)
+    assert guarded.flags == ("redecoded", "decoder_anomaly")
 
 
 def test_a_chunk_too_short_to_split_is_flagged_without_decoding_again() -> None:
@@ -204,7 +204,7 @@ def test_run_request_redecodes_a_chunk_whose_first_decode_loops(tmp_path: Path, 
     engine = ScriptedEngine([looping(), sound("left"), sound("right"), sound("untouched")])
     metrics = worker.run_request(req, engine=engine, guard=QualityGuard())
     first, second = rows(tmp_path)
-    assert (first.text, first.flags) == ("left right", ())
+    assert (first.text, first.flags) == ("left right", ("redecoded",))
     assert (first.start, first.end) == (0.0, 6.0)
     assert (second.text, second.flags) == ("untouched", ())
     assert len(engine.heard) == 4
@@ -214,7 +214,7 @@ def test_run_request_redecodes_a_chunk_whose_first_decode_loops(tmp_path: Path, 
 def test_run_request_flags_a_chunk_that_keeps_looping(tmp_path: Path, wav: Path) -> None:
     engine = ScriptedEngine([looping()])
     worker.run_request(request(tmp_path, wav), engine=engine, guard=QualityGuard())
-    assert [r.flags for r in rows(tmp_path)] == [("token_cap_hit", "decoder_anomaly")] * 2
+    assert [r.flags for r in rows(tmp_path)] == [("token_cap_hit", "redecoded", "decoder_anomaly")] * 2
     # Per chunk: the first decode plus one re-decode of two halves, however badly the halves fare.
     assert len(engine.heard) == 2 * (1 + 2)
 
@@ -229,6 +229,6 @@ def test_main_guards_by_default_and_the_request_can_opt_out(tmp_path: Path, wav:
         assert worker.main([str(path)]) == 0
         first, second = rows(base)
         assert (first.text == LOOP_TEXT) is (not guard)
-        assert first.flags == (() if guard else ("token_cap_hit",))
+        assert first.flags == (("redecoded",) if guard else ("token_cap_hit",))
         assert second.flags == ()
     assert json.loads(path.read_text(encoding="utf-8"))["quality_guard"] is False
