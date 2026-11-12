@@ -109,7 +109,7 @@ def run_worker(request: WorkerRequest, *, python: str | None = None) -> WorkerRe
             )
         except ProcMemoryExceeded as exc:
             detail = f"{hypothesis} worker stopped to protect the machine: {exc}"
-            raise EngineMemoryError(detail, _memory_fix(exc), exc) from exc
+            raise EngineMemoryError(detail, memory_fix(exc), exc) from exc
     children_rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
     if result.returncode != 0:
         raise EngineError(_failure(hypothesis, out, result.returncode, result.stderr))
@@ -121,8 +121,12 @@ def run_worker(request: WorkerRequest, *, python: str | None = None) -> WorkerRe
 
 
 @contextlib.contextmanager
-def worker_lock() -> Generator[None, None, None]:
-    """Hold the machine-wide MLX lock; two engines at once would fight over unified memory."""
+def worker_lock() -> Generator[int, None, None]:
+    """Hold the machine-wide MLX lock; two engines at once would fight over unified memory.
+
+    Yields the locked descriptor. A child given a copy (`pass_fds`) keeps the lock held until it exits, even if this
+    process dies first, because a flock belongs to the open file and not to the process that took it.
+    """
     fd = os.open(paths.locks_dir() / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         try:
@@ -130,18 +134,19 @@ def worker_lock() -> Generator[None, None, None]:
         except BlockingIOError:
             log.info("waiting for another ASR worker to finish (%s)", LOCK_NAME)
             fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        yield fd
     finally:
         os.close(fd)
 
 
-def _memory_fix(exc: ProcMemoryExceeded) -> str:
-    resume = "finished chunks are kept and the next run resumes from them"
+def memory_fix(exc: ProcMemoryExceeded, *, smaller: str = "use a smaller engine", kept: str = "finished chunks") -> str:
+    """Say how to avoid another kill by the memory watch; `smaller` names the lighter choice, `kept` what survives."""
+    resume = f"{kept} are kept and the next run resumes from them"
     if exc.trigger == "available":
         return f"close memory-heavy apps, then run again ({resume})"
     return (
-        f"use a smaller engine, or raise asr.{CAP_SETTING} in the config file only if this Mac has that much memory "
-        f"to spare ({resume})"
+        f"{smaller}, or raise asr.{CAP_SETTING} in the config file only if this Mac has that much memory to spare "
+        f"({resume})"
     )
 
 
