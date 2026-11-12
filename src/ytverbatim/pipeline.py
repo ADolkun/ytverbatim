@@ -38,7 +38,7 @@ from ytverbatim.acquire.session import (
 )
 from ytverbatim.asr import registry
 from ytverbatim.asr import runner as asr_runner
-from ytverbatim.asr.models import FINGERPRINT_FILE, ChunkHypothesis, FileJob, WorkerRequest
+from ytverbatim.asr.models import METRICS_FILE, ChunkHypothesis, FileJob, WorkerRequest, without_wav
 from ytverbatim.asr.protocol import EngineDef
 from ytverbatim.auth.cooldown import utcnow
 from ytverbatim.auth.source import CookieSource, resolve_source
@@ -590,10 +590,12 @@ class _VideoRun:
         makes of the rows must not decode the audio again. The worker refuses a folder holding another request's
         output, and an interrupted run of the same request resumes in the same folder.
         """
-        fingerprint = request.fingerprint()
-        out_dir = self.store.work_dir(stage) / request.engine.spec.id / store.digest(_without_wav(fingerprint))[:16]
-        _adopt(out_dir, fingerprint)
-        return request.model_copy(update={"out_dir": str(out_dir)})
+        decode = without_wav(request.fingerprint())
+        out_dir = self.store.work_dir(stage) / request.engine.spec.id / store.digest(decode)[:16]
+        _adopt(out_dir, decode)
+        placed = request.model_copy(update={"out_dir": str(out_dir)})
+        asr_runner.follow_moved_audio(placed)
+        return placed
 
     def _asr_request(self, metadata: VideoMetadata) -> WorkerRequest:
         request = WorkerRequest(
@@ -606,7 +608,7 @@ class _VideoRun:
 
     def _asr_key(self, request: WorkerRequest) -> str:
         # The worker's own fingerprint, minus the WAV path: the video id already names the audio.
-        return self._key("asr", {"request": _without_wav(request.fingerprint())})
+        return self._key("asr", {"request": without_wav(request.fingerprint())})
 
     def _transcribed(self, hypotheses: Path, metadata: VideoMetadata) -> Transcribed:
         return stages.from_asr_rows(_read_rows(hypotheses, self.video_id), self.settings.definition, metadata)
@@ -681,6 +683,8 @@ class _VideoRun:
 
         def compute() -> _Opinion:
             if request is None:
+                # Nothing to re-decode, so no folder of this engine can be resumed again.
+                _remove(self.store.work_dir("second_opinion") / second.spec.id)
                 return _Opinion(opinion=None)
             hypotheses = asr_runner.finished(request) or asr_runner.run_worker(request).hypotheses
             return _Opinion(opinion=numeric.SecondOpinion.from_hypotheses(_read_rows(hypotheses, self.video_id)))
@@ -806,21 +810,22 @@ class _VideoRun:
         return self._stage("numeric", self._key("numeric", inputs), _TextResult, compute, self.settings.llm_id or "")
 
 
-def _adopt(out_dir: Path, fingerprint: dict[str, JsonValue]) -> None:
-    """Move a folder holding this exact request's output, left under another name, to `out_dir`.
+def _adopt(out_dir: Path, decode: JsonValue) -> None:
+    """Move a folder holding this request's output, left under another name, to `out_dir`.
 
-    Folders were once keyed by the stage version, so a version bump would otherwise decode the audio again.
+    Folders were once keyed by the stage version, so a version bump would otherwise decode the audio again. That
+    scheme can leave a complete folder and an interrupted one of the same request; the complete one is taken, since
+    the other is pruned once the stage is stored.
     """
     if out_dir.exists() or not out_dir.parent.is_dir():
         return
-    for entry in out_dir.parent.iterdir():
-        try:
-            stored: object = json.loads((entry / FINGERPRINT_FILE).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if stored == fingerprint:
-            entry.rename(out_dir)
-            return
+    matches = [
+        entry
+        for entry in out_dir.parent.iterdir()
+        if (stored := asr_runner.stored_fingerprint(entry)) is not None and without_wav(stored) == decode
+    ]
+    if matches:
+        min(matches, key=lambda entry: (not (entry / METRICS_FILE).is_file(), entry.name)).rename(out_dir)
 
 
 def _prune(root: Path, keep: Path) -> None:
@@ -841,16 +846,6 @@ def _remove(path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
     else:
         path.unlink(missing_ok=True)
-
-
-def _without_wav(fingerprint: dict[str, JsonValue]) -> dict[str, JsonValue]:
-    files = fingerprint.get("files")
-    if not isinstance(files, list):
-        return fingerprint
-    kept: list[JsonValue] = [
-        {k: v for k, v in job.items() if k != "wav"} if isinstance(job, dict) else job for job in files
-    ]
-    return {**fingerprint, "files": kept}
 
 
 def _text_key(stretches: Sequence[Stretch]) -> str:

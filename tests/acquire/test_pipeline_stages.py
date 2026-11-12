@@ -1,6 +1,7 @@
 """The full `run` pipeline with a fake yt-dlp, a fake ASR worker and a fake LLM: stages, store, LLM and captions."""
 
 import json
+import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -22,6 +23,7 @@ from ytverbatim.errors import ConfigError, DependencyError, EngineError, LLMUnav
 from ytverbatim.llm import claude_cli
 from ytverbatim.llm.protocol import LLMRequest, LLMResponse, Usage
 from ytverbatim.pipeline import ProgressEvent, VideoResult, process_many
+from ytverbatim.text import numeric
 from ytverbatim.text import punctuate as punctuate_module
 
 ZH = "zhVideo0001"
@@ -505,6 +507,78 @@ def test_a_folder_of_the_same_request_under_an_older_name_is_adopted(session_kit
     report, results, _ = run(session_kit, yt)
     assert report.exit_code == 0, results[0].outcome
     assert len(worker.calls) == 1 and worker_dirs(session_kit) == [folder]
+
+
+def test_a_moved_library_rereads_its_kept_rows_after_an_asr_bump(session_kit, worker, monkeypatch, tmp_path) -> None:
+    yt = zh_yt(session_kit)
+    run(session_kit, yt)
+    (folder,) = worker_dirs(session_kit)
+    session_kit.out = session_kit.out.rename(tmp_path / "moved")
+
+    bump(monkeypatch, "asr")
+    report, results, _ = run(session_kit, yt)
+    assert report.exit_code == 0, results[0].outcome
+    assert stored(results[0])["asr"] is False and len(worker.calls) == 1
+    assert worker_dirs(session_kit) == [folder]
+
+
+def test_a_relative_out_reuses_the_folder_an_absolute_out_made(session_kit, worker, monkeypatch, tmp_path) -> None:
+    yt = zh_yt(session_kit)
+    run(session_kit, yt)
+    (folder,) = worker_dirs(session_kit)
+    monkeypatch.chdir(tmp_path)
+    session_kit.out = Path("out")
+
+    bump(monkeypatch, "asr")
+    report, results, _ = run(session_kit, yt)
+    assert report.exit_code == 0, results[0].outcome
+    assert len(worker.calls) == 1 and worker_dirs(session_kit) == [folder]
+
+
+def test_an_interrupted_run_resumes_its_folder_after_the_library_moves(session_kit, worker, tmp_path) -> None:
+    yt = zh_yt(session_kit)
+    worker.error = EngineError("killed mid-decode")
+    report, _, _ = run(session_kit, yt)
+    assert report.exit_code == 1
+    (folder,) = worker_dirs(session_kit)
+    session_kit.out = session_kit.out.rename(tmp_path / "moved")
+
+    worker.error = None
+    report, results, _ = run(session_kit, yt)
+    assert report.exit_code == 0, results[0].outcome
+    assert worker.calls[1].out_dir == str(session_kit.out / ZH / ".stages" / "asr" / folder)
+    assert worker_dirs(session_kit) == [folder]
+
+
+def test_adoption_prefers_the_complete_folder_of_two_with_the_same_request(session_kit, worker, monkeypatch) -> None:
+    yt = zh_yt(session_kit)
+    run(session_kit, yt)
+    (folder,) = worker_dirs(session_kit)
+    engine_dir = session_kit.out / ZH / ".stages" / "asr" / "w-prod"
+    complete = (engine_dir / folder.split("/")[1]).rename(engine_dir / "ffffffffffffffff")
+    partial = shutil.copytree(complete, engine_dir / "0000000000000000")
+    (partial / METRICS_FILE).unlink()
+
+    bump(monkeypatch, "asr")
+    report, results, _ = run(session_kit, yt)
+    assert report.exit_code == 0, results[0].outcome
+    assert len(worker.calls) == 1 and worker_dirs(session_kit) == [folder]
+
+
+def test_a_second_opinion_with_nothing_to_check_drops_that_engines_folders(session_kit, worker, monkeypatch) -> None:
+    yt = zh_yt(session_kit)
+    options = config.load_options(overrides={"text": {"numeric_second_opinion": "w-vad"}})
+    run(session_kit, yt, options=options)
+    (folder,) = worker_dirs(session_kit, stage="second_opinion")
+    other = session_kit.out / ZH / ".stages" / "second_opinion" / "q-base" / "0123456789abcdef"
+    other.mkdir(parents=True)
+
+    bump(monkeypatch, "second_opinion")
+    monkeypatch.setattr(numeric, "second_opinion_request", lambda *_args, **_kwargs: None)
+    report, results, _ = run(session_kit, yt, options=options)
+    assert report.exit_code == 0, results[0].outcome
+    assert worker_dirs(session_kit, stage="second_opinion") == ["q-base/0123456789abcdef"]
+    assert folder.startswith("w-vad/")
 
 
 def test_the_second_opinion_folder_follows_its_request_not_the_stage_versions(session_kit, worker, monkeypatch) -> None:

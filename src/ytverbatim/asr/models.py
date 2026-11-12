@@ -101,6 +101,19 @@ class WorkerRequest(_Model):
         return self.model_dump(mode="json", exclude={"out_dir", "hf_hub_cache", "memory_cap_bytes"})
 
 
+def without_wav(fingerprint: JsonValue) -> JsonValue:
+    """Drop the WAV paths from a fingerprint: where the audio lies says nothing about what decoding it gives."""
+    if not isinstance(fingerprint, dict):
+        return fingerprint
+    files = fingerprint.get("files")
+    if not isinstance(files, list):
+        return fingerprint
+    kept: list[JsonValue] = [
+        {k: v for k, v in job.items() if k != "wav"} if isinstance(job, dict) else job for job in files
+    ]
+    return {**fingerprint, "files": kept}
+
+
 class WorkerError(_Model):
     """The structured failure the worker leaves in `error.json` for the parent to read."""
 
