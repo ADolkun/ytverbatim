@@ -88,6 +88,17 @@ def test_misconfigured_source_never_falls_back_to_anonymous() -> None:
         source.resolve_source(None, env={})
 
 
+def test_unreadable_saved_source_hides_the_home_directory(home: Path) -> None:
+    path = paths.auth_source_file()
+    path.unlink(missing_ok=True)
+    path.mkdir()
+    with pytest.raises(AuthError) as caught:
+        source.resolve_source(None, env={})
+    assert caught.value.state is AuthState.NO_SOURCE
+    assert str(home) not in caught.value.detail
+    assert "~/" in caught.value.detail
+
+
 def test_save_source_is_private() -> None:
     path = source.save_source(None)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600

@@ -113,6 +113,7 @@ def test_child_filters_domains_and_writes_private_file(store: Path, capsys: pyte
         "decrypt_failures": 2,
         "logged_in": True,
         "warnings": [],
+        "profile": "Default",
     }
     [(browser, pin_dir)] = extractor.calls
     assert browser == "chrome"
@@ -151,10 +152,24 @@ def test_login_rule_only_counts_cookies_sent_to_www() -> None:
 @pytest.mark.parametrize(
     ("extractor", "state"),
     [
-        (FakeExtractor(_jar(), warnings=["find-generic-password failed"]), AuthState.KEYCHAIN_DENIED),
-        (FakeExtractor(_jar(), warnings=["cannot decrypt v10 cookies: no key found"]), AuthState.KEYCHAIN_DENIED),
+        (FakeExtractor([], warnings=["find-generic-password failed"]), AuthState.KEYCHAIN_DENIED),
+        (FakeExtractor([], warnings=["cannot decrypt v10 cookies: no key found"]), AuthState.KEYCHAIN_DENIED),
         (
             FakeExtractor([], info=["Extracted 0 cookies from chrome (940 could not be decrypted)"]),
+            AuthState.KEYCHAIN_DENIED,
+        ),
+        (
+            # A partial jar: undecryptable login cookies must not read as "signed out".
+            FakeExtractor(_jar(sapisid=False), info=["Extracted 8 cookies from chrome (3 could not be decrypted)"]),
+            AuthState.KEYCHAIN_DENIED,
+        ),
+        (
+            FakeExtractor(
+                [],
+                warnings=[
+                    "failed to decrypt cookie (AES-GCM) because the MAC check failed. Possibly the key is wrong?"
+                ],
+            ),
             AuthState.KEYCHAIN_DENIED,
         ),
         (
@@ -171,6 +186,50 @@ def test_child_maps_failures(
     assert result["ok"] is False
     assert result["state"] == state.value
     assert not out.exists()
+
+
+def test_key_failure_detail_names_the_keychain_item_not_sign_in(
+    store: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    extractor = FakeExtractor([], warnings=["Possibly the key is wrong?"])
+    result = _run_child(snapshot.new_snapshot_path(), extractor, capsys)
+    detail = str(result["detail"])
+    assert "Chrome Safe Storage" in detail
+    assert "the cookie key looks wrong" in detail
+    assert "sign in" not in detail
+
+
+def test_key_warning_on_a_logged_in_jar_still_snapshots(store: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    extractor = FakeExtractor(_jar(), warnings=["Possibly the key is wrong?"])
+    result = _run_child(snapshot.new_snapshot_path(), extractor, capsys)
+    assert result["ok"] is True
+    assert result["warnings"] == ["wrong_key"]
+
+
+def test_child_without_profile_uses_the_only_store(store: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    out = snapshot.new_snapshot_path()
+    code = child.main(["--browser", "chrome", "--out", str(out)], extract=FakeExtractor(_jar()))
+    result = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert result["profile"] == "Default"
+
+
+def test_child_without_profile_refuses_to_guess(store: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    other = store.parent.parent / "Side" / "Cookies"
+    other.parent.mkdir()
+    other.write_bytes(b"sqlite")
+    code = child.main(["--browser", "chrome", "--out", "x"], extract=FakeExtractor(_jar()))
+    result = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert result["state"] == AuthState.PROFILE_NOT_FOUND.value
+    assert "auth use chrome:<DIR>" in result["detail"]
+
+
+def test_child_catch_all_hides_the_home_directory(home: Path, store: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    extractor = FakeExtractor([], error=RuntimeError(f"cannot open {home}/Library/thing"))
+    result = _run_child(snapshot.new_snapshot_path(), extractor, capsys)
+    assert result["state"] is None
+    assert result["detail"] == "RuntimeError: cannot open ~/Library/thing"
 
 
 def test_child_reports_missing_profile_with_choices(store: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -190,7 +249,7 @@ def test_child_warning_kinds_never_carry_messages(store: Path, capsys: pytest.Ca
 def test_child_module_runs_as_subprocess(home: Path) -> None:
     out = snapshot.new_snapshot_path()
     result = proc.run(
-        [sys.executable, "-m", snapshot.CHILD_MODULE, "--browser", "chrome", "--out", str(out)], timeout_s=60
+        [sys.executable, "-P", "-m", snapshot.CHILD_MODULE, "--browser", "chrome", "--out", str(out)], timeout_s=60
     )
     assert result.returncode == 1
     assert json.loads(result.stdout)["state"] == AuthState.BROWSER_NOT_FOUND.value
@@ -217,7 +276,7 @@ class FakeRun:
 
 _OK = json.dumps(
     {"ok": True, "counts": {"youtube.com": 3, "google.com": 1}, "decrypt_failures": 0, "logged_in": True,
-     "warnings": ["other"]}
+     "warnings": ["other"], "profile": "Default"}
 )  # fmt: skip
 
 
@@ -228,11 +287,13 @@ def test_browser_snapshot_runs_child_and_deletes_file(monkeypatch: pytest.Monkey
     with snapshot.cookie_snapshot(BrowserSource("chrome", "Default"), timeout_s=7) as snap:
         assert snap.path.exists()
         assert snap.path.parent == paths.snapshots_dir()
-        assert snap.summary == snapshot.SnapshotSummary({"youtube.com": 3, "google.com": 1}, 0, True, ("other",))
+        assert snap.summary == snapshot.SnapshotSummary(
+            {"youtube.com": 3, "google.com": 1}, 0, True, ("other",), "Default"
+        )
 
     assert not snap.path.exists()
     assert fake.argv == [
-        sys.executable, "-m", "ytverbatim.auth._snapshot_child", "--browser", "chrome", "--out", str(snap.path),
+        sys.executable, "-P", "-m", "ytverbatim.auth._snapshot_child", "--browser", "chrome", "--out", str(snap.path),
         "--profile", "Default",
     ]  # fmt: skip
     assert fake.timeout_s == 7
@@ -289,6 +350,7 @@ def test_cookie_file_snapshot_is_a_filtered_private_copy(home: Path, monkeypatch
         kept = cookiefile.read_cookie_file(snap.path)
         assert {e.domain for e in kept} == {".youtube.com", "m.youtube.com", ".google.com", "accounts.google.com"}
         assert snap.summary.logged_in
+        assert snap.summary.profile is None
 
     assert not snap.path.exists()
     assert original.read_bytes() == before
@@ -299,7 +361,9 @@ def test_cookie_file_logged_out(home: Path) -> None:
     original = _cookie_file(home, [child._entry(c) for c in _jar(login_expires=PAST)])
     with pytest.raises(AuthError) as caught, snapshot.cookie_snapshot(CookieFileSource(original)):
         pass
-    assert caught.value.state is AuthState.LOGGED_OUT
+    assert caught.value.state is AuthState.COOKIE_FILE_LOGGED_OUT
+    assert "re-export it from a fresh private window" in caught.value.detail
+    assert "browser" not in caught.value.detail
     assert list(paths.snapshots_dir().iterdir()) == []
 
 

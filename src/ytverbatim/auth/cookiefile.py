@@ -4,6 +4,7 @@ from pathlib import Path
 
 from ytverbatim.auth.state import AuthState
 from ytverbatim.errors import AuthError
+from ytverbatim.ytdlp.runner import redact
 
 # Spelled without "Netscape" on purpose: both forms are valid headers, and the shorter one keeps the
 # repository's privacy scanner, which flags the long form as a leaked cookie file, quiet.
@@ -28,7 +29,7 @@ class CookieEntry:
 
 
 def _invalid(path: Path, problem: str) -> AuthError:
-    return AuthError(AuthState.COOKIE_FILE_INVALID, f"{path}: {problem}")
+    return AuthError(AuthState.COOKIE_FILE_INVALID, redact(f"{path}: {problem}"))
 
 
 def _parse_line(path: Path, number: int, line: str) -> CookieEntry | None:

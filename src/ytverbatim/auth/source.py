@@ -8,6 +8,7 @@ from ytverbatim import atomic, paths
 from ytverbatim.auth import chromium
 from ytverbatim.auth.state import AuthState
 from ytverbatim.errors import AuthError
+from ytverbatim.ytdlp.runner import redact
 
 ENV_VAR = "YTVERBATIM_AUTH"
 _COOKIE_FILE_PREFIX = "cookie-file:"
@@ -67,10 +68,12 @@ def _saved_spec(path: Path) -> str | None:
     except FileNotFoundError:
         return None
     except (OSError, ValueError) as exc:
-        raise AuthError(AuthState.NO_SOURCE, f"{path} is unreadable ({exc}); rerun `ytverbatim auth use`") from exc
+        raise AuthError(
+            AuthState.NO_SOURCE, redact(f"{path} is unreadable ({exc}); rerun `ytverbatim auth use`")
+        ) from exc
     spec = raw.get("spec") if isinstance(raw, dict) else None
     if not isinstance(spec, str):
-        raise AuthError(AuthState.NO_SOURCE, f"{path} has no 'spec' string; rerun `ytverbatim auth use`")
+        raise AuthError(AuthState.NO_SOURCE, redact(f"{path} has no 'spec' string; rerun `ytverbatim auth use`"))
     return spec
 
 
