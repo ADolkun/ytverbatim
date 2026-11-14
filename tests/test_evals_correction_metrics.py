@@ -50,6 +50,14 @@ def flag(before: str, after: str) -> Flag:
         ("zh", "看NVDA的财报", "看的财报", [], True),
         ("zh", "大家意见一致", "大家意见一直", [], False),
         ("en", "they bought two thousand shares", "they bought 2,000 shares", [], False),
+        ("en", "we use open AI tools", "we use OpenAI tools", [flag("AI", "OpenAI")], False),
+        ("en", "we use open AI tools", "we use OpenAI tools", [], True),
+        ("en", "we use open AI tools", "we use OpenAI tools", [flag("ML", "OpenAI")], True),
+        ("en", "we use OpenAI tools", "we use Open AI tools", [flag("OpenAI", "AI")], False),
+        ("en", "we use OpenAI tools", "we use Open AI tools", [], True),
+        ("en", "open AI and GAP", "OpenAI and GAAP", [flag("AI", "OpenAI"), flag("GAP", "GAAP")], False),
+        ("en", "open AI and GAP", "OpenAI and GAAP", [flag("AI", "OpenAI")], True),
+        ("en", "NVDA and AMD", "NVDA", [flag("AI", "OpenAI")], True),
     ],
 )
 def test_breaks_numbers(language: Language, before: str, after: str, flags: list[Flag], broken: bool) -> None:
