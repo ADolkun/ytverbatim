@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from ytverbatim.contract import ContextDocument
     from ytverbatim.llm import LLMClient
     from ytverbatim.pipeline import process
+    from ytverbatim.text.numbers import QKind, QToken, quantity_tokens
 
 __version__ = version("ytverbatim")
 
@@ -21,9 +22,23 @@ _LAZY = {
     "Options": "ytverbatim.config",
     "ContextDocument": "ytverbatim.contract",
     "LLMClient": "ytverbatim.llm",
+    "quantity_tokens": "ytverbatim.text.numbers",
+    "QToken": "ytverbatim.text.numbers",
+    "QKind": "ytverbatim.text.numbers",
 }
 
-__all__ = ["ContextDocument", "LLMClient", "Options", "__version__", "expand", "process", "video_file"]
+__all__ = [
+    "ContextDocument",
+    "LLMClient",
+    "Options",
+    "QKind",
+    "QToken",
+    "__version__",
+    "expand",
+    "process",
+    "quantity_tokens",
+    "video_file",
+]
 
 
 def __getattr__(name: str) -> object:
