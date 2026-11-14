@@ -547,6 +547,17 @@ def test_dollar_spellings_agree_and_magnitudes_dispute(tmp_path: Path) -> None:
     assert disputed.stats == NumericStats(disputed=1)
 
 
+def test_uppercase_magnitudes_dispute(tmp_path: Path) -> None:
+    result = run(
+        [TimedText("The deal is worth $10BN in total", 0.0, 3.0)],
+        Evidence(PRIMARY, captions=(manual((0.0, 3.0, "the deal is worth $10MN in total")),)),
+        FakeClient([verdicts((0, "$10MN", "low"))]),
+        tmp_path,
+        language="en",
+    )
+    assert result.stats == NumericStats(disputed=1)
+
+
 @pytest.mark.parametrize(
     ("asr", "caption", "mine", "theirs", "language"),
     [

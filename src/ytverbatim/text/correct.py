@@ -28,7 +28,7 @@ from ytverbatim.text.guards import GuardName, check_fix, symbol_changes
 _log = logging.getLogger(__name__)
 
 # Part of every checkpoint and stage key: bump it on any prompt, guard or logic change so stored results are redone.
-PROMPT_VERSION = "correction-v5"
+PROMPT_VERSION = "correction-v6"
 BATCH_CHARS = 1800
 # Mean per-word probability below which a sentence gets the second, low-confidence pass.
 SECOND_PASS_MIN_CONFIDENCE = 0.5
