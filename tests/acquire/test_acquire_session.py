@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from ytverbatim import paths
+from ytverbatim import paths, proc
 from ytverbatim.acquire import session
 from ytverbatim.acquire.session import BatchReport, FetchOptions, VideoOutcome, VideoStatus
 from ytverbatim.auth import preflight
@@ -527,3 +527,93 @@ def test_a_video_without_comments_is_not_re_extracted_every_run(session_kit) -> 
     for _ in range(2):
         run(session_kit, yt, [PUBLIC], creator_note=True)
     assert len(yt.labels("metadata")) == 1
+
+
+def test_without_the_option_no_video_is_requested(session_kit) -> None:
+    yt = session_kit.yt()
+    outcome = only(run(session_kit, yt, [PUBLIC]))
+    assert [c.label for c in yt.calls] == ["metadata", "captions", "audio"]
+    assert not (session_kit.out / PUBLIC / "video.mp4").exists()
+    assert "video" not in outcome.reused
+
+
+def test_the_option_adds_one_video_request_after_the_audio(session_kit) -> None:
+    yt = session_kit.yt()
+    outcome = only(run(session_kit, yt, [PUBLIC], video=True))
+    assert outcome.status is VideoStatus.OK
+    assert [c.label for c in yt.calls] == ["metadata", "captions", "audio", "video"]
+    (call,) = yt.labels("video")
+    info = session_kit.out / PUBLIC / "info.json"
+    assert call.args == [
+        "--load-info-json",
+        str(info),
+        "-f",
+        "bestvideo[height<=1080][ext=mp4]/bestvideo[height<=1080]",
+        "--remux-video",
+        "mp4",
+        "-o",
+        f"{session_kit.out / PUBLIC / 'video'}.%(ext)s",
+    ]
+    assert (session_kit.out / PUBLIC / "video.mp4").is_file()
+
+
+def test_the_video_uses_the_cookie_path_the_audio_took(session_kit) -> None:
+    yt = session_kit.yt()
+    yt.availability[MEMBERS] = "subscriber_only"
+    yt.failures[("metadata", False)] = [session_kit.fail(Signal.MEMBERS_ONLY)]
+    yt.secondary[("metadata", True)] = (Signal.AUTH_COOKIES_FOUND,)
+    outcome = only(run(session_kit, yt, [MEMBERS], video=True))
+
+    assert outcome.status is VideoStatus.OK, outcome
+    (snap,) = session_kit.snapshots.taken
+    assert {c.label for c in yt.calls if c.cookies is not None} == {"metadata", "captions", "audio", "video"}
+    assert all(c.cookies == snap for c in yt.calls if c.cookies is not None)
+    assert yt.labels("video", cookied=False) == []
+
+
+def test_an_anonymous_video_takes_no_snapshot(session_kit) -> None:
+    yt = session_kit.yt()
+    run(session_kit, yt, [PUBLIC], video=True)
+    assert session_kit.snapshots.taken == [] and yt.labels("video")[0].cookies is None
+
+
+def test_a_valid_video_is_reused(session_kit) -> None:
+    run(session_kit, session_kit.yt(), [PUBLIC], video=True)
+    yt = session_kit.yt()
+    outcome = only(run(session_kit, yt, [PUBLIC], video=True))
+    assert yt.calls == []
+    assert outcome.reused == ("info", "captions", "audio", "wav", "video")
+
+
+def test_turning_the_option_on_fetches_only_the_video_from_a_saved_extraction(session_kit) -> None:
+    run(session_kit, session_kit.yt(), [PUBLIC])
+    yt = session_kit.yt()
+    outcome = only(run(session_kit, yt, [PUBLIC], video=True))
+    assert [c.label for c in yt.calls] == ["video"]
+    assert outcome.reused == ("info", "captions", "audio", "wav")
+
+
+def test_a_corrupt_video_is_replaced(session_kit, fake_proc) -> None:
+    run(session_kit, session_kit.yt(), [PUBLIC], video=True)
+    target = session_kit.out / PUBLIC / "video.mp4"
+    target.write_bytes(b"corrupt")
+    healthy = fake_proc.responses["ffprobe"]
+
+    def probe(argv: list[str]) -> proc.ProcResult:
+        if Path(argv[-1]).name == "video.mp4" and Path(argv[-1]).read_bytes() == b"corrupt":
+            return proc.ProcResult(1, "", "Invalid data found", 0.0)
+        return healthy(argv)
+
+    fake_proc.responses["ffprobe"] = probe
+    yt = session_kit.yt()
+    outcome = only(run(session_kit, yt, [PUBLIC], video=True))
+    assert outcome.status is VideoStatus.OK and "video" not in outcome.reused
+    assert [c.label for c in yt.calls] == ["video"]
+    assert target.read_bytes() == b"fake video"
+
+
+def test_a_failed_video_download_fails_the_video(session_kit) -> None:
+    yt = session_kit.yt()
+    yt.failures[("video", False)] = [session_kit.fail(Signal.NO_FORMATS)]
+    outcome = only(run(session_kit, yt, [PUBLIC], video=True))
+    assert outcome.status is VideoStatus.ERROR and outcome.error == Signal.NO_FORMATS.value

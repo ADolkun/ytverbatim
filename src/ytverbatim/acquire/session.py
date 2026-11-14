@@ -30,6 +30,8 @@ from ytverbatim.acquire.captions import (
 from ytverbatim.acquire.captions import FILE_STEM as CAPTIONS_STEM
 from ytverbatim.acquire.expand import expand_target
 from ytverbatim.acquire.metadata import VideoMetadata, fetch_info, has_comments, info_path, load_metadata
+from ytverbatim.acquire.video import fetch_video as download_video
+from ytverbatim.acquire.video import ready_video
 from ytverbatim.auth import preflight, snapshot
 from ytverbatim.auth.cooldown import (
     CAPTIONS_LABEL,
@@ -114,6 +116,8 @@ class FetchOptions:
     cookies_first: bool = False
     # Folds a bounded comment page into each video's one `-J`; a saved extraction without it is redone once.
     creator_note: bool = False
+    # Also downloads the video track (`video.mp4`), after the audio and on the same cookie path.
+    video: bool = False
 
 
 class VideoStatus(StrEnum):
@@ -265,8 +269,10 @@ class FetchSession:
         stop = self._runner.stop
         return BatchStopError(stop.signal, stop.until) if stop is not None else None
 
-    def fetch_video(self, video_id: str, *, cookies_first: bool = False, audio: bool = True) -> VideoOutcome:
-        """Fetch one video; `audio=False` skips the audio stages for a caller that already has what audio gives."""
+    def fetch_video(
+        self, video_id: str, *, cookies_first: bool = False, audio: bool = True, captions: bool = True
+    ) -> VideoOutcome:
+        """Fetch one video; `audio=False` and `captions=False` skip stages for a caller that already has them."""
         if (stop := self.pending_stop()) is not None:
             raise stop
         vdir = paths.video_dir(video_id, self._out)
@@ -274,7 +280,7 @@ class FetchSession:
         try:
             with contextlib.ExitStack() as stack:
                 snaps = stack.enter_context(_Snapshots(self._source)) if self._source is not None else None
-                return self._fetch(video_id, vdir, snaps, cookies_first=cookies_first, audio=audio)
+                return self._fetch(video_id, vdir, snaps, cookies_first=cookies_first, audio=audio, captions=captions)
         except AuthError as exc:
             if exc.state not in _PER_VIDEO_AUTH_STATES:
                 self._source_failure = exc
@@ -285,13 +291,17 @@ class FetchSession:
             return self._failure(video_id, exc)
 
     def _fetch(
-        self, video_id: str, vdir: Path, snaps: _Snapshots | None, *, cookies_first: bool, audio: bool
+        self, video_id: str, vdir: Path, snaps: _Snapshots | None, *, cookies_first: bool, audio: bool, captions: bool
     ) -> VideoOutcome:
         want_audio = self._options.audio and audio
-        captions_done = not self._options.captions or _load_tracks(vdir) is not None
+        want_captions = self._options.captions and captions
+        captions_done = not want_captions or _load_tracks(vdir) is not None
         audio_done = not want_audio or _audio_ready(vdir)
+        video_done = not self._options.video or ready_video(vdir) is not None
         prior = _load_prior(
-            vdir, need_fresh=not (captions_done and audio_done), creator_note=self._options.creator_note
+            vdir,
+            need_fresh=not (captions_done and audio_done and video_done),
+            creator_note=self._options.creator_note,
         )
         reused: list[str] = []
         if prior is not None:
@@ -305,8 +315,8 @@ class FetchSession:
             atomic.write_text(vdir / ACCESS_FILE, access.model_dump_json(indent=2) + "\n")
 
         warnings: list[str] = list(access.warnings)
-        captions: tuple[str, ...] = ()
-        if self._options.captions:
+        captions_found: tuple[str, ...] = ()
+        if want_captions:
             entries = _load_tracks(vdir)
             if entries is None:
                 result = self._stage(snaps, access.cookies_used, lambda c: self._captions(vdir, metadata, c))
@@ -317,11 +327,13 @@ class FetchSession:
                     atomic.write_json(vdir / CAPTIONS_DIR / TRACKS_FILE, {"tracks": entries})
             else:
                 reused.append("captions")
-            captions = tuple(_track_label(entry) for entry in entries)
+            captions_found = tuple(_track_label(entry) for entry in entries)
 
         audio_s: float | None = None
         if want_audio:
             audio_s = self._audio(video_id, vdir, metadata, snaps, access.cookies_used, reused)
+        if self._options.video:
+            self._video(video_id, vdir, metadata, snaps, access.cookies_used, reused)
 
         warnings += [w for seen in self._runner.seen for w in seen.warnings]
         access = access.model_copy(update={"warnings": _clean_warnings(warnings)})
@@ -331,7 +343,7 @@ class FetchSession:
             status=VideoStatus.OK,
             access=access,
             chapters=len(metadata.chapters),
-            captions=captions,
+            captions=captions_found,
             audio_s=audio_s,
             reused=tuple(reused),
         )
@@ -466,6 +478,25 @@ class FetchSession:
             return wav_s
         to_wav16k(native, wav, expected_duration=expected)
         return validate_audio(wav, expected_duration=expected)
+
+    def _video(
+        self,
+        video_id: str,
+        vdir: Path,
+        metadata: VideoMetadata,
+        snaps: _Snapshots | None,
+        cookies_used: bool,
+        reused: list[str],
+    ) -> None:
+        expected = metadata.duration
+        if ready_video(vdir) is not None:
+            reused.append("video")
+            return
+        self._stage(
+            snaps,
+            cookies_used,
+            lambda c: download_video(self._runner, video_id, vdir, vdir, expected_duration=expected, cookies=c),
+        )
 
     def _access(self, metadata: VideoMetadata, extracted: _Extracted, warnings: Iterable[str]) -> Access:
         if self._ytdlp_version is None:

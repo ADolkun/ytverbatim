@@ -36,6 +36,7 @@ from ytverbatim.acquire.session import (
     fetch,
     saved_captions,
 )
+from ytverbatim.acquire.video import ready_video
 from ytverbatim.asr import registry
 from ytverbatim.asr import runner as asr_runner
 from ytverbatim.asr.models import METRICS_FILE, ChunkHypothesis, FileJob, WorkerRequest, without_wav
@@ -238,6 +239,7 @@ def process_many(  # noqa: PLR0913
         ignore_cooldown=ignore_cooldown,
         cookies_first=cookies_first,
         creator_note=options.ytdlp.creator_note,
+        video=options.ytdlp.video,
     )
     hook = _RunHook(settings)
 
@@ -275,6 +277,7 @@ class _Settings:
     force: bool
     captions: bool
     creator_note: bool
+    video: bool
     emit: Callable[[ProgressEvent], None]
     clock: Callable[[], datetime]
 
@@ -339,6 +342,7 @@ def _settings(
         force,
         captions,
         options.ytdlp.creator_note,
+        options.ytdlp.video,
         emit,
         clock,
     )
@@ -368,7 +372,10 @@ class _RunHook:
 
     def done(self, video_id: str) -> bool:
         try:
-            return _reusable(paths.video_dir(video_id, self.settings.out), self.settings) is not None
+            vdir = paths.video_dir(video_id, self.settings.out)
+            if _reusable(vdir, self.settings) is None:
+                return False
+            return not self.settings.video or ready_video(vdir) is not None
         except OSError:
             return False
 
@@ -414,6 +421,14 @@ def _run_video(session: FetchSession, planned: PlannedVideo, settings: _Settings
                     chapters=len(document.chapters),
                     reused=("context",),
                 )
+                if settings.video and ready_video(vdir) is None:
+                    # The video is not part of the run key, so a current document says nothing about it.
+                    fetched = session.fetch_video(
+                        video_id, cookies_first=planned.cookies_first, audio=False, captions=False
+                    )
+                    if fetched.status is not VideoStatus.OK:
+                        return VideoResult(fetched)
+                    outcome = replace(outcome, reused=("context", *fetched.reused))
                 return VideoResult(outcome, document, vdir / CONTEXT_MD)
             if settings.force:
                 StageStore(vdir).clear()

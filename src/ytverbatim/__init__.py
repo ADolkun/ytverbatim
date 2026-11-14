@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ytverbatim.acquire.session import expand
+    from ytverbatim.acquire.video import video_file
     from ytverbatim.config import Options
     from ytverbatim.contract import ContextDocument
     from ytverbatim.llm import LLMClient
@@ -16,12 +17,13 @@ __version__ = version("ytverbatim")
 _LAZY = {
     "process": "ytverbatim.pipeline",
     "expand": "ytverbatim.acquire.session",
+    "video_file": "ytverbatim.acquire.video",
     "Options": "ytverbatim.config",
     "ContextDocument": "ytverbatim.contract",
     "LLMClient": "ytverbatim.llm",
 }
 
-__all__ = ["ContextDocument", "LLMClient", "Options", "__version__", "expand", "process"]
+__all__ = ["ContextDocument", "LLMClient", "Options", "__version__", "expand", "process", "video_file"]
 
 
 def __getattr__(name: str) -> object:

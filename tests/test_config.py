@@ -34,6 +34,7 @@ cookie_channels = ["UCexample1", "UCexample2"]
 [ytdlp]
 max_videos_per_run = 5
 creator_note = true
+video = true
 
 [asr]
 source = "captions"
@@ -51,6 +52,7 @@ timeout_s = 60
     assert options.auth == AuthOptions(policy="always", cookie_channels=("UCexample1", "UCexample2"))
     assert options.ytdlp.max_videos_per_run == 5
     assert options.ytdlp.creator_note is True
+    assert options.ytdlp.video is True
     assert options.asr.source == "captions"
     assert options.asr.engine == "w-prod"
     assert options.text.chapters == "none"
@@ -87,6 +89,7 @@ def test_section_must_be_a_table(tmp_path: Path) -> None:
         '[ytdlp]\nmax_videos_per_run = "5"\n',
         "[ytdlp]\nmax_videos_per_run = true\n",
         "[ytdlp]\ncreator_note = 1\n",
+        "[ytdlp]\nvideo = 1\n",
         "[llm]\nmodel = 3\n",
         '[llm]\ntimeout_s = "slow"\n',
     ],
