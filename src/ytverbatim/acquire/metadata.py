@@ -105,6 +105,11 @@ def load_metadata(stage_dir: Path) -> VideoMetadata:
     return trim_info(_parse_info(path.read_text(encoding="utf-8"), 0))
 
 
+def has_comments(stage_dir: Path) -> bool:
+    """Whether the saved extraction asked for comments; yt-dlp adds the key, even when empty or disabled, only then."""
+    return "comments" in _parse_info(info_path(stage_dir).read_text(encoding="utf-8"), 0)
+
+
 def trim_info(info: Mapping[str, object]) -> VideoMetadata:
     language = _text(info.get("language"))
     subtitles = _mapping(info.get("subtitles"))

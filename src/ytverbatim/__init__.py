@@ -3,6 +3,7 @@ from importlib.metadata import version
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from ytverbatim.acquire.session import expand
     from ytverbatim.config import Options
     from ytverbatim.contract import ContextDocument
     from ytverbatim.llm import LLMClient
@@ -14,12 +15,13 @@ __version__ = version("ytverbatim")
 # yt-dlp, pydantic and the pipeline.
 _LAZY = {
     "process": "ytverbatim.pipeline",
+    "expand": "ytverbatim.acquire.session",
     "Options": "ytverbatim.config",
     "ContextDocument": "ytverbatim.contract",
     "LLMClient": "ytverbatim.llm",
 }
 
-__all__ = ["ContextDocument", "LLMClient", "Options", "__version__", "process"]
+__all__ = ["ContextDocument", "LLMClient", "Options", "__version__", "expand", "process"]
 
 
 def __getattr__(name: str) -> object:

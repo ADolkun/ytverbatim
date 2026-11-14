@@ -106,7 +106,7 @@ def make_doc() -> Callable[..., ContextDocument]:
         chapter_ranges = _ranges(numbered, lambda s: s.chapter) if chapters else {}
         return ContextDocument.model_validate(
             {
-                "schema_version": "1.0",
+                "schema_version": "1.1",
                 "generator": Generator(name="ytverbatim", version="0.0.1"),
                 "created_at": "2026-01-02T03:04:05+00:00",
                 "video": Video(

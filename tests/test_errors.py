@@ -41,6 +41,19 @@ def test_hierarchy_and_attributes() -> None:
     assert issubclass(ConfigError, YtverbatimError)
 
 
+def test_every_error_has_a_fix_that_is_empty_until_one_is_set() -> None:
+    errors = [
+        YtverbatimError("x"),
+        AuthError(AuthState.NO_SOURCE),
+        YtDlpError(None, (), "x", 1),
+        UnavailableError("geo"),
+        BatchStopError(Signal.BOT_CHECK, None),
+    ]
+    assert [e.fix for e in errors] == [""] * len(errors)
+    errors[1].fix = "Run: ytverbatim auth profiles"
+    assert errors[1].fix == "Run: ytverbatim auth profiles" and errors[0].fix == ""
+
+
 def test_stderr_preview_keeps_both_ends() -> None:
     assert stderr_preview("  short  ") == "short"
     long = "A" * 1000 + "M" * 500 + "Z" * 1000

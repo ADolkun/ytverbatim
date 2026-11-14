@@ -10,14 +10,14 @@ import json
 import logging
 import time
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
 from typing import Literal, Protocol, cast
 
-from ytverbatim import atomic, ids, paths
+from ytverbatim import atomic, config, ids, paths
 from ytverbatim.acquire.audio import INFO_MAX_AGE_S, WAV_NAME, fetch_audio, find_audio, to_wav16k, validate_audio
 from ytverbatim.acquire.captions import (
     DEFAULT_LANGUAGES,
@@ -29,7 +29,7 @@ from ytverbatim.acquire.captions import (
 )
 from ytverbatim.acquire.captions import FILE_STEM as CAPTIONS_STEM
 from ytverbatim.acquire.expand import expand_target
-from ytverbatim.acquire.metadata import VideoMetadata, fetch_info, info_path, load_metadata
+from ytverbatim.acquire.metadata import VideoMetadata, fetch_info, has_comments, info_path, load_metadata
 from ytverbatim.auth import preflight, snapshot
 from ytverbatim.auth.cooldown import (
     CAPTIONS_LABEL,
@@ -45,7 +45,7 @@ from ytverbatim.auth.cooldown import (
 )
 from ytverbatim.auth.fixes import fix_for
 from ytverbatim.auth.snapshot import Snapshot
-from ytverbatim.auth.source import BrowserSource, CookieFileSource, CookieSource
+from ytverbatim.auth.source import BrowserSource, CookieFileSource, CookieSource, resolve_source
 from ytverbatim.auth.state import AuthState
 from ytverbatim.contract.models import Access
 from ytverbatim.errors import (
@@ -110,6 +110,8 @@ class FetchOptions:
     cookie_channels: tuple[str, ...] = ()
     max_videos: int = 50
     ignore_cooldown: bool = False
+    # Folds a bounded comment page into each video's one `-J`; a saved extraction without it is redone once.
+    creator_note: bool = False
 
 
 class VideoStatus(StrEnum):
@@ -131,6 +133,8 @@ class VideoOutcome:
     detail: str = ""
     fix: str = ""
     auth_error: bool = False
+    # The error behind a recorded failure, so `process` can raise it as it was; not part of the report.
+    cause: YtverbatimError | None = field(default=None, repr=False, compare=False)
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -284,7 +288,9 @@ class FetchSession:
         want_audio = self._options.audio and audio
         captions_done = not self._options.captions or _load_tracks(vdir) is not None
         audio_done = not want_audio or _audio_ready(vdir)
-        prior = _load_prior(vdir, need_fresh=not (captions_done and audio_done))
+        prior = _load_prior(
+            vdir, need_fresh=not (captions_done and audio_done), creator_note=self._options.creator_note
+        )
         reused: list[str] = []
         if prior is not None:
             metadata, access = prior
@@ -333,7 +339,8 @@ class FetchSession:
         if policy == "always" or (cookies_first and policy == "auto"):
             return self._extract_with_cookies(video_id, vdir, self._cookie_snapshots(snaps, None))
         try:
-            return _Extracted(fetch_info(self._runner, video_id, vdir), cookies_used=False)
+            info = fetch_info(self._runner, video_id, vdir, creator_note=self._options.creator_note)
+            return _Extracted(info, cookies_used=False)
         except YtDlpError as exc:
             if exc.primary not in ESCALATE_SIGNALS:
                 raise
@@ -353,7 +360,15 @@ class FetchSession:
     def _extract_with_cookies(self, video_id: str, vdir: Path, snaps: _Snapshots) -> _Extracted:
         try:
             metadata = self._with_cookies(
-                snaps, lambda cookies: fetch_info(self._runner, video_id, vdir, cookies=cookies, verbose=True)
+                snaps,
+                lambda cookies: fetch_info(
+                    self._runner,
+                    video_id,
+                    vdir,
+                    cookies=cookies,
+                    creator_note=self._options.creator_note,
+                    verbose=True,
+                ),
             )
         except YtDlpError as exc:
             if exc.primary in (Signal.MEMBERS_ONLY, Signal.LOGIN_REQUIRED):
@@ -466,6 +481,9 @@ class FetchSession:
         )
 
     def _failure(self, video_id: str, exc: YtverbatimError) -> VideoOutcome:
+        return replace(self._recorded(video_id, exc), cause=exc)
+
+    def _recorded(self, video_id: str, exc: YtverbatimError) -> VideoOutcome:
         match exc:
             case AuthError(state=state, detail=detail):
                 fix = fix_for(state, **preflight.fix_context(self._source))
@@ -592,11 +610,16 @@ def _duration_if_valid(path: Path, expected: float | None) -> float | None:
         return None
 
 
-def _load_prior(vdir: Path, *, need_fresh: bool) -> tuple[VideoMetadata, Access] | None:
-    """Reuse the saved extraction; with stages still to run it must be young enough for its signed URLs."""
+def _load_prior(vdir: Path, *, need_fresh: bool, creator_note: bool) -> tuple[VideoMetadata, Access] | None:
+    """Reuse the saved extraction; with stages still to run it must be young enough for its signed URLs.
+
+    With `creator_note`, an extraction made without comments is not reusable: it can say nothing about a note.
+    """
     info = info_path(vdir)
     try:
         if need_fresh and time.time() - info.stat().st_mtime > INFO_MAX_AGE_S:
+            return None
+        if creator_note and not has_comments(vdir):
             return None
         metadata = load_metadata(vdir)
         access = Access.model_validate_json((vdir / ACCESS_FILE).read_text(encoding="utf-8"))
@@ -667,6 +690,23 @@ def _needs_cookies(ref: ids.YouTubeRef, channel_keys: set[str]) -> bool:
     return ref.kind is ids.RefKind.CHANNEL and ref.id.lower() in channel_keys
 
 
+def _list_ids(
+    runner: YtDlpRunner,
+    target: str,
+    ref: ids.YouTubeRef,
+    *,
+    cookies_first: bool,
+    source: CookieSource | None,
+    limit: int,
+) -> list[str]:
+    # Members playlists are listed with cookies too: anonymous listing of them is unverified.
+    with contextlib.ExitStack() as stack:
+        cookies: Path | None = None
+        if cookies_first and ref.kind is ids.RefKind.PLAYLIST and source is not None:
+            cookies = stack.enter_context(snapshot.cookie_snapshot(source)).path
+        return expand_target(runner, target, limit=limit, cookies=cookies)
+
+
 def plan_videos(
     runner: YtDlpRunner,
     targets: Sequence[str],
@@ -683,12 +723,7 @@ def plan_videos(
         if ref is None:
             raise ValueError(f"not a YouTube video, playlist or channel: {target!r}")
         cookies_first = _needs_cookies(ref, channel_keys) and options.policy != "never"
-        # Members playlists are listed with cookies too: anonymous listing of them is unverified.
-        with contextlib.ExitStack() as stack:
-            cookies: Path | None = None
-            if cookies_first and ref.kind is ids.RefKind.PLAYLIST and source is not None:
-                cookies = stack.enter_context(snapshot.cookie_snapshot(source)).path
-            found = expand_target(runner, target, limit=options.max_videos, cookies=cookies)
+        found = _list_ids(runner, target, ref, cookies_first=cookies_first, source=source, limit=options.max_videos)
         if ref.kind is not ids.RefKind.VIDEO and len(found) >= options.max_videos:
             capped = True
         for video_id in found:
@@ -698,6 +733,48 @@ def plan_videos(
         capped = True
         videos = videos[: options.max_videos]
     return videos, capped
+
+
+def expand(
+    target: str,
+    *,
+    limit: int = 0,
+    auth: str | None = None,
+    options: config.Options | None = None,
+) -> list[str]:
+    """Return the video ids behind one video, playlist or channel URL, in order and without repeats.
+
+    A video costs no request. Otherwise this refuses an active cooldown before any request (`BatchStopError`), and a
+    bot or rate signal starts one and raises the same. `limit` caps the listing (0 means all; the per-run video cap
+    of `run` does not apply). A members playlist, and nothing else, is listed with cookies from `auth` or the
+    configured source, unless `auth.policy` is "never"; with none set it raises `AuthError` rather than list it
+    anonymously. Raises `ValueError` for a target that is none of the three, and `YtDlpError` for a failed listing.
+    Errors carry a `fix`.
+    """
+    ref = ids.classify(target)
+    if ref is None:
+        raise ValueError(f"not a YouTube video, playlist or channel: {target!r}")
+    if ref.kind is ids.RefKind.VIDEO:
+        return [ref.id]
+    options = options or config.load_options()
+    check_cooldown(utcnow())
+    source = resolve_source(auth)
+    cookies_first = _needs_cookies(ref, _channel_keys(options.auth.cookie_channels)) and options.auth.policy != "never"
+    if cookies_first and ref.kind is ids.RefKind.PLAYLIST and source is None:
+        no_source = AuthError(
+            AuthState.NO_SOURCE, "a members playlist is listed with cookies, but no auth source is set"
+        )
+        no_source.fix = fix_for(AuthState.NO_SOURCE)
+        raise no_source
+    runner = GuardedRunner(default_runner(()), utcnow)
+    try:
+        found = _list_ids(runner, target, ref, cookies_first=cookies_first, source=source, limit=limit)
+    except YtDlpError as exc:
+        exc.fix = _ytdlp_fix(exc)
+        raise
+    if runner.stop is not None:
+        raise BatchStopError(runner.stop.signal, runner.stop.until)
+    return found
 
 
 def fetch(
@@ -786,6 +863,7 @@ __all__ = [
     "VideoStatus",
     "check_cooldown",
     "default_runner",
+    "expand",
     "fetch",
     "plan_videos",
     "read_cooldown",

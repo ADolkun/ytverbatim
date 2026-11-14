@@ -132,6 +132,9 @@ class FakeYtDlp:
     # Per video: its declared language, and its caption files by track code (an "-orig" code is the auto track).
     language: dict[str, str] = field(default_factory=dict)
     tracks: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Per video: the comments a `--get-comments` extraction returns, and a live status its `-J` reports.
+    comments: dict[str, list[dict[str, object]]] = field(default_factory=dict)
+    live_status: dict[str, str] = field(default_factory=dict)
     calls: list[YtCall] = field(default_factory=list)
 
     def run(self, args: Sequence[str], *, cookies: Path | None, timeout_s: float, label: str) -> YtDlpResult:
@@ -144,7 +147,7 @@ class FakeYtDlp:
         secondary = self.secondary.get(key, ())
         stderr = self.stderr.get(key, "")
         if label == "metadata":
-            return self._ok(json.dumps(self._info(call.video_id)), secondary, stderr)
+            return self._ok(json.dumps(self._info(call.video_id, "--get-comments" in args)), secondary, stderr)
         if label == "captions":
             target = args[args.index("-o") + 1].removeprefix("subtitle:").replace("%(ext)s", "")
             files = self.tracks.get(Path(target).parent.parent.name)
@@ -158,8 +161,8 @@ class FakeYtDlp:
             return self._ok("\n".join(self.playlist) + "\n", secondary, stderr)
         return self._ok("", secondary, stderr)
 
-    def _info(self, video_id: str) -> dict[str, object]:
-        return {
+    def _info(self, video_id: str, with_comments: bool = False) -> dict[str, object]:
+        info: dict[str, object] = {
             "id": video_id,
             "title": "Synthetic title",
             "channel": "Synthetic channel",
@@ -171,6 +174,12 @@ class FakeYtDlp:
             "automatic_captions": self._auto(video_id),
             "subtitles": {code: [] for code in self.tracks.get(video_id, {}) if not code.endswith("-orig")},
         }
+        if video_id in self.live_status:
+            info["live_status"] = self.live_status[video_id]
+        if with_comments:
+            # As yt-dlp: the key exists only when comments were asked for, even if there are none.
+            info["comments"] = self.comments.get(video_id, [])
+        return info
 
     def _auto(self, video_id: str) -> dict[str, list[object]]:
         if video_id in self.no_captions:

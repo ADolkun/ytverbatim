@@ -457,3 +457,73 @@ def test_failed_verbose_call_drops_debug_lines(session_kit) -> None:
     outcome = only(run(session_kit, yt, [MEMBERS]))
     assert outcome.error == "unclassified" and "something new" in outcome.detail
     assert SECRET not in _files_text(session_kit.out) + _files_text(session_kit.home)
+
+
+PINNED = {
+    "is_pinned": True,
+    "author_is_uploader": True,
+    "text": "Correction: the figure is 12%.",
+    "author": "@synthetic",
+    "like_count": 7,
+    "_time_text": "1 day ago",
+}
+
+
+def test_comments_are_asked_for_only_when_the_creator_note_is_on(session_kit) -> None:
+    yt = session_kit.yt()
+    run(session_kit, yt, [PUBLIC])
+    assert yt.labels("metadata")[0].args == ["-J", "--no-playlist", f"https://www.youtube.com/watch?v={PUBLIC}"]
+
+    yt = session_kit.yt()
+    run(session_kit, yt, [PUBLIC_2], creator_note=True)
+    (call,) = yt.labels("metadata")
+    assert call.args[:3] == ["-J", "--no-playlist", "--get-comments"] and call.args[-1].endswith(PUBLIC_2)
+
+
+def test_the_note_rides_on_the_cookied_extraction_too(session_kit) -> None:
+    yt = session_kit.yt()
+    yt.availability[MEMBERS] = "subscriber_only"
+    yt.failures[("metadata", False)] = [session_kit.fail(Signal.MEMBERS_ONLY)]
+    run(session_kit, yt, [MEMBERS], creator_note=True)
+    (cookied,) = yt.labels("metadata", cookied=True)
+    assert "--get-comments" in cookied.args and "-v" in cookied.args
+
+
+def test_the_note_is_read_from_the_extraction(session_kit) -> None:
+    yt = session_kit.yt()
+    yt.comments[PUBLIC] = [{**PINNED, "is_pinned": False}, PINNED]
+    run(session_kit, yt, [PUBLIC], creator_note=True)
+    metadata = json.loads((session_kit.out / PUBLIC / "metadata.json").read_text())
+    assert metadata["creator_note"] == {
+        "text": "Correction: the figure is 12%.",
+        "author": "@synthetic",
+        "like_count": 7,
+        "published": "1 day ago",
+    }
+
+    run(session_kit, yt, [PUBLIC_2], creator_note=True)
+    assert json.loads((session_kit.out / PUBLIC_2 / "metadata.json").read_text())["creator_note"] is None
+
+
+def test_turning_the_note_on_re_extracts_once(session_kit) -> None:
+    yt = session_kit.yt()
+    yt.comments[PUBLIC] = [PINNED]
+    run(session_kit, yt, [PUBLIC])
+    run(session_kit, yt, [PUBLIC])
+    assert len(yt.labels("metadata")) == 1
+    assert json.loads((session_kit.out / PUBLIC / "metadata.json").read_text())["creator_note"] is None
+
+    run(session_kit, yt, [PUBLIC], creator_note=True)
+    assert len(yt.labels("metadata")) == 2 and "--get-comments" in yt.labels("metadata")[1].args
+    assert json.loads((session_kit.out / PUBLIC / "metadata.json").read_text())["creator_note"] is not None
+
+    outcome = only(run(session_kit, yt, [PUBLIC], creator_note=True))
+    assert len(yt.labels("metadata")) == 2 and "info" in outcome.reused
+
+
+def test_a_video_without_comments_is_not_re_extracted_every_run(session_kit) -> None:
+    yt = session_kit.yt()
+    yt.comments[PUBLIC] = []
+    for _ in range(2):
+        run(session_kit, yt, [PUBLIC], creator_note=True)
+    assert len(yt.labels("metadata")) == 1
