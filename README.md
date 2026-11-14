@@ -4,7 +4,7 @@ Turn YouTube URLs into verified, timestamped transcripts for LLM context.
 
 Language models need transcripts they can cite. `ytverbatim` aims to produce text where every line carries a timestamp, so a quote can be traced back to the exact moment in the video. It works with your own logged-in browser session, so Premium and members-only videos you can already watch are covered. Speech recognition runs locally on Apple Silicon (MLX), with a focus on Mandarin and English.
 
-**Status: pre-alpha.** `ytverbatim run` turns a video into a transcript with local Whisper, restores missing punctuation and checks numbers against independent readings where there are any (the video's own captions, or an optional second engine). The engine selection is still to come.
+**Status: pre-alpha.** `ytverbatim run` turns a video into a transcript with local Whisper, restores missing punctuation and checks numbers against independent readings where there are any (the video's own captions, or an optional second engine). An engine evaluation kept mlx-whisper large-v3 as the default ([result](evals/results/asr-2026-11-13.md)).
 
 ## Usage
 
