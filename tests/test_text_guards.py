@@ -253,6 +253,27 @@ def test_a_ticker_merged_into_or_split_out_of_a_word_is_reported(
     assert fixed[change.char_start : change.char_end] == after
 
 
+@pytest.mark.parametrize(
+    ("original", "fixed"),
+    [
+        ("1H25 revenue", "1Q25 revenue"),
+        ("guidance for 3Q24", "guidance for 3H24"),
+        ("watch 10M1", "watch 10N1"),
+        ("the 2Y10Y spread", "the 2Y10X spread"),
+    ],
+)
+def test_a_single_letter_ticker_fused_to_a_figure_stays_exact(original: str, fixed: str) -> None:
+    assert rejected_by(original, fixed) == "numeric_spans"
+
+
+@pytest.mark.parametrize(
+    ("original", "fixed"),
+    [("1H25 revenue", "1H25 revenue."), ("3.35SMH today", "3.35SMH today."), ("at 10AM", "at 10AM.")],
+)
+def test_an_unchanged_fused_figure_is_accepted(original: str, fixed: str) -> None:
+    assert rejected_by(original, fixed) is None
+
+
 def test_a_merge_that_respells_the_ticker_beyond_one_letter_is_rejected() -> None:
     assert rejected_by("we use open AL tools", "we use OpenAI tools") == "symbols"
 

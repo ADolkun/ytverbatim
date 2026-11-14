@@ -95,9 +95,10 @@ _QUANTITY_TOKEN = re.compile(
     rf"{_CJK_CURRENCY_WORDS}|{_SINGLE_FINANCIAL_TICKER.pattern}|{_DOTTED_TICKER.pattern}"
 )
 # Ordered numeric surface tokens: alphanumeric and dotted tickers (Q2, BRK.B, 0700.HK) and numbers with their sign,
-# currency and percent. Letter-only symbols and Chinese numerals have their own guards.
+# currency and percent. Letter-only symbols and Chinese numerals have their own guards. A ticker may follow a digit
+# directly, as quantity_tokens splits it (1H25 is 1 and H25), so a fused one with a single letter is compared too.
 _NUMERIC_SPAN = re.compile(
-    r"(?<![A-Za-z0-9])(?:[A-Z][A-Z0-9]+\.[A-Z]+|[A-Z][A-Z0-9]*[0-9][A-Z0-9]*|\d{2,}\.[A-Z]{2,})(?![A-Za-z0-9])"
+    r"(?<![A-Za-z])(?:[A-Z][A-Z0-9]+\.[A-Z]+|[A-Z][A-Z0-9]*[0-9][A-Z0-9]*|\d{2,}\.[A-Z]{2,})(?![A-Za-z0-9])"
     r"|(?<![A-Za-z0-9])[-+−]?(?:[$¥€£][-+−]?)?(?:\d+(?:,\d{3}(?!\d))*(?:\.\d+)?|\.\d+)%?"
 )
 _NEGATION = re.compile(
