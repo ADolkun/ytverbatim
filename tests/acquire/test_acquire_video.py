@@ -54,6 +54,20 @@ def test_the_download_asks_for_the_video_track_only_as_mp4(fakes, tmp_path: Path
     assert (call.cookies, call.timeout_s, call.label) == (cookies, 99.0, "video")
 
 
+@pytest.mark.parametrize(
+    ("duration", "timeout_s"),
+    [(None, 3600.0), (600.0, 3600.0), (7200.0, 21600.0), (20 * 3600.0, 12 * 3600.0)],
+)
+def test_the_download_limit_scales_with_the_duration_between_a_floor_and_a_ceiling(
+    fakes, tmp_path: Path, fake_proc, duration: float | None, timeout_s: float
+) -> None:
+    runner = fakes.runner(lambda args, _label: (write_video(args), fakes.ok())[1])
+    fake_proc.probe_returns(f"{duration or 600.0}\n")
+    video.fetch_video(runner, VIDEO_ID, stage(tmp_path), tmp_path / "out", expected_duration=duration)
+    (call,) = runner.calls
+    assert call.timeout_s == timeout_s
+
+
 def test_an_earlier_file_is_removed_so_yt_dlp_does_not_skip_the_download(fakes, tmp_path: Path, fake_proc) -> None:
     out_dir = tmp_path / "out"
     out_dir.mkdir()

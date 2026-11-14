@@ -131,6 +131,25 @@ def test_fetch_audio_loads_the_saved_info_and_keeps_the_native_container(fakes, 
     assert len(runner.calls) == 1
 
 
+@pytest.mark.parametrize(
+    ("duration", "timeout_s"),
+    [(None, 3600.0), (0.0, 3600.0), (float("nan"), 3600.0), (600.0, 3600.0), (4 * 3600.0, 7200.0)],
+)
+def test_the_audio_download_limit_scales_with_the_duration(
+    fakes, tmp_path: Path, fake_proc, duration: float | None, timeout_s: float
+) -> None:
+    runner = fakes.runner(lambda args, _label: (write_audio(args), fakes.ok())[1])
+    fake_proc.probe_returns(f"{timeout_s * 2}\n")
+    audio.fetch_audio(runner, VIDEO_ID, stage(tmp_path), tmp_path / "out", expected_duration=duration)
+    (call,) = runner.calls
+    assert call.timeout_s == timeout_s
+
+
+def test_the_download_limit_never_passes_the_ceiling() -> None:
+    ceiling = audio.DOWNLOAD_TIMEOUT_CEILING_S
+    assert audio.download_timeout_s(float("inf"), audio.VIDEO_DOWNLOAD_S_PER_MEDIA_S) == ceiling
+
+
 def test_a_truncated_download_is_deleted_and_raises(fakes, tmp_path: Path, fake_proc) -> None:
     out_dir = tmp_path / "out"
     runner = fakes.runner(lambda args, _label: (write_audio(args), fakes.ok())[1])
