@@ -138,35 +138,57 @@ def _view(language: str) -> Language:
     return "en" if language == "en" else "zh"
 
 
-def _respellings(flags: Sequence[Flag], language: Language) -> set[tuple[str, str]]:
+def _respellings(flags: Sequence[Flag], language: Language) -> Counter[tuple[str, str]]:
     # `text.correct` writes an `entity_corrected` note as "before → after".
     pairs = (f.note.partition(" → ") for f in flags if f.kind == "entity_corrected")
-    return {(canonical(before, language), canonical(after, language)) for before, _, after in pairs}
+    return Counter((canonical(before, language), canonical(after, language)) for before, _, after in pairs)
 
 
 def breaks_numbers(before: str, after: str, flags: Sequence[Flag], language: Language) -> bool:
     """Whether ``after`` changes a quantity, or changes a ticker that ``flags`` do not record as a correction.
 
-    A ticker respelled in place must match a flag's before and after. One that vanishes into a name (open AI→OpenAI)
-    or appears out of one has no counterpart, so it only has to be named on its own side of a flag (``AI → OpenAI``).
+    Each flag covers one changed ticker. A ticker respelled in place needs a flag with its before and after. One that
+    vanishes into a name (open AI→OpenAI) or appears out of one has no counterpart, so a flag naming it on its own side
+    covers it (``AI → OpenAI``).
     """
     tokens = [quantity_tokens(canonical(text, language)) for text in (before, after)]
     quantities = [[(t.value_itn, t.kind) for t in found if t.kind != "ticker"] for found in tokens]
     if quantities[0] != quantities[1]:
         return True
     old, new = ([t.surface for t in found if t.kind == "ticker"] for found in tokens)
-    allowed = _respellings(flags, language)
-    flagged_before = {b for b, _ in allowed}
-    flagged_after = {a for _, a in allowed}
+    unused = _respellings(flags, language)
     for tag, i1, i2, j1, j2 in SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
         if tag == "equal":
             continue
         if i2 - i1 == j2 - j1:
-            if any((b, a) not in allowed for b, a in zip(old[i1:i2], new[j1:j2], strict=True)):
+            changed = [(b, a) for b, a in zip(old[i1:i2], new[j1:j2], strict=True) if b != a]
+            if not all(_use(unused, before=b, after=a) for b, a in changed):
                 return True
-        elif any(b not in flagged_before for b in old[i1:i2]) or any(a not in flagged_after for a in new[j1:j2]):
+            continue
+        gone, came = Counter(old[i1:i2]), Counter(new[j1:j2])
+        # A flag naming both a vanished and a new ticker of the block is a respelling and covers both.
+        for b, a in list(unused):
+            paired = min(unused[b, a], gone[b], came[a])
+            unused[b, a] -= paired
+            gone[b] -= paired
+            came[a] -= paired
+        if not all(_use(unused, before=b) for b in gone.elements()):
+            return True
+        if not all(_use(unused, after=a) for a in came.elements()):
             return True
     return False
+
+
+def _use(unused: Counter[tuple[str, str]], *, before: str | None = None, after: str | None = None) -> bool:
+    """Spend one unused flag with this ``before`` and ``after`` (None matches any); False when there is none."""
+    pair = next(
+        ((b, a) for (b, a), count in unused.items() if count > 0 and before in (None, b) and after in (None, a)),
+        None,
+    )
+    if pair is None:
+        return False
+    unused[pair] -= 1
+    return True
 
 
 def number_violations(base: BaseFile, candidate: CandidateFile) -> int:
