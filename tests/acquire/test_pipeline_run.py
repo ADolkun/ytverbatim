@@ -511,6 +511,72 @@ def test_the_default_run_key_is_the_one_made_before_the_creator_note_existed(ses
     assert settings_for(session_kit, note_options(on=True)).run_key() != before
 
 
+def video_options(*, on: bool) -> config.Options:
+    return config.load_options(overrides={"ytdlp": {"video": on}})
+
+
+def test_a_default_run_requests_no_video(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    run(session_kit, yt)
+    assert [c.label for c in yt.calls] == ["metadata", "captions", "audio"]
+    assert not (session_kit.out / PUBLIC / "video.mp4").exists()
+
+
+def test_the_option_downloads_the_video_during_a_run(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    _, results, _ = run(session_kit, yt, options=video_options(on=True))
+    assert [c.label for c in yt.calls] == ["metadata", "captions", "audio", "video"]
+    assert (session_kit.out / PUBLIC / "video.mp4").is_file() and results[0].document is not None
+
+    _, again, _ = run(session_kit, yt, options=video_options(on=True))
+    assert len(yt.labels("video")) == 1 and again[0].outcome.reused == ("context",)
+
+
+def test_a_current_document_with_a_wanted_video_makes_exactly_one_video_request(
+    session_kit, worker: FakeWorker
+) -> None:
+    yt = session_kit.yt()
+    _, first, _ = run(session_kit, yt)
+    before = len(yt.calls)
+
+    _, second, events = run(session_kit, yt, options=video_options(on=True))
+
+    assert [c.label for c in yt.calls[before:]] == ["video"]
+    assert len(worker.calls) == 1
+    assert second[0].document == first[0].document
+    assert second[0].outcome.reused == ("context", "info")
+    assert [e.stage for e in events] == ["skip"]
+    assert (session_kit.out / PUBLIC / "video.mp4").is_file()
+
+    run(session_kit, yt, options=video_options(on=True))
+    assert len(yt.labels("video")) == 1
+
+
+def test_a_failed_video_download_fails_a_current_document_loudly(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    run(session_kit, yt)
+    yt.failures[("video", False)] = [session_kit.fail(Signal.NO_FORMATS)]
+    with pytest.raises(YtDlpError):
+        process(PUBLIC, video_options(on=True), out=session_kit.out, runner_factory=lambda _sleep: yt)
+
+
+def test_a_cooldown_still_refuses_a_current_document_whose_video_is_missing(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    run(session_kit, yt)
+    session.start_cooldown(Signal.RATE_LIMITED, NOW)
+    calls = len(yt.calls)
+    with pytest.raises(session.BatchStopError):
+        run(session_kit, yt, options=video_options(on=True))
+    assert len(yt.calls) == calls
+
+
+def test_the_video_option_is_not_part_of_the_run_key(session_kit, worker: FakeWorker) -> None:
+    assert (
+        settings_for(session_kit, video_options(on=True)).run_key()
+        == settings_for(session_kit, config.load_options()).run_key()
+    )
+
+
 def test_a_held_lock_raises_busy_without_touching_the_network(session_kit, worker: FakeWorker) -> None:
     yt = session_kit.yt()
     vdir = session_kit.out / PUBLIC

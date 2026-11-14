@@ -21,6 +21,7 @@ class YtdlpOptions:
     max_videos_per_run: int = 50
     premium_probe_id: str = "BaW_jenozKc"
     creator_note: bool = False
+    video: bool = False
 
 
 @dataclass(frozen=True)

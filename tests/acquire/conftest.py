@@ -117,7 +117,7 @@ class YtCall:
 
 @dataclass
 class FakeYtDlp:
-    """A scripted yt-dlp: metadata, captions, audio and expansion succeed unless a failure is queued.
+    """A scripted yt-dlp: metadata, captions, audio, video and expansion succeed unless a failure is queued.
 
     `failures[(label, cookied)]` holds errors raised in order by matching calls; `availability` and
     `secondary` shape a video's successful `-J`.
@@ -157,6 +157,8 @@ class FakeYtDlp:
                 Path(f"{target}{code}.json3").write_text(content, "utf-8")
         elif label == "audio":
             Path(args[args.index("-o") + 1].replace("%(ext)s", "webm")).write_bytes(b"fake audio")
+        elif label == "video":
+            Path(args[args.index("-o") + 1].replace("%(ext)s", "mp4")).write_bytes(b"fake video")
         elif label == "expand":
             return self._ok("\n".join(self.playlist) + "\n", secondary, stderr)
         return self._ok("", secondary, stderr)

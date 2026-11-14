@@ -57,15 +57,15 @@ def fetch_audio(
         if stale.suffix.lower() not in {".wav", ".part", ".ytdl"}:
             stale.unlink(missing_ok=True)
 
-    try:
-        _download(runner, stage_dir, out_dir, cookies, timeout_s)
-    except YtDlpError as exc:
-        saved = info_path(stage_dir)
-        if exc.primary is not Signal.HTTP_403 or now() - saved.stat().st_mtime <= INFO_MAX_AGE_S:
-            raise
-        log.warning("audio download got 403 with a stale info JSON; extracting the video again")
-        fetch_info(runner, video_id, stage_dir, cookies=cookies)
-        _download(runner, stage_dir, out_dir, cookies, timeout_s)
+    download_refreshing_stale_info(
+        runner,
+        video_id,
+        stage_dir,
+        cookies,
+        lambda: _download(runner, stage_dir, out_dir, cookies, timeout_s),
+        what="audio",
+        now=now,
+    )
 
     path = find_audio(out_dir)
     if path is None:
@@ -78,24 +78,51 @@ def fetch_audio(
     return path
 
 
-def validate_audio(path: Path, *, expected_duration: float | None, min_coverage: float = MIN_COVERAGE) -> float:
-    """Raise unless `path` is non-empty, decodable and long enough; return its probed duration."""
+def download_refreshing_stale_info(
+    runner: YtDlpRunner,
+    video_id: str,
+    stage_dir: Path,
+    cookies: Path | None,
+    download: Callable[[], None],
+    *,
+    what: str,
+    now: Callable[[], float] = time.time,
+) -> None:
+    """Run `download`; a 403 with an old info JSON means expired signed URLs, so extract once more and retry once."""
+    try:
+        download()
+    except YtDlpError as exc:
+        saved = info_path(stage_dir)
+        if exc.primary is not Signal.HTTP_403 or now() - saved.stat().st_mtime <= INFO_MAX_AGE_S:
+            raise
+        log.warning("%s download got 403 with a stale info JSON; extracting the video again", what)
+        fetch_info(runner, video_id, stage_dir, cookies=cookies)
+        download()
+
+
+def validate_audio(
+    path: Path, *, expected_duration: float | None, min_coverage: float = MIN_COVERAGE, kind: str = "audio"
+) -> float:
+    """Raise unless `path` is non-empty, decodable and long enough; return its probed duration.
+
+    `kind` names the medium in the errors, so the same probe serves the video file.
+    """
     try:
         size = path.stat().st_size
     except OSError as exc:
-        raise MediaValidationError(f"audio file is missing: {path.name}") from exc
+        raise MediaValidationError(f"{kind} file is missing: {path.name}") from exc
     if size == 0:
-        raise MediaValidationError(f"audio file is empty: {path.name}")
-    probed = probe_duration(path)
+        raise MediaValidationError(f"{kind} file is empty: {path.name}")
+    probed = probe_duration(path, kind=kind)
     if expected_duration and expected_duration > 0 and probed < min_coverage * expected_duration:
         raise MediaValidationError(
-            f"audio is truncated: {path.name} is {probed:.0f}s, "
+            f"{kind} is truncated: {path.name} is {probed:.0f}s, "
             f"under {min_coverage:.0%} of the expected {expected_duration:.0f}s"
         )
     return probed
 
 
-def probe_duration(path: Path) -> float:
+def probe_duration(path: Path, *, kind: str = "audio") -> float:
     result = proc.run(
         [
             "ffprobe",
@@ -111,13 +138,13 @@ def probe_duration(path: Path) -> float:
     )
     if result.returncode != 0:
         # ffprobe and ffmpeg echo the absolute input path, which names the user.
-        raise MediaValidationError(f"audio is unreadable: {path.name}\n{stderr_preview(redact(result.stderr))}")
+        raise MediaValidationError(f"{kind} is unreadable: {path.name}\n{stderr_preview(redact(result.stderr))}")
     try:
         duration = float(result.stdout.strip())
     except ValueError:
         duration = 0.0
     if duration <= 0:
-        raise MediaValidationError(f"audio has no readable duration: {path.name}")
+        raise MediaValidationError(f"{kind} has no readable duration: {path.name}")
     return duration
 
 
