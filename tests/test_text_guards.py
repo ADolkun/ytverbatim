@@ -51,6 +51,8 @@ def rejected_by(original: str, fixed: str) -> str | None:
         ("股票长了", "股票涨了"),
         ("it went up and then down", "it went up and then down."),
         ("prices rose then fell", "prices rose, then fell"),
+        # A comma group of four digits is two numbers, so spacing them apart changes nothing.
+        ("in 2023,2024 it grew", "in 2023, 2024 it grew"),
     ],
 )
 def test_safe_fix_is_accepted(original: str, fixed: str) -> None:

@@ -177,7 +177,8 @@ _TEN, _HUNDRED = 10, 100
 _EN_PIECE = re.compile(rf"(?i:\b(?:{_EN_NUMBER_WORD}|and)\b)")
 
 _DIGIT = "[0-9０-９]"
-_NUMBER = rf"(?:{_DIGIT}+(?:,{_DIGIT}{{3}})*(?:\.{_DIGIT}+)?|\.{_DIGIT}+)"
+# A thousands group is exactly three digits, so 2023,2024 is two numbers and not 2023,202 followed by 4.
+_NUMBER = rf"(?:{_DIGIT}+(?:,{_DIGIT}{{3}}(?!{_DIGIT}))*(?:\.{_DIGIT}+)?|\.{_DIGIT}+)"
 _NO_ALNUM_BEFORE = r"(?<![A-Za-z0-9])"
 _NO_ALNUM_AFTER = r"(?![A-Za-z0-9])"
 

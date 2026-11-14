@@ -1,4 +1,5 @@
 import random
+import unicodedata
 from itertools import product
 
 import pytest
@@ -91,6 +92,25 @@ def test_offsets_index_the_input() -> None:
     for token in quantity_tokens(text):
         assert text[token.char_start : token.char_end] == token.surface
     assert surfaces(text) == ["SPY", "3.5%", "QQQ", "一百五十期"]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("1,000,000", [("1,000,000", "1000000")]),
+        ("1,500.5", [("1,500.5", "1500.5")]),
+        ("2023,2024", [("2023", "2023"), ("2024", "2024")]),
+        ("5,1000", [("5", "5"), ("1000", "1000")]),
+        ("５,１０００", [("５", "5"), ("１０００", "1000")]),
+        ("1,000,0000", [("1,000", "1000"), ("0000", "0000")]),
+    ],
+)
+def test_a_thousands_group_has_exactly_three_digits(text: str, expected: list[tuple[str, str]]) -> None:
+    assert [(t.surface, t.value_itn) for t in quantity_tokens(text)] == expected
+
+
+def test_full_width_thousands_groups_split_the_same_after_nfkc() -> None:
+    assert [t.value_itn for t in quantity_tokens(unicodedata.normalize("NFKC", "５，１０００"))] == ["5", "1000"]
 
 
 def test_dates_and_identifiers_are_not_split_into_signed_numbers() -> None:
