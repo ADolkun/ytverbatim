@@ -9,7 +9,12 @@ if TYPE_CHECKING:
 
 
 class YtverbatimError(Exception):
-    """Base class for every error raised on purpose by this package."""
+    """Base class for every error raised on purpose by this package.
+
+    `fix` is a one-line, actionable remedy for the caller to show; empty when there is nothing specific to say.
+    """
+
+    fix: str = ""
 
 
 class ConfigError(YtverbatimError):

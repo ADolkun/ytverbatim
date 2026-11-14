@@ -42,10 +42,8 @@ from ytverbatim.asr.models import METRICS_FILE, ChunkHypothesis, FileJob, Worker
 from ytverbatim.asr.protocol import EngineDef
 from ytverbatim.auth.cooldown import utcnow
 from ytverbatim.auth.source import CookieSource, resolve_source
-from ytverbatim.auth.state import AuthState
 from ytverbatim.contract import ContextDocument, LLMUsage, dump_document, load_document
 from ytverbatim.errors import (
-    AuthError,
     BatchStopError,
     BusyError,
     ConfigError,
@@ -233,6 +231,7 @@ def process_many(  # noqa: PLR0913
         cookie_channels=options.auth.cookie_channels,
         max_videos=options.ytdlp.max_videos_per_run,
         ignore_cooldown=ignore_cooldown,
+        creator_note=options.ytdlp.creator_note,
     )
     hook = _RunHook(settings)
 
@@ -269,6 +268,7 @@ class _Settings:
     out: Path
     force: bool
     captions: bool
+    creator_note: bool
     emit: Callable[[ProgressEvent], None]
     clock: Callable[[], datetime]
 
@@ -279,19 +279,19 @@ class _Settings:
     def run_key(self) -> str:
         """Everything a finished document depends on besides the video itself; a change means a rerun."""
         versions = stage_versions()
-        return input_hash(
-            "context",
-            versions["context"],
-            {
-                "versions": dict[str, JsonValue](versions),
-                "source": self.source,
-                "captions": self.captions,
-                "engine": _engine_key(self.definition),
-                "second_opinion": _engine_key(self.second_opinion) if self.second_opinion else None,
-                "text": _plain(asdict(self.text)),
-                "llm": self.llm_id,
-            },
-        )
+        inputs: dict[str, JsonValue] = {
+            "versions": dict[str, JsonValue](versions),
+            "source": self.source,
+            "captions": self.captions,
+            "engine": _engine_key(self.definition),
+            "second_opinion": _engine_key(self.second_opinion) if self.second_opinion else None,
+            "text": _plain(asdict(self.text)),
+            "llm": self.llm_id,
+        }
+        if self.creator_note:
+            # Added only when on, so the keys of documents made before the option existed stay valid.
+            inputs["creator_note"] = True
+        return input_hash("context", versions["context"], inputs)
 
 
 def _settings(
@@ -323,7 +323,18 @@ def _settings(
         raise ConfigError("correction needs an LLM; pass --llm PROVIDER:MODEL or set [llm], or use --no-correct")
     memory_cap = asr_runner.memory_cap_bytes(options.asr.memory_cap_gib)
     return _Settings(
-        options.text, options.asr.source, definition, second, llm, memory_cap, out, force, captions, emit, clock
+        options.text,
+        options.asr.source,
+        definition,
+        second,
+        llm,
+        memory_cap,
+        out,
+        force,
+        captions,
+        options.ytdlp.creator_note,
+        emit,
+        clock,
     )
 
 
@@ -432,13 +443,11 @@ def _error_kind(exc: Exception) -> str:
 
 
 def _error_for(outcome: VideoOutcome) -> YtverbatimError:
-    """Rebuild the error of a failure the fetch session recorded only as an outcome."""
-    detail = outcome.detail or outcome.error or "failed"
-    if outcome.auth_error and outcome.error is not None:
-        return AuthError(AuthState(outcome.error), outcome.detail)
-    if outcome.error == "media_invalid":
-        return MediaValidationError(detail)
-    return YtverbatimError(f"{outcome.video_id}: {outcome.error}: {detail}")
+    """Return the error of a failure the fetch session recorded as an outcome, as raised and with its fix."""
+    if outcome.cause is not None:
+        outcome.cause.fix = outcome.fix
+        return outcome.cause
+    return YtverbatimError(f"{outcome.video_id}: {outcome.error}: {outcome.detail or outcome.error or 'failed'}")
 
 
 class _Stretches(BaseModel):
@@ -489,6 +498,9 @@ class _VideoRun:
         if outcome.status is not VideoStatus.OK or outcome.access is None:
             return VideoResult(outcome)
         metadata = load_metadata(self.vdir)
+        if not settings.creator_note:
+            # A note saved while the option was on must not reach the document or the correction prompt once it is off.
+            metadata = replace(metadata, creator_note=None)
         tracks = saved_captions(self.vdir)
 
         source: Transcribed | None = None

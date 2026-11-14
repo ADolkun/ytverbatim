@@ -8,7 +8,7 @@ from ytverbatim.contract.models import SCHEMA_VERSION, ContextDocument
 from ytverbatim.errors import ContractError
 
 SCHEMA_PATH = Path(__file__).with_name("context.v1.schema.json")
-_SUPPORTED_MAJOR = int(SCHEMA_VERSION.split(".")[0])
+_SUPPORTED_MAJOR, _CURRENT_MINOR = (int(part) for part in SCHEMA_VERSION.split("."))
 _JSON_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
 
 
@@ -24,8 +24,9 @@ def dump_document(doc: ContextDocument) -> str:
 def load_document(source: Path | str) -> ContextDocument:
     """Read a document from a file (`Path`) or from JSON text (`str`).
 
-    An unknown major version is refused. A newer minor version (`1.x`) loads with the fields this reader
-    does not know dropped, which is why it is reported as `1.0` afterwards; re-saving it discards them.
+    An unknown major version is refused. An older minor version loads as it is and is reported as the current
+    one, since a minor version only adds optional fields. A newer minor version loads with the fields this reader
+    does not know dropped, which is why it is reported as the current version afterwards; re-saving it discards them.
     """
     text = source.read_text(encoding="utf-8") if isinstance(source, Path) else source
     try:
@@ -36,9 +37,11 @@ def load_document(source: Path | str) -> ContextDocument:
         raise ContractError("a context document must be a JSON object")
     data = cast("dict[str, Any]", raw)
     minor = _check_version(data.get("schema_version"))
-    if minor > 0:
+    if minor > _CURRENT_MINOR:
         schema = export_schema()
-        data = {**_prune_unknown(data, schema, schema["$defs"]), "schema_version": SCHEMA_VERSION}
+        data = _prune_unknown(data, schema, schema["$defs"])
+    if minor != _CURRENT_MINOR:
+        data = {**data, "schema_version": SCHEMA_VERSION}
     try:
         return ContextDocument.model_validate(data)
     except ValidationError as exc:

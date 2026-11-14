@@ -1,0 +1,203 @@
+{
+  "schema_version": "1.0",
+  "generator": {
+    "name": "ytverbatim",
+    "version": "0.0.1"
+  },
+  "created_at": "2026-01-02T03:04:05Z",
+  "video": {
+    "id": "AAAAAAAAAAA",
+    "url": "https://www.youtube.com/watch?v=AAAAAAAAAAA",
+    "title": "Example Title",
+    "channel": "Example Channel",
+    "channel_id": "UCexample",
+    "upload_date": "2026-01-01",
+    "duration_s": 8.2,
+    "description": "An example video.",
+    "language": "zh",
+    "tags": [
+      "example"
+    ]
+  },
+  "access": {
+    "auth_source": "none",
+    "cookies_used": false,
+    "logged_in": null,
+    "premium": null,
+    "member": null,
+    "availability": "public",
+    "ytdlp_version": "2026.10.26",
+    "warnings": [
+      "no JS runtime found"
+    ]
+  },
+  "transcript": {
+    "language": "zh+en",
+    "script": "zh-Hans",
+    "runs": [
+      {
+        "id": "asr-1",
+        "kind": "asr",
+        "engine": "example-engine",
+        "model_repo": "example/model",
+        "model_revision": null,
+        "params": {
+          "alpha": {
+            "a": 2,
+            "z": 1
+          },
+          "beam": 1,
+          "temperature": [
+            0.0,
+            0.2
+          ]
+        },
+        "vad": null,
+        "chunking": {
+          "max_s": 30
+        },
+        "aligner": null
+      }
+    ],
+    "punctuation": "engine",
+    "correction_llm": null
+  },
+  "chapters": [
+    {
+      "index": 0,
+      "title": "Intro",
+      "start": 0.0,
+      "end": 6.0,
+      "source": "youtube",
+      "first_segment": 0,
+      "last_segment": 1
+    },
+    {
+      "index": 1,
+      "title": "Main",
+      "start": 6.0,
+      "end": 8.2,
+      "source": "youtube",
+      "first_segment": 2,
+      "last_segment": 2
+    }
+  ],
+  "paragraphs": [
+    {
+      "index": 0,
+      "start": 0.0,
+      "end": 6.0,
+      "first_segment": 0,
+      "last_segment": 1
+    },
+    {
+      "index": 1,
+      "start": 6.0,
+      "end": 8.2,
+      "first_segment": 2,
+      "last_segment": 2
+    }
+  ],
+  "segments": [
+    {
+      "id": 0,
+      "start": 0.0,
+      "end": 2.5,
+      "text": "大家好，欢迎收看。",
+      "words": null,
+      "source": {
+        "kind": "asr",
+        "run": "asr-1"
+      },
+      "edits": [],
+      "flags": [],
+      "paragraph": 0,
+      "chapter": 0
+    },
+    {
+      "id": 1,
+      "start": 2.5,
+      "end": 6.0,
+      "text": "Today we cover NVDA at 150 dollars.",
+      "words": [
+        {
+          "text": "Today",
+          "start": 2.5,
+          "end": 2.9,
+          "conf": 0.98
+        },
+        {
+          "text": "we",
+          "start": 2.9,
+          "end": 3.0,
+          "conf": null
+        }
+      ],
+      "source": {
+        "kind": "asr",
+        "run": "asr-1"
+      },
+      "edits": [
+        {
+          "stage": "correction",
+          "before": "Envidia",
+          "after": "NVDA",
+          "llm": "example-llm"
+        }
+      ],
+      "flags": [
+        {
+          "kind": "numeric_disputed",
+          "char_start": 21,
+          "char_end": 24,
+          "note": "engines disagree",
+          "readings": [
+            {
+              "source": "asr:example-engine",
+              "text": "150"
+            },
+            {
+              "source": "caption_auto",
+              "text": "115"
+            }
+          ]
+        }
+      ],
+      "paragraph": 0,
+      "chapter": 0
+    },
+    {
+      "id": 2,
+      "start": 6.0,
+      "end": 8.2,
+      "text": "好的，我们开始。",
+      "words": null,
+      "source": {
+        "kind": "asr",
+        "run": "asr-1"
+      },
+      "edits": [],
+      "flags": [],
+      "paragraph": 1,
+      "chapter": 1
+    }
+  ],
+  "quality": {
+    "speech_seconds": 7.5,
+    "transcribed_seconds": 8.2,
+    "decoder_anomalies": 0,
+    "flags_by_kind": {
+      "numeric_disputed": 1
+    },
+    "warnings": []
+  },
+  "llm_usage": [
+    {
+      "stage": "correction",
+      "client": "example",
+      "calls": 1,
+      "input_tokens": 100,
+      "output_tokens": null
+    }
+  ]
+}

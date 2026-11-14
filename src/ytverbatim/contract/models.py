@@ -5,7 +5,7 @@ from typing import Annotated, Literal, Self
 
 from pydantic import AfterValidator, AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, model_validator
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 # An absolute /Users/<name>/ or /home/<name>/ path, but not a URL path such as example.com/home/user/.
 _HOME_PATH = re.compile(r"(?<![\w.~-])/(?:Users|home)/[^/\s]+(?:/|\s|$)")
@@ -195,6 +195,15 @@ class Access(_Model):
         return self
 
 
+class CreatorNote(_Model):
+    """The uploader's own pinned comment; `published` is YouTube's relative text, such as "1 day ago"."""
+
+    text: str
+    author: str
+    like_count: int | None
+    published: str
+
+
 class Video(_Model):
     id: str
     url: str
@@ -206,6 +215,8 @@ class Video(_Model):
     description: str
     language: str | None
     tags: tuple[str, ...]
+    # Only when `[ytdlp] creator_note` is on and the uploader pinned a comment of their own.
+    creator_note: CreatorNote | None = None
 
 
 class Quality(_Model):
@@ -258,7 +269,7 @@ def _check_partition(label: str, ranges: Sequence[tuple[int, int, int]], segment
 
 
 class ContextDocument(_Model):
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.1"]
     generator: Generator
     created_at: AwareDatetime
     video: Video

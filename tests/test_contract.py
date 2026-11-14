@@ -10,7 +10,9 @@ from pydantic import ValidationError
 from ytverbatim.auth import chromium
 from ytverbatim.contract import (
     SCHEMA_PATH,
+    SCHEMA_VERSION,
     ContextDocument,
+    CreatorNote,
     dump_document,
     export_schema,
     load_document,
@@ -19,6 +21,9 @@ from ytverbatim.contract.models import Access
 from ytverbatim.errors import ContractError
 
 Raw = dict[str, Any]
+
+V1_0_FIXTURE = Path(__file__).parent / "fixtures" / "contract" / "context_v1_0.json"
+NOTE = {"text": "Correction: the figure is 12%.", "author": "@example", "like_count": None, "published": "1 day ago"}
 
 RUN = {
     "id": "asr-1",
@@ -72,7 +77,7 @@ def make_raw() -> Raw:
         }
     ]
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "generator": {"name": "ytverbatim", "version": "0.0.1"},
         "created_at": "2026-01-02T03:04:05+00:00",
         "video": {
@@ -442,9 +447,51 @@ def test_minor_version_is_accepted_and_unknown_fields_dropped() -> None:
     raw["segments"][1]["words"][0]["new_word_field"] = 1
     raw["transcript"]["runs"][0]["vad"] = {"kept": "free-form blobs are untouched"}
     doc = load_document(json.dumps(raw))
-    assert doc.schema_version == "1.0"
+    assert doc.schema_version == SCHEMA_VERSION
     assert doc.transcript.runs[0].vad == {"kept": "free-form blobs are untouched"}
     assert "new_field" not in dump_document(doc)
+
+
+def test_a_newer_minor_version_drops_unknown_fields_inside_the_creator_note() -> None:
+    raw = make_raw()
+    raw["schema_version"] = "1.7"
+    raw["video"]["creator_note"] = {**NOTE, "new_note_field": 1}
+    doc = load_document(json.dumps(raw))
+    assert doc.video.creator_note == CreatorNote.model_validate(NOTE)
+
+
+def test_a_1_0_document_still_loads_and_is_reported_as_the_current_version() -> None:
+    doc = load_document(V1_0_FIXTURE)
+    assert doc.schema_version == SCHEMA_VERSION == "1.1"
+    assert doc.video.creator_note is None
+    assert json.loads(dump_document(doc))["video"]["creator_note"] is None
+    assert doc.segments[1].text == "Today we cover NVDA at 150 dollars."
+
+
+def test_a_1_0_document_is_still_validated_strictly() -> None:
+    raw = json.loads(V1_0_FIXTURE.read_text(encoding="utf-8"))
+    raw["video"]["new_field"] = 1
+    with pytest.raises(ContractError, match="new_field"):
+        load_document(json.dumps(raw))
+    raw = json.loads(V1_0_FIXTURE.read_text(encoding="utf-8"))
+    raw["segments"][1]["id"] = 7
+    with pytest.raises(ContractError, match="dense"):
+        load_document(json.dumps(raw))
+
+
+def test_the_creator_note_round_trips() -> None:
+    raw = make_raw()
+    raw["video"]["creator_note"] = NOTE
+    doc = ContextDocument.model_validate(raw)
+    assert doc.video.creator_note == CreatorNote.model_validate(NOTE)
+    assert load_document(dump_document(doc)) == doc
+
+
+def test_a_creator_note_needs_all_its_fields() -> None:
+    raw = make_raw()
+    raw["video"]["creator_note"] = {"text": "x", "author": "y"}
+    with pytest.raises(ValidationError, match="published"):
+        ContextDocument.model_validate(raw)
 
 
 def test_same_version_still_rejects_unknown_fields() -> None:

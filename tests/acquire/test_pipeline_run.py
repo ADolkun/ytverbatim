@@ -8,23 +8,30 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from ytverbatim import config, pipeline
+from ytverbatim import config, pipeline, proc
 from ytverbatim.acquire import session
 from ytverbatim.acquire.metadata import Chapter, VideoMetadata
 from ytverbatim.asr import registry
 from ytverbatim.asr import runner as asr_runner
 from ytverbatim.asr.models import HYPOTHESES_FILE, ChunkHypothesis, RunMetrics, WorkerRequest
 from ytverbatim.asr.runner import WorkerResult
+from ytverbatim.auth.fixes import fix_for
+from ytverbatim.auth.state import AuthState
 from ytverbatim.cli import main
 from ytverbatim.contract import ContextDocument, Word, load_document
 from ytverbatim.errors import (
+    AuthError,
     BusyError,
     ConfigError,
     ContractError,
     DependencyError,
     EngineError,
     EngineMemoryError,
+    MediaValidationError,
     ProcMemoryExceeded,
+    ProcTimeout,
+    UnavailableError,
+    YtDlpError,
 )
 from ytverbatim.pipeline import ProgressEvent, VideoResult, process, process_many, video_lock
 from ytverbatim.ytdlp.types import Signal
@@ -327,6 +334,145 @@ def test_process_reraises_a_batch_stop(session_kit, worker: FakeWorker) -> None:
     with pytest.raises(session.BatchStopError) as stopped:
         process(PUBLIC, out=session_kit.out, runner_factory=lambda _sleep: yt)
     assert stopped.value.signal is Signal.BOT_CHECK
+
+
+def test_process_raises_a_login_failure_as_an_auth_error_with_its_fix(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    yt.failures[("metadata", False)] = [session_kit.fail(Signal.MEMBERS_ONLY)]
+    with pytest.raises(AuthError) as raised:
+        process(PUBLIC, out=session_kit.out, runner_factory=lambda _sleep: yt)
+    assert raised.value.state is AuthState.AUTH_REQUIRED and "no auth source is set" in raised.value.detail
+    assert raised.value.fix == fix_for(AuthState.AUTH_REQUIRED)
+    assert worker.calls == []
+
+
+def test_process_raises_a_yt_dlp_failure_as_it_was_with_its_fix(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    yt.failures[("metadata", False)] = [session_kit.fail(Signal.GEO)]
+    with pytest.raises(YtDlpError) as raised:
+        process(PUBLIC, out=session_kit.out, runner_factory=lambda _sleep: yt)
+    assert raised.value.primary is Signal.GEO and "blocks this video in your country" in raised.value.fix
+
+
+def test_process_raises_an_unavailable_video_as_it_was(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    yt.live_status[PUBLIC] = "is_live"
+    with pytest.raises(UnavailableError) as raised:
+        process(PUBLIC, out=session_kit.out, runner_factory=lambda _sleep: yt)
+    assert raised.value.kind == "live" and raised.value.fix == ""
+
+
+def test_process_raises_a_media_failure_as_it_was(session_kit, worker: FakeWorker) -> None:
+    session_kit.proc.probe_returns("3.0\n")
+    with pytest.raises(MediaValidationError):
+        process(PUBLIC, out=session_kit.out, runner_factory=lambda _sleep: session_kit.yt())
+
+
+def test_process_raises_a_timeout_as_it_was(session_kit, worker: FakeWorker) -> None:
+    def hang(_argv: list[str]) -> proc.ProcResult:
+        raise ProcTimeout("ffmpeg", 600.0)
+
+    session_kit.proc.responses["ffmpeg"] = hang
+    with pytest.raises(ProcTimeout) as raised:
+        process(PUBLIC, out=session_kit.out, runner_factory=lambda _sleep: session_kit.yt())
+    assert raised.value.timeout_s == 600.0
+
+
+def test_a_recorded_failure_keeps_its_cause_out_of_the_batch_report(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    yt.failures[("metadata", False)] = [session_kit.fail(Signal.GEO)]
+    _, results, _ = run(session_kit, yt)
+    assert isinstance(results[0].outcome.cause, YtDlpError)
+    assert "cause" not in json.loads((session_kit.out / "batch_report.json").read_text())["videos"][0]
+
+
+NOTE = {
+    "is_pinned": True,
+    "author_is_uploader": True,
+    "text": "Correction: the figure is 12%.",
+    "author": "@synthetic",
+    "like_count": 7,
+    "_time_text": "1 day ago",
+}
+
+
+def note_options(*, on: bool) -> config.Options:
+    return config.load_options(overrides={"ytdlp": {"creator_note": on}})
+
+
+def test_the_document_carries_the_creator_note_only_when_the_option_is_on(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    yt.comments[PUBLIC] = [NOTE]
+    _, results, _ = run(session_kit, yt)
+    assert results[0].document is not None and results[0].document.video.creator_note is None
+    assert results[0].document.schema_version == "1.1"
+    assert "--get-comments" not in yt.labels("metadata")[0].args
+
+    _, results, _ = run(session_kit, yt, options=note_options(on=True))
+    document = results[0].document
+    assert document is not None and document.video.creator_note is not None
+    assert document.video.creator_note.model_dump() == {
+        "text": "Correction: the figure is 12%.",
+        "author": "@synthetic",
+        "like_count": 7,
+        "published": "1 day ago",
+    }
+    assert len(yt.labels("metadata")) == 2, "turning it on re-extracts once"
+    assert len(worker.calls) == 1, "and reuses every stored stage"
+    assert load_document(session_kit.out / PUBLIC / "context.json") == document
+
+    _, results, _ = run(session_kit, yt, options=note_options(on=True))
+    assert results[0].outcome.reused == ("context",) and len(yt.labels("metadata")) == 2
+
+
+def test_a_video_without_a_pinned_creator_comment_has_no_note(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    yt.comments[PUBLIC] = [{**NOTE, "author_is_uploader": False}]
+    _, results, _ = run(session_kit, yt, options=note_options(on=True))
+    assert results[0].document is not None and results[0].document.video.creator_note is None
+    assert "--get-comments" in yt.labels("metadata")[0].args
+
+
+def test_turning_the_option_off_drops_a_saved_note_from_the_document(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    yt.comments[PUBLIC] = [NOTE]
+    run(session_kit, yt, options=note_options(on=True))
+    _, results, _ = run(session_kit, yt, options=note_options(on=False))
+    assert results[0].outcome.reused != ("context",), "the document is made again"
+    assert results[0].document is not None and results[0].document.video.creator_note is None
+    assert len(yt.labels("metadata")) == 1
+
+
+def test_the_default_run_key_does_not_depend_on_the_creator_note_option(session_kit, worker: FakeWorker) -> None:
+    default = pipeline._settings(
+        config.load_options(),
+        None,
+        session_kit.out,
+        force=False,
+        captions=True,
+        emit=lambda _e: None,
+        clock=lambda: NOW,
+    )
+    assert default.creator_note is False
+    explicit_off = pipeline._settings(
+        note_options(on=False),
+        None,
+        session_kit.out,
+        force=False,
+        captions=True,
+        emit=lambda _e: None,
+        clock=lambda: NOW,
+    )
+    on = pipeline._settings(
+        note_options(on=True),
+        None,
+        session_kit.out,
+        force=False,
+        captions=True,
+        emit=lambda _e: None,
+        clock=lambda: NOW,
+    )
+    assert default.run_key() == explicit_off.run_key() != on.run_key()
 
 
 def test_a_held_lock_raises_busy_without_touching_the_network(session_kit, worker: FakeWorker) -> None:

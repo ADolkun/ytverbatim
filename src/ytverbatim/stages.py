@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 from ytverbatim import __version__, ids
 from ytverbatim.acquire.captions import CaptionTrack
+from ytverbatim.acquire.creator_note import CreatorNote
 from ytverbatim.acquire.metadata import VideoMetadata
 from ytverbatim.asr import chunks
 from ytverbatim.asr.models import ChunkHypothesis
@@ -40,6 +41,7 @@ from ytverbatim.contract import (
     Video,
     Word,
 )
+from ytverbatim.contract import CreatorNote as ContractCreatorNote
 from ytverbatim.contract import Generator as GeneratorInfo
 from ytverbatim.contract.models import SCHEMA_VERSION
 from ytverbatim.errors import ContractError
@@ -645,7 +647,12 @@ def _video(metadata: VideoMetadata, tags: Sequence[str], stretches: Sequence[Str
         description=metadata.description,
         language=metadata.language,
         tags=tuple(tags),
+        creator_note=_creator_note(metadata.creator_note),
     )
+
+
+def _creator_note(note: CreatorNote | None) -> ContractCreatorNote | None:
+    return ContractCreatorNote.model_validate(asdict(note)) if note is not None else None
 
 
 def _upload_date(raw: str | None) -> date | None:

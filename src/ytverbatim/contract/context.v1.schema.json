@@ -143,6 +143,43 @@
       "title": "Chapter",
       "type": "object"
     },
+    "CreatorNote": {
+      "additionalProperties": false,
+      "description": "The uploader's own pinned comment; `published` is YouTube's relative text, such as \"1 day ago\".",
+      "properties": {
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "author": {
+          "title": "Author",
+          "type": "string"
+        },
+        "like_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Like Count"
+        },
+        "published": {
+          "title": "Published",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "author",
+        "like_count",
+        "published"
+      ],
+      "title": "CreatorNote",
+      "type": "object"
+    },
     "Edit": {
       "additionalProperties": false,
       "properties": {
@@ -741,6 +778,17 @@
           },
           "title": "Tags",
           "type": "array"
+        },
+        "creator_note": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CreatorNote"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -800,7 +848,7 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "const": "1.0",
+      "const": "1.1",
       "title": "Schema Version",
       "type": "string"
     },
