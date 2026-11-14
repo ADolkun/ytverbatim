@@ -14,6 +14,7 @@ _YOUTUBE_HOSTS = frozenset(
         "music.youtube.com",
         "youtube-nocookie.com",
         "www.youtube-nocookie.com",
+        "player.youtube-nocookie.com",
     }
 )
 _SHORT_HOSTS = frozenset({"youtu.be", "www.youtu.be"})

@@ -22,6 +22,8 @@ VID = "abcDEF_1234"
         f"https://www.youtube.com/shorts/{VID}",
         f"https://www.youtube.com/embed/{VID}",
         f"https://www.youtube-nocookie.com/embed/{VID}",
+        f"https://player.youtube-nocookie.com/v/{VID}",
+        f"https://player.youtube-nocookie.com/v/{VID}/",
         f"https://www.youtube.com/live/{VID}?feature=share",
         f"https://www.youtube.com/v/{VID}",
     ],
