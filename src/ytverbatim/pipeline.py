@@ -330,9 +330,10 @@ def _settings(
         llm = client_from_options(options.llm)
     if options.text.correct and llm is None:
         raise ConfigError("correction needs an LLM; pass --llm PROVIDER:MODEL or set [llm], or use --no-correct")
+    text = replace(options.text, correct=llm is not None if options.text.correct is None else options.text.correct)
     memory_cap = asr_runner.memory_cap_bytes(options.asr.memory_cap_gib)
     return _Settings(
-        options.text,
+        text,
         options.asr.source,
         definition,
         second,
@@ -753,7 +754,10 @@ class _VideoRun:
             if not any(needs_punctuation(text, language) for text in texts):
                 return _TextResult(stretches=stretches)
             if llm is None:
-                notice = "punctuation not restored: some stretches have few sentence marks and no LLM is configured"
+                notice = (
+                    "punctuation not restored: some stretches have few sentence marks and no LLM is configured "
+                    "(correction is skipped without one too)"
+                )
                 return _TextResult(stretches=stretches, notices=(notice,))
             result = punctuate(texts, language=language, client=llm, checkpoint_dir=self.store.work_dir("punctuate"))
             failed = set(result.failed)

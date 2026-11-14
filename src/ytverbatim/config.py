@@ -35,8 +35,8 @@ class AsrOptions:
 
 @dataclass(frozen=True)
 class TextOptions:
-    # Off until the correction head-to-head shows it helps.
-    correct: bool = False
+    # None corrects whenever the text stages have an LLM; True without one is an error, False turns it off.
+    correct: bool | None = None
     # "auto" is YouTube's chapters today; an LLM fallback for videos without them comes later.
     chapters: Literal["auto", "none"] = "auto"
     # An ASR hypothesis id that re-decodes the numeric spans as independent evidence, or "off".
