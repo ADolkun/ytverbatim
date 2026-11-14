@@ -233,6 +233,36 @@ def test_symbol_changes_point_into_the_corrected_text() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("original", "fixed", "before", "after"),
+    [
+        ("we use open AI tools", "we use OpenAI tools", "AI", "OpenAI"),
+        ("我们用open AI的工具", "我们用OpenAI的工具", "AI", "OpenAI"),
+        ("we use OpenAI tools", "we use Open AI tools", "OpenAI", "AI"),
+        ("buy $GAP now", "buy $GAAP now", "$GAP", "$GAAP"),
+        ("the ChatGPT app", "the ChatGTP app", "ChatGPT", "ChatGTP"),
+    ],
+)
+def test_a_ticker_merged_into_or_split_out_of_a_word_is_reported(
+    original: str, fixed: str, before: str, after: str
+) -> None:
+    verdict = check_fix(original, fixed)
+    assert verdict.ok
+    (change,) = verdict.entity_changes
+    assert (change.before, change.after) == (before, after)
+    assert fixed[change.char_start : change.char_end] == after
+
+
+def test_a_merge_that_respells_the_ticker_beyond_one_letter_is_rejected() -> None:
+    assert rejected_by("we use open AL tools", "we use OpenAI tools") == "symbols"
+
+
+def test_a_ticker_holding_two_runs_is_reported_once() -> None:
+    assert symbol_changes("on NYSE: GAP today", "on NYSE: GAAP today") == (
+        EntityChange("NYSE: GAP", "NYSE: GAAP", 3, 13),
+    )
+
+
 def test_symbol_changes_refuse_a_changed_count() -> None:
     with pytest.raises(ValueError, match="symbol count"):
         symbol_changes("NVDA and AMD", "NVDA")

@@ -105,6 +105,20 @@ def test_acronym_fixes_are_flagged_at_their_offsets_after_a_length_change(tmp_pa
     assert [text[f.char_start : f.char_end] for f in result.flags[0]] == ["GAAP", "MSCI"]
 
 
+def test_a_ticker_merged_into_a_name_is_applied_and_flagged_on_the_name(tmp_path: Path) -> None:
+    client = FakeClient([fixed((0, "the OpenAI deal and the GAAP rules"))])
+    result = run(["the open AI deal and the GAP rules"], client, tmp_path)
+    (text,) = result.texts
+    assert text == "the OpenAI deal and the GAAP rules"
+    assert result.rejections == ()
+    assert result.flags == (
+        (
+            Flag(kind="entity_corrected", char_start=4, char_end=10, note="AI → OpenAI"),
+            Flag(kind="entity_corrected", char_start=24, char_end=28, note="GAP → GAAP"),
+        ),
+    )
+
+
 @pytest.mark.parametrize(
     ("original", "proposed"),
     [

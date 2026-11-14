@@ -63,6 +63,7 @@ _QUANTITY = (
 _NON_DATA_CHAR = re.compile(rf"[^\s0-9０-９.,%％$¥€£A-Z{_CJK_NUMERAL_CHARS}]")
 # Bare uppercase runs (NVDA, GAAP, SPX): acronyms and tickers, the one symbol class a fix may respell.
 _BARE_SYMBOL = re.compile(r"[A-Z]{2,}")
+_ASCII_ALNUM = re.compile(r"[A-Za-z0-9]")
 # Dotted, exchange-prefixed and share-class tickers stay exact: BRK.B→BRK.A or $F→$T is a different security even
 # though it is one letter away. Bare single letters (F, C, T) collide with English words, so only their explicit
 # financial forms are protected.
@@ -180,12 +181,12 @@ def check_fix(original: str, fixed: str, *, min_keep_ratio: float = MIN_KEEP_RAT
     for name, broken in checks:
         if broken():
             return GuardVerdict(name)
-    if len(_BARE_SYMBOL.findall(fixed)) != len(_BARE_SYMBOL.findall(original)):
+    before, after = _BARE_SYMBOL.findall(original), _BARE_SYMBOL.findall(fixed)
+    if len(before) != len(after):
         return GuardVerdict("symbols")
-    changes = symbol_changes(original, fixed)
-    if any(not _is_near_symbol(change.before, change.after) for change in changes):
+    if any(old != new and not _is_near_symbol(old, new) for old, new in zip(before, after, strict=True)):
         return GuardVerdict("symbols")
-    return GuardVerdict(None, changes)
+    return GuardVerdict(None, symbol_changes(original, fixed))
 
 
 def check_numeric_fix(original: str, fixed: str, suspects: list[str]) -> bool:
@@ -211,16 +212,40 @@ def check_numeric_fix(original: str, fixed: str, suspects: list[str]) -> bool:
 
 
 def symbol_changes(original: str, fixed: str) -> tuple[EntityChange, ...]:
-    """Acronyms and tickers that differ position by position; both texts must hold the same number of them."""
+    """Acronyms and tickers that differ position by position; both texts must hold the same number of them.
+
+    Each uppercase run is named by the quantity ticker that holds it, or else by its whole word. A run can survive a
+    merge unchanged while its ticker vanishes into a name (open AI→OpenAI), and that is recorded as ``AI → OpenAI``
+    on the merged word; a ticker split out of a word is recorded the other way round.
+    """
     before = list(_BARE_SYMBOL.finditer(original))
     after = list(_BARE_SYMBOL.finditer(fixed))
     if len(before) != len(after):
         raise ValueError(f"symbol count changed from {len(before)} to {len(after)}")
-    return tuple(
-        EntityChange(old[0], new[0], new.start(), new.end())
-        for old, new in zip(before, after, strict=True)
-        if old[0] != new[0]
-    )
+    changes: list[EntityChange] = []
+    for (old, _), (new, (start, end)) in zip(_symbol_names(original, before), _symbol_names(fixed, after), strict=True):
+        change = EntityChange(old, new, start, end)
+        # A ticker or word holding two runs (NYSE: AI) changes once.
+        if old != new and change not in changes:
+            changes.append(change)
+    return tuple(changes)
+
+
+def _symbol_names(text: str, runs: list[re.Match[str]]) -> list[tuple[str, tuple[int, int]]]:
+    tickers = [token for token in quantity_tokens(text) if token.kind == "ticker"]
+    names: list[tuple[str, tuple[int, int]]] = []
+    for run in runs:
+        ticker = next((t for t in tickers if t.char_start <= run.start() and run.end() <= t.char_end), None)
+        if ticker is not None:
+            names.append((ticker.surface, (ticker.char_start, ticker.char_end)))
+            continue
+        start, end = run.start(), run.end()
+        while start > 0 and _ASCII_ALNUM.match(text[start - 1]):
+            start -= 1
+        while end < len(text) and _ASCII_ALNUM.match(text[end]):
+            end += 1
+        names.append((text[start:end], (start, end)))
+    return names
 
 
 def _is_near_symbol(before: str, after: str) -> bool:

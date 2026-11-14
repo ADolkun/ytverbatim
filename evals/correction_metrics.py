@@ -15,6 +15,7 @@ import random
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
@@ -144,16 +145,28 @@ def _respellings(flags: Sequence[Flag], language: Language) -> set[tuple[str, st
 
 
 def breaks_numbers(before: str, after: str, flags: Sequence[Flag], language: Language) -> bool:
-    """Whether ``after`` changes a quantity, or respells a ticker that ``flags`` do not record as a correction."""
+    """Whether ``after`` changes a quantity, or changes a ticker that ``flags`` do not record as a correction.
+
+    A ticker respelled in place must match a flag's before and after. One that vanishes into a name (open AI→OpenAI)
+    or appears out of one has no counterpart, so it only has to be named on its own side of a flag (``AI → OpenAI``).
+    """
     tokens = [quantity_tokens(canonical(text, language)) for text in (before, after)]
     quantities = [[(t.value_itn, t.kind) for t in found if t.kind != "ticker"] for found in tokens]
     if quantities[0] != quantities[1]:
         return True
-    tickers = [[t.surface for t in found if t.kind == "ticker"] for found in tokens]
-    if len(tickers[0]) != len(tickers[1]):
-        return True
+    old, new = ([t.surface for t in found if t.kind == "ticker"] for found in tokens)
     allowed = _respellings(flags, language)
-    return any(a != b and (a, b) not in allowed for a, b in zip(*tickers, strict=True))
+    flagged_before = {b for b, _ in allowed}
+    flagged_after = {a for _, a in allowed}
+    for tag, i1, i2, j1, j2 in SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        if i2 - i1 == j2 - j1:
+            if any((b, a) not in allowed for b, a in zip(old[i1:i2], new[j1:j2], strict=True)):
+                return True
+        elif any(b not in flagged_before for b in old[i1:i2]) or any(a not in flagged_after for a in new[j1:j2]):
+            return True
+    return False
 
 
 def number_violations(base: BaseFile, candidate: CandidateFile) -> int:
