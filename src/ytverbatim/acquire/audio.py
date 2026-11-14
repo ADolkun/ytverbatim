@@ -15,7 +15,13 @@ log = logging.getLogger(__name__)
 
 AUDIO_STEM = "audio"
 WAV_NAME = "audio.wav"
-DEFAULT_DOWNLOAD_TIMEOUT_S = 3600.0
+# A download is killed after this many seconds per second of media, kept between a floor for short videos and a
+# ceiling that still ends a hung one. A 1080p video-only stream runs at several Mbit/s, so on a slow connection it
+# downloads slower than real time; the audio stream is a small fraction of that.
+DOWNLOAD_TIMEOUT_FLOOR_S = 3600.0
+DOWNLOAD_TIMEOUT_CEILING_S = 12 * 3600.0
+AUDIO_DOWNLOAD_S_PER_MEDIA_S = 0.5
+VIDEO_DOWNLOAD_S_PER_MEDIA_S = 3.0
 DEFAULT_CONVERT_TIMEOUT_S = 1800.0
 PROBE_TIMEOUT_S = 20.0
 MIN_COVERAGE = 0.9
@@ -47,11 +53,16 @@ def fetch_audio(
     *,
     expected_duration: float | None,
     cookies: Path | None = None,
-    timeout_s: float = DEFAULT_DOWNLOAD_TIMEOUT_S,
+    timeout_s: float | None = None,
     now: Callable[[], float] = time.time,
     creator_note: bool = False,
 ) -> Path:
-    """Download the best audio in its native container and validate it; the info JSON must already be saved."""
+    """Download the best audio in its native container and validate it; the info JSON must already be saved.
+
+    Without ``timeout_s`` the download's time limit follows ``expected_duration`` (see `download_timeout_s`).
+    """
+    if timeout_s is None:
+        timeout_s = download_timeout_s(expected_duration, AUDIO_DOWNLOAD_S_PER_MEDIA_S)
     out_dir.mkdir(parents=True, exist_ok=True)
     # Removing earlier native files keeps the post-download pick unambiguous.
     for stale in out_dir.glob(f"{AUDIO_STEM}.*"):
@@ -78,6 +89,16 @@ def fetch_audio(
         path.unlink(missing_ok=True)
         raise
     return path
+
+
+def download_timeout_s(duration: float | None, seconds_per_media_second: float) -> float:
+    """Scale a download's time limit with the media's duration, between the floor and the ceiling.
+
+    An unknown or non-positive duration (a live stream, say) gets the floor.
+    """
+    if duration is None or not duration > 0:
+        return DOWNLOAD_TIMEOUT_FLOOR_S
+    return min(DOWNLOAD_TIMEOUT_CEILING_S, max(DOWNLOAD_TIMEOUT_FLOOR_S, duration * seconds_per_media_second))
 
 
 def download_refreshing_stale_info(

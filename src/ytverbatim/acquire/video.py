@@ -3,7 +3,12 @@ from collections.abc import Callable
 from pathlib import Path
 
 from ytverbatim import paths
-from ytverbatim.acquire.audio import DEFAULT_DOWNLOAD_TIMEOUT_S, download_refreshing_stale_info, validate_audio
+from ytverbatim.acquire.audio import (
+    VIDEO_DOWNLOAD_S_PER_MEDIA_S,
+    download_refreshing_stale_info,
+    download_timeout_s,
+    validate_audio,
+)
 from ytverbatim.acquire.metadata import info_path, load_metadata
 from ytverbatim.errors import MediaValidationError, ProcTimeout, YtDlpError
 from ytverbatim.ytdlp.types import YtDlpRunner
@@ -23,11 +28,16 @@ def fetch_video(
     *,
     expected_duration: float | None,
     cookies: Path | None = None,
-    timeout_s: float = DEFAULT_DOWNLOAD_TIMEOUT_S,
+    timeout_s: float | None = None,
     now: Callable[[], float] = time.time,
     creator_note: bool = False,
 ) -> Path:
-    """Download the video track as `video.mp4` and validate it; the info JSON must already be saved."""
+    """Download the video track as `video.mp4` and validate it; the info JSON must already be saved.
+
+    Without ``timeout_s`` the download's time limit follows ``expected_duration`` (see `download_timeout_s`).
+    """
+    if timeout_s is None:
+        timeout_s = download_timeout_s(expected_duration, VIDEO_DOWNLOAD_S_PER_MEDIA_S)
     out_dir.mkdir(parents=True, exist_ok=True)
     # yt-dlp skips a download whose target exists, so a corrupt earlier file has to go first.
     for stale in out_dir.glob(f"{VIDEO_STEM}.*"):
