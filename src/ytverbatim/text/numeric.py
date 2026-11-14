@@ -47,7 +47,7 @@ from ytverbatim.text.numbers import QToken, quantity_tokens
 _log = logging.getLogger(__name__)
 
 # Part of every checkpoint and stage key: bump it on any prompt, guard or logic change so stored results are redone.
-PROMPT_VERSION = "numeric-v4"
+PROMPT_VERSION = "numeric-v5"
 STAGE = "numeric"
 BATCH_SIZE = 8
 # Whisper word probability below which a span heard by one source only is also flagged `low_confidence`.

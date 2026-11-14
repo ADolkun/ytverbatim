@@ -43,6 +43,7 @@ def flag(before: str, after: str) -> Flag:
     [
         ("zh", "我们卖出了一百股", "我们卖出了一百五十股", [], True),
         ("en", "revenue was $5 million", "revenue was $5 billion", [], True),
+        ("en", "a $10BN deal", "a $10MN deal", [], True),
         ("en", "up 15% on the day", "up 15% on the day", [], False),
         ("zh", "看NVDA的财报", "看NVDIA的财报", [flag("NVDA", "NVDIA")], False),
         ("zh", "看NVDA的财报", "看NVDIA的财报", [], True),

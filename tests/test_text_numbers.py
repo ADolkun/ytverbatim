@@ -108,9 +108,15 @@ def test_a_ticker_written_against_a_figure_is_its_own_token(text: str, expected:
         ("10B", "10B", "10000000000"),
         ("5K", "5K", "5000"),
         ("3bn", "3bn", "3000000000"),
-        ("10BN", "10", "10"),
-        ("5MN", "5", "5"),
-        ("5mn", "5", "5"),
+        ("10BN", "10BN", "10000000000"),
+        ("1.5BN", "1.5BN", "1500000000"),
+        ("$5MM", "$5MM", "$5000000"),
+        ("$10MN", "$10MN", "$10000000"),
+        ("5mn", "5mn", "5000000"),
+        ("2TN", "2TN", "2000000000000"),
+        ("$1tn", "$1tn", "$1000000000000"),
+        ("$3T", "$3T", "$3000000000000"),
+        ("5mm", "5", "5"),
         ("25BPS", "25", "25"),
         ("25bps", "25", "25"),
         ("3x", "3", "3"),
@@ -120,6 +126,19 @@ def test_a_ticker_written_against_a_figure_is_its_own_token(text: str, expected:
 def test_figure_suffixes_are_not_tickers(text: str, surface: str, value: str) -> None:
     (token,) = quantity_tokens(text)
     assert (token.surface, token.value_itn) == (surface, value)
+
+
+def test_upper_and_lower_case_magnitudes_share_a_value() -> None:
+    assert [t.value_itn for t in quantity_tokens("10BN 10bn 10B 10 billion")] == ["10000000000"] * 4
+
+
+def test_a_run_that_only_starts_like_a_magnitude_is_a_ticker() -> None:
+    assert [(t.surface, t.kind) for t in quantity_tokens("10BNX 10TB")] == [
+        ("10", "number"),
+        ("BNX", "ticker"),
+        ("10", "number"),
+        ("TB", "ticker"),
+    ]
 
 
 def test_letters_after_digits_inside_a_word_are_not_a_ticker() -> None:

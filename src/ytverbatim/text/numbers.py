@@ -138,7 +138,21 @@ def _alternation(words: tuple[str, ...]) -> str:
 
 # The same dollar amount is written $15, 15 dollars or 15美元; all of them normalise to $15.
 _USD_WORDS = frozenset({"美元", "美金"})
-_EN_MAGNITUDE = {"thousand": 3, "million": 6, "billion": 9, "trillion": 12, "k": 3, "m": 6, "b": 9, "bn": 9}
+# MM is millions in finance usage; T stands for trillions only in upper case, and mm (millimetres) is left out.
+_EN_MAGNITUDE = {
+    "thousand": 3,
+    "million": 6,
+    "billion": 9,
+    "trillion": 12,
+    "k": 3,
+    "m": 6,
+    "mm": 6,
+    "mn": 6,
+    "b": 9,
+    "bn": 9,
+    "t": 12,
+    "tn": 12,
+}
 _EN_UNITS = dict(
     zip(
         [
@@ -196,7 +210,7 @@ _TOKEN = re.compile(
             rf"(?P<symbol>{_NO_ALNUM_BEFORE}[A-Z][A-Z0-9]+(?:\.[A-Z]+)?{_NO_ALNUM_AFTER})",
             rf"(?P<number>{_NO_ALNUM_BEFORE}(?P<sign>[-+−])?(?P<currency>[$¥€£])?(?P<sign2>[-+−])?"
             rf"(?P<digits>{_NUMBER})"
-            r"(?P<en_magnitude>\s?(?i:thousand|million|billion|trillion)\b|(?:[Kk]|M|B|bn)(?![A-Za-z0-9]))?"
+            r"(?P<en_magnitude>\s?(?i:thousand|million|billion|trillion)\b|(?:BN|MN|TN|MM|bn|mn|tn|[Kk]|M|B|T)(?![A-Za-z0-9]))?"
             r"(?:(?P<percent> ?[%％]|\s?(?i:percent)\b)|(?P<dollars>\s?(?i:dollars?)\b)"
             rf"|(?P<magnitude>[百千][万亿萬億]*|[万亿萬億]+)?(?P<measure>{_alternation(_MEASURE_WORDS)})?))",
             rf"(?P<spelled>(?<![A-Za-z0-9-])(?i:{_EN_NUMBER_WORD})(?:(?:[ -]|\s+and\s+)(?i:{_EN_NUMBER_WORD}))*"
@@ -205,10 +219,11 @@ _TOKEN = re.compile(
     )
 )
 
-# A symbol written against a figure (3.35SMH) is still a ticker, unless the run is a figure suffix: 10BN, 25BPS.
-# Lowercase suffixes (bn, mn, bps, x) and single letters never match a symbol, so only these uppercase runs need it.
+# A symbol written against a figure (3.35SMH) is still a ticker, unless the run is a figure suffix. The number
+# pattern already takes the magnitudes (10BN, $5MM), and lowercase suffixes (bps, x) and single letters never match a
+# symbol, so only the uppercase units it does not read are listed.
 _FUSED_SYMBOL = re.compile(rf"[A-Z][A-Z0-9]+(?:\.[A-Z]+)?{_NO_ALNUM_AFTER}")
-_FIGURE_SUFFIXES = frozenset({"BN", "MN", "BPS"})
+_FIGURE_SUFFIXES = frozenset({"BPS"})
 
 _MIN_BARE_RUN = 2
 _YEAR_DIGITS = 4
