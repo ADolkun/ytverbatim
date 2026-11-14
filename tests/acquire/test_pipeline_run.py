@@ -1,12 +1,13 @@
 import json
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
+from pydantic import JsonValue
 
 from ytverbatim import config, pipeline, proc
 from ytverbatim.acquire import session
@@ -34,9 +35,11 @@ from ytverbatim.errors import (
     YtDlpError,
 )
 from ytverbatim.pipeline import ProgressEvent, VideoResult, process, process_many, video_lock
+from ytverbatim.store import input_hash
 from ytverbatim.ytdlp.types import Signal
 
 PUBLIC = "pubVideo001"
+MEMBERS = "memVideo001"
 NOW = datetime(2030, 1, 1, 12, 0, tzinfo=UTC)
 
 # One sentence per YouTube chapter of the fake extraction (0-50 s and 50-100 s).
@@ -380,10 +383,48 @@ def test_process_raises_a_timeout_as_it_was(session_kit, worker: FakeWorker) -> 
 
 def test_a_recorded_failure_keeps_its_cause_out_of_the_batch_report(session_kit, worker: FakeWorker) -> None:
     yt = session_kit.yt()
-    yt.failures[("metadata", False)] = [session_kit.fail(Signal.GEO)]
+    raw = "ERROR: [youtube] synthetic cause line\nTraceback-like detail that must stay out of the report"
+    yt.failures[("metadata", False)] = [session_kit.fail(Signal.GEO, preview=raw)]
     _, results, _ = run(session_kit, yt)
-    assert isinstance(results[0].outcome.cause, YtDlpError)
-    assert "cause" not in json.loads((session_kit.out / "batch_report.json").read_text())["videos"][0]
+    cause = results[0].outcome.cause
+    assert isinstance(cause, YtDlpError) and "Traceback-like detail" in cause.preview
+    text = (session_kit.out / "batch_report.json").read_text(encoding="utf-8")
+    assert "Traceback-like detail" not in text
+    (video,) = json.loads(text)["videos"]
+    assert video["detail"] == "ERROR: [youtube] synthetic cause line"
+    assert "cause" not in video
+
+
+def test_cookies_first_sends_the_first_extraction_with_cookies(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    process(
+        MEMBERS,
+        out=session_kit.out,
+        auth="cookie-file:/nonexistent/cookies.txt",
+        cookies_first=True,
+        runner_factory=lambda _sleep: yt,
+    )
+    assert yt.labels("metadata", cookied=False) == []
+    assert len(yt.labels("metadata", cookied=True)) == 1
+
+
+def test_by_default_the_first_extraction_is_anonymous(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    process(
+        MEMBERS,
+        out=session_kit.out,
+        auth="cookie-file:/nonexistent/cookies.txt",
+        runner_factory=lambda _sleep: yt,
+    )
+    assert len(yt.labels("metadata", cookied=False)) == 1 and yt.labels("metadata", cookied=True) == []
+
+
+def test_cookies_first_without_a_source_is_an_auth_error_with_a_fix(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    with pytest.raises(AuthError) as raised:
+        process(MEMBERS, out=session_kit.out, cookies_first=True, runner_factory=lambda _sleep: yt)
+    assert raised.value.state is AuthState.AUTH_REQUIRED and raised.value.fix
+    assert yt.calls == []
 
 
 NOTE = {
@@ -443,36 +484,31 @@ def test_turning_the_option_off_drops_a_saved_note_from_the_document(session_kit
     assert len(yt.labels("metadata")) == 1
 
 
-def test_the_default_run_key_does_not_depend_on_the_creator_note_option(session_kit, worker: FakeWorker) -> None:
-    default = pipeline._settings(
-        config.load_options(),
-        None,
-        session_kit.out,
-        force=False,
-        captions=True,
-        emit=lambda _e: None,
-        clock=lambda: NOW,
+def settings_for(kit, options: config.Options) -> pipeline._Settings:
+    return pipeline._settings(
+        options, None, kit.out, force=False, captions=True, emit=lambda _e: None, clock=lambda: NOW
     )
-    assert default.creator_note is False
-    explicit_off = pipeline._settings(
-        note_options(on=False),
-        None,
-        session_kit.out,
-        force=False,
-        captions=True,
-        emit=lambda _e: None,
-        clock=lambda: NOW,
+
+
+def test_the_default_run_key_is_the_one_made_before_the_creator_note_existed(session_kit, worker: FakeWorker) -> None:
+    default = settings_for(session_kit, config.load_options())
+    versions = pipeline.stage_versions()
+    before = input_hash(
+        "context",
+        versions["context"],
+        {
+            "versions": dict[str, JsonValue](versions),
+            "source": default.source,
+            "captions": True,
+            "engine": pipeline._engine_key(default.definition),
+            "second_opinion": None,
+            "text": pipeline._plain(asdict(default.text)),
+            "llm": None,
+        },
     )
-    on = pipeline._settings(
-        note_options(on=True),
-        None,
-        session_kit.out,
-        force=False,
-        captions=True,
-        emit=lambda _e: None,
-        clock=lambda: NOW,
-    )
-    assert default.run_key() == explicit_off.run_key() != on.run_key()
+    assert default.run_key() == before
+    assert settings_for(session_kit, note_options(on=False)).run_key() == before
+    assert settings_for(session_kit, note_options(on=True)).run_key() != before
 
 
 def test_a_held_lock_raises_busy_without_touching_the_network(session_kit, worker: FakeWorker) -> None:

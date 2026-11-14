@@ -647,6 +647,52 @@ def test_correction_reruns_when_its_glossary_changes(session_kit, worker) -> Non
     assert stored(results[0])["correct"] is False and stored(results[0])["punctuate"] is True
 
 
+NOTE_TEXT = "Correction: the revenue figure is 12 million."
+PINNED = {"is_pinned": True, "author_is_uploader": True, "text": NOTE_TEXT, "author": "@synthetic", "like_count": 3}
+
+
+def note_run(kit, yt, llm: FakeLLM, *, note: bool):
+    options = config.load_options(overrides={"text": {"correct": True}, "ytdlp": {"creator_note": note}})
+    return run(kit, yt, options=options, llm=llm)
+
+
+def correct_prompts(llm: FakeLLM) -> list[str]:
+    return [r.user for r in llm.requests if "ITEMS:" not in r.user and '"items"' not in r.user]
+
+
+def test_the_creator_note_reaches_correction_only_when_the_option_is_on(session_kit, worker) -> None:
+    yt = zh_yt(session_kit)
+    yt.comments[ZH] = [PINNED]
+    llm = FakeLLM()
+    note_run(session_kit, yt, llm, note=False)
+    assert correct_prompts(llm) and not any(NOTE_TEXT in prompt for prompt in correct_prompts(llm))
+
+    llm = FakeLLM()
+    _, results, _ = note_run(session_kit, yt, llm, note=True)
+    assert llm.stages() == ["correct"], "only correction is asked again"
+    assert all(NOTE_TEXT in prompt for prompt in correct_prompts(llm))
+    assert stored(results[0]) == {"asr": True, "normalize": True, "punctuate": True, "correct": False, "numeric": True}
+    assert only_document(results).video.creator_note is not None
+
+    llm = FakeLLM()
+    _, results, events = note_run(session_kit, yt, llm, note=True)
+    assert llm.requests == [] and [e.stage for e in events] == ["skip"]
+
+    _, results, _ = note_run(session_kit, yt, FakeLLM(), note=False)
+    assert stored(results[0])["correct"] is False
+    assert only_document(results).video.creator_note is None
+
+
+def test_turning_the_note_on_for_a_video_without_one_reuses_correction(session_kit, worker) -> None:
+    yt = zh_yt(session_kit)
+    note_run(session_kit, yt, FakeLLM(), note=False)
+    llm = FakeLLM()
+    _, results, _ = note_run(session_kit, yt, llm, note=True)
+    assert llm.requests == []
+    assert stored(results[0]) == {"asr": True, "normalize": True, "punctuate": True, "correct": True, "numeric": True}
+    assert only_document(results).video.creator_note is None
+
+
 def test_numbers_without_independent_readings_are_called_unchecked(session_kit, worker, monkeypatch) -> None:
     yt = zh_yt(session_kit)
     yt.tracks[ZH] = {}

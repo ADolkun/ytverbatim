@@ -72,6 +72,7 @@ def fetch_command(
                 cookie_channels=options.auth.cookie_channels,
                 max_videos=options.ytdlp.max_videos_per_run,
                 ignore_cooldown=ignore_cooldown,
+                creator_note=options.ytdlp.creator_note,
             ),
             runner_factory=lambda sleep: SubprocessRunner(sleep_args=sleep),
             on_video=_print_outcome,

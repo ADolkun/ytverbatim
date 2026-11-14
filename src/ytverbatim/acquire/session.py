@@ -110,6 +110,8 @@ class FetchOptions:
     cookie_channels: tuple[str, ...] = ()
     max_videos: int = 50
     ignore_cooldown: bool = False
+    # Every video's first extraction uses cookies, as for a members playlist; `plan_videos` sets this per target.
+    cookies_first: bool = False
     # Folds a bounded comment page into each video's one `-J`; a saved extraction without it is redone once.
     creator_note: bool = False
 
@@ -722,8 +724,9 @@ def plan_videos(
         ref = ids.classify(target)
         if ref is None:
             raise ValueError(f"not a YouTube video, playlist or channel: {target!r}")
-        cookies_first = _needs_cookies(ref, channel_keys) and options.policy != "never"
-        found = _list_ids(runner, target, ref, cookies_first=cookies_first, source=source, limit=options.max_videos)
+        listing_cookies = _needs_cookies(ref, channel_keys) and options.policy != "never"
+        cookies_first = (listing_cookies or options.cookies_first) and options.policy != "never"
+        found = _list_ids(runner, target, ref, cookies_first=listing_cookies, source=source, limit=options.max_videos)
         if ref.kind is not ids.RefKind.VIDEO and len(found) >= options.max_videos:
             capped = True
         for video_id in found:
@@ -747,9 +750,12 @@ def expand(
     A video costs no request. Otherwise this refuses an active cooldown before any request (`BatchStopError`), and a
     bot or rate signal starts one and raises the same. `limit` caps the listing (0 means all; the per-run video cap
     of `run` does not apply). A members playlist, and nothing else, is listed with cookies from `auth` or the
-    configured source, unless `auth.policy` is "never"; with none set it raises `AuthError` rather than list it
-    anonymously. Raises `ValueError` for a target that is none of the three, and `YtDlpError` for a failed listing.
-    Errors carry a `fix`.
+    configured source, unless `auth.policy` is "never"; with none set, or with policy "always" and none set, it
+    raises `AuthError` rather than list anonymously. Raises `ValueError` for a target that is none of the three, and
+    `YtDlpError` for a failed listing. Every error carries a `fix`.
+
+    The ids carry no memory of where they came from: pass `cookies_first=True` to `process` for ids from a members
+    playlist, or each one is first requested anonymously, refused, and only then retried with cookies.
     """
     ref = ids.classify(target)
     if ref is None:
@@ -757,24 +763,30 @@ def expand(
     if ref.kind is ids.RefKind.VIDEO:
         return [ref.id]
     options = options or config.load_options()
-    check_cooldown(utcnow())
-    source = resolve_source(auth)
-    cookies_first = _needs_cookies(ref, _channel_keys(options.auth.cookie_channels)) and options.auth.policy != "never"
-    if cookies_first and ref.kind is ids.RefKind.PLAYLIST and source is None:
-        no_source = AuthError(
-            AuthState.NO_SOURCE, "a members playlist is listed with cookies, but no auth source is set"
-        )
-        no_source.fix = fix_for(AuthState.NO_SOURCE)
-        raise no_source
-    runner = GuardedRunner(default_runner(()), utcnow)
+    source: CookieSource | None = None
     try:
+        check_cooldown(utcnow())
+        source = resolve_source(auth)
+        policy = options.auth.policy
+        if policy == "always" and source is None:
+            raise AuthError(AuthState.NO_SOURCE, "--policy always needs an auth source")
+        cookies_first = _needs_cookies(ref, _channel_keys(options.auth.cookie_channels)) and policy != "never"
+        if cookies_first and ref.kind is ids.RefKind.PLAYLIST and source is None:
+            raise AuthError(AuthState.NO_SOURCE, "a members playlist is listed with cookies, but no auth source is set")
+        runner = GuardedRunner(default_runner(()), utcnow)
         found = _list_ids(runner, target, ref, cookies_first=cookies_first, source=source, limit=limit)
+        if runner.stop is not None:
+            raise BatchStopError(runner.stop.signal, runner.stop.until)
+        return found
+    except BatchStopError as exc:
+        exc.fix = stop_fix(exc.signal, exc.until)
+        raise
+    except AuthError as exc:
+        exc.fix = fix_for(exc.state, **preflight.fix_context(source))
+        raise
     except YtDlpError as exc:
         exc.fix = _ytdlp_fix(exc)
         raise
-    if runner.stop is not None:
-        raise BatchStopError(runner.stop.signal, runner.stop.until)
-    return found
 
 
 def fetch(

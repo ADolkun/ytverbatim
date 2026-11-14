@@ -156,6 +156,7 @@ def process(
     auth: str | None = None,
     captions: bool = True,
     force: bool = False,
+    cookies_first: bool = False,
     progress: Callable[[ProgressEvent], None] | None = None,
     runner_factory: Callable[[Sequence[str]], YtDlpRunner] = default_runner,
 ) -> ContextDocument:
@@ -165,7 +166,9 @@ def process(
     provider applies, and with none configured those stages degrade as `quality.warnings` records. Raises the
     video's own error (`AuthError`, `EngineError`, `LLMError`, `ContractError`, ...), or `BatchStopError` when
     YouTube asked us to back off before the video was done. `auth` is an auth spec as for `--auth`; without it the
-    configured source applies.
+    configured source applies. `cookies_first` sends the video's first request with cookies, for a video known to need
+    a login such as one from a members playlist; without it the first request is anonymous and cookies follow only
+    when YouTube asks for them.
     """
     ref = ids.classify(url)
     if ref is None or ref.kind is not ids.RefKind.VIDEO:
@@ -179,6 +182,7 @@ def process(
         source=resolve_source(auth),
         captions=captions,
         force=force,
+        cookies_first=cookies_first,
         progress=progress,
         on_video=results.append,
         runner_factory=runner_factory,
@@ -206,6 +210,7 @@ def process_many(  # noqa: PLR0913
     captions: bool = True,
     force: bool = False,
     ignore_cooldown: bool = False,
+    cookies_first: bool = False,
     progress: Callable[[ProgressEvent], None] | None = None,
     on_video: Callable[[VideoResult], None] | None = None,
     runner_factory: Callable[[Sequence[str]], YtDlpRunner] = default_runner,
@@ -231,6 +236,7 @@ def process_many(  # noqa: PLR0913
         cookie_channels=options.auth.cookie_channels,
         max_videos=options.ytdlp.max_videos_per_run,
         ignore_cooldown=ignore_cooldown,
+        cookies_first=cookies_first,
         creator_note=options.ytdlp.creator_note,
     )
     hook = _RunHook(settings)
