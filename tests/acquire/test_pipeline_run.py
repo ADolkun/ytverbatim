@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -10,13 +11,14 @@ from click.testing import CliRunner
 from pydantic import JsonValue
 
 from ytverbatim import config, pipeline, proc
-from ytverbatim.acquire import session
+from ytverbatim.acquire import audio, session
 from ytverbatim.acquire.metadata import Chapter, VideoMetadata
 from ytverbatim.asr import registry
 from ytverbatim.asr import runner as asr_runner
 from ytverbatim.asr.models import HYPOTHESES_FILE, ChunkHypothesis, RunMetrics, WorkerRequest
 from ytverbatim.asr.runner import WorkerResult
 from ytverbatim.auth.fixes import fix_for
+from ytverbatim.auth.source import CookieFileSource
 from ytverbatim.auth.state import AuthState
 from ytverbatim.cli import main
 from ytverbatim.contract import ContextDocument, Word, load_document
@@ -545,11 +547,116 @@ def test_a_current_document_with_a_wanted_video_makes_exactly_one_video_request(
     assert len(worker.calls) == 1
     assert second[0].document == first[0].document
     assert second[0].outcome.reused == ("context", "info")
-    assert [e.stage for e in events] == ["skip"]
+    assert [e.stage for e in events] == ["skip", "fetch"]
+    assert [t.stage for t in second[0].timings] == ["fetch"]
     assert (session_kit.out / PUBLIC / "video.mp4").is_file()
 
     run(session_kit, yt, options=video_options(on=True))
     assert len(yt.labels("video")) == 1
+
+
+def age_info(vdir: Path) -> None:
+    old = (vdir / "info.json").stat().st_mtime - 2 * 3600
+    os.utime(vdir / "info.json", (old, old))
+
+
+def test_an_old_extraction_is_refreshed_once_before_the_video(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    run(session_kit, yt)
+    age_info(session_kit.out / PUBLIC)
+    before = len(yt.calls)
+
+    run(session_kit, yt, options=video_options(on=True))
+
+    assert [c.label for c in yt.calls[before:]] == ["metadata", "video"]
+    assert all(c.cookies is None for c in yt.calls[before:])
+
+
+def test_the_reuse_path_keeps_the_cookies_the_document_was_made_with(session_kit, worker: FakeWorker) -> None:
+    source = CookieFileSource(Path("/nonexistent/cookies.txt"))
+    yt = session_kit.yt()
+    yt.availability[MEMBERS] = "subscriber_only"
+    yt.failures[("metadata", False)] = [session_kit.fail(Signal.MEMBERS_ONLY)]
+    yt.secondary[("metadata", True)] = (Signal.AUTH_COOKIES_FOUND,)
+    _, first, _ = run(session_kit, yt, [MEMBERS], source=source)
+    assert first[0].document is not None and first[0].document.access.cookies_used
+    age_info(session_kit.out / MEMBERS)
+    before = len(yt.calls)
+
+    run(session_kit, yt, [MEMBERS], options=video_options(on=True), source=source)
+
+    after = yt.calls[before:]
+    assert [c.label for c in after] == ["metadata", "video"]
+    assert all(c.cookies is not None for c in after), "no anonymous attempt that YouTube would refuse"
+
+
+def test_the_reuse_path_stays_anonymous_under_policy_never(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    run(session_kit, yt)
+    age_info(session_kit.out / PUBLIC)
+    before = len(yt.calls)
+    options = config.load_options(overrides={"auth": {"policy": "never"}, "ytdlp": {"video": True}})
+    run(session_kit, yt, options=options, source=CookieFileSource(Path("/nonexistent/cookies.txt")))
+    assert [c.label for c in yt.calls[before:]] == ["metadata", "video"]
+    assert all(c.cookies is None for c in yt.calls[before:])
+
+
+def test_a_stale_info_403_keeps_the_creator_note(
+    session_kit, worker: FakeWorker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(audio, "INFO_MAX_AGE_S", -1.0)
+    yt = session_kit.yt()
+    yt.comments[PUBLIC] = [NOTE]
+    yt.failures[("video", False)] = [session_kit.fail(Signal.HTTP_403)]
+    options = config.load_options(overrides={"ytdlp": {"video": True, "creator_note": True}})
+
+    _, results, _ = run(session_kit, yt, options=options)
+
+    assert [c.label for c in yt.calls] == ["metadata", "captions", "audio", "video", "metadata", "video"]
+    assert all("--get-comments" in c.args for c in yt.labels("metadata"))
+    info = json.loads((session_kit.out / PUBLIC / "info.json").read_text())
+    assert info["comments"], "the refreshed extraction still carries the comments"
+    document = results[0].document
+    assert document is not None and document.video.creator_note is not None
+
+
+def test_a_present_video_still_waives_the_cooldown(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    run(session_kit, yt, options=video_options(on=True))
+    session.start_cooldown(Signal.RATE_LIMITED, NOW)
+    calls = len(yt.calls)
+
+    report, results, _ = run(session_kit, yt, options=video_options(on=True))
+
+    assert report.exit_code == 0 and results[0].outcome.reused == ("context",)
+    assert len(yt.calls) == calls
+
+
+def test_a_failed_video_probe_does_not_abort_the_batch_precheck(session_kit, worker: FakeWorker, fake_proc) -> None:
+    yt = session_kit.yt()
+    run(session_kit, yt, options=video_options(on=True))
+    session.start_cooldown(Signal.RATE_LIMITED, NOW)
+
+    def timed_out(argv: list[str]) -> proc.ProcResult:
+        raise ProcTimeout("ffprobe", 20.0)
+
+    fake_proc.responses["ffprobe"] = timed_out
+    with pytest.raises(session.BatchStopError):
+        run(session_kit, yt, options=video_options(on=True))
+
+
+def test_a_video_failure_on_the_reuse_path_does_not_stop_the_next_video(session_kit, worker: FakeWorker) -> None:
+    yt = session_kit.yt()
+    targets = [PUBLIC, "pubVideo002"]
+    run(session_kit, yt, targets)
+    yt.failures[("video", False)] = [session_kit.fail(Signal.NO_FORMATS)]
+
+    report, results, _ = run(session_kit, yt, targets, options=video_options(on=True))
+
+    assert [r.outcome.status for r in results] == [session.VideoStatus.ERROR, session.VideoStatus.OK]
+    assert report.exit_code == 1
+    assert not (session_kit.out / PUBLIC / "video.mp4").exists()
+    assert (session_kit.out / "pubVideo002" / "video.mp4").is_file()
 
 
 def test_a_failed_video_download_fails_a_current_document_loudly(session_kit, worker: FakeWorker) -> None:

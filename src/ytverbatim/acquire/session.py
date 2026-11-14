@@ -333,7 +333,7 @@ class FetchSession:
         if want_audio:
             audio_s = self._audio(video_id, vdir, metadata, snaps, access.cookies_used, reused)
         if self._options.video:
-            self._video(video_id, vdir, metadata, snaps, access.cookies_used, reused)
+            self._video(video_id, vdir, metadata, snaps, access.cookies_used, reused, present=video_done)
 
         warnings += [w for seen in self._runner.seen for w in seen.warnings]
         access = access.model_copy(update={"warnings": _clean_warnings(warnings)})
@@ -469,7 +469,15 @@ class FetchSession:
             native = self._stage(
                 snaps,
                 cookies_used,
-                lambda c: fetch_audio(self._runner, video_id, vdir, vdir, expected_duration=expected, cookies=c),
+                lambda c: fetch_audio(
+                    self._runner,
+                    video_id,
+                    vdir,
+                    vdir,
+                    expected_duration=expected,
+                    cookies=c,
+                    creator_note=self._options.creator_note,
+                ),
             )
         wav = vdir / WAV_NAME
         wav_s = _duration_if_valid(wav, expected)
@@ -487,15 +495,24 @@ class FetchSession:
         snaps: _Snapshots | None,
         cookies_used: bool,
         reused: list[str],
+        *,
+        present: bool,
     ) -> None:
-        expected = metadata.duration
-        if ready_video(vdir) is not None:
+        if present:
             reused.append("video")
             return
         self._stage(
             snaps,
             cookies_used,
-            lambda c: download_video(self._runner, video_id, vdir, vdir, expected_duration=expected, cookies=c),
+            lambda c: download_video(
+                self._runner,
+                video_id,
+                vdir,
+                vdir,
+                expected_duration=metadata.duration,
+                cookies=c,
+                creator_note=self._options.creator_note,
+            ),
         )
 
     def _access(self, metadata: VideoMetadata, extracted: _Extracted, warnings: Iterable[str]) -> Access:

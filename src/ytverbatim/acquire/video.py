@@ -5,7 +5,7 @@ from pathlib import Path
 from ytverbatim import paths
 from ytverbatim.acquire.audio import DEFAULT_DOWNLOAD_TIMEOUT_S, download_refreshing_stale_info, validate_audio
 from ytverbatim.acquire.metadata import info_path, load_metadata
-from ytverbatim.errors import MediaValidationError, YtDlpError
+from ytverbatim.errors import MediaValidationError, ProcTimeout, YtDlpError
 from ytverbatim.ytdlp.types import YtDlpRunner
 
 VIDEO_STEM = "video"
@@ -25,6 +25,7 @@ def fetch_video(
     cookies: Path | None = None,
     timeout_s: float = DEFAULT_DOWNLOAD_TIMEOUT_S,
     now: Callable[[], float] = time.time,
+    creator_note: bool = False,
 ) -> Path:
     """Download the video track as `video.mp4` and validate it; the info JSON must already be saved."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -41,6 +42,7 @@ def fetch_video(
         lambda: _download(runner, stage_dir, out_dir, cookies, timeout_s),
         what="video",
         now=now,
+        creator_note=creator_note,
     )
 
     path = out_dir / VIDEO_NAME
@@ -71,9 +73,13 @@ def video_file(video_id: str, out: Path | None = None) -> Path | None:
     """Return the validated video file `process` or `fetch` saved for `video_id` under `out`, else None.
 
     A file that is missing, corrupt or shorter than 90% of the video's duration counts as absent. The video is
-    only downloaded when `[ytdlp] video = true`; this never downloads.
+    only downloaded when `[ytdlp] video = true`; this never downloads. A probe that times out counts as absent; a
+    missing `ffprobe` raises `DependencyError` and a malformed id `ValueError`.
     """
-    return ready_video(paths.video_dir(video_id, out))
+    try:
+        return ready_video(paths.video_dir(video_id, out))
+    except ProcTimeout:
+        return None
 
 
 def _download(runner: YtDlpRunner, stage_dir: Path, out_dir: Path, cookies: Path | None, timeout_s: float) -> None:
