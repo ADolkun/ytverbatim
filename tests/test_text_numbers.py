@@ -83,6 +83,49 @@ def test_tickers(ticker: str) -> None:
     assert (token.surface, token.kind) == (ticker, "ticker")
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("3.35SMH", [("3.35", "number"), ("SMH", "ticker")]),
+        ("5%NVDA", [("5%", "percent"), ("NVDA", "ticker")]),
+        ("$1.2MSFT", [("$1.2", "currency"), ("MSFT", "ticker")]),
+        ("10BABA", [("10", "number"), ("BABA", "ticker")]),
+        ("5BRK.B", [("5", "number"), ("BRK.B", "ticker")]),
+        ("３.３５SMH", [("３.３５", "number"), ("SMH", "ticker")]),
+        ("涨了3.35SMH", [("3.35", "number"), ("SMH", "ticker")]),
+    ],
+)
+def test_a_ticker_written_against_a_figure_is_its_own_token(text: str, expected: list[tuple[str, str]]) -> None:
+    assert [(t.surface, t.kind) for t in quantity_tokens(text)] == expected
+    spaced = [(t.surface, t.kind) for t in quantity_tokens(text.replace(expected[-1][0], f" {expected[-1][0]}"))]
+    assert spaced == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "surface", "value"),
+    [
+        ("$1.2M", "$1.2M", "$1200000"),
+        ("10B", "10B", "10000000000"),
+        ("5K", "5K", "5000"),
+        ("3bn", "3bn", "3000000000"),
+        ("10BN", "10", "10"),
+        ("5MN", "5", "5"),
+        ("5mn", "5", "5"),
+        ("25BPS", "25", "25"),
+        ("25bps", "25", "25"),
+        ("3x", "3", "3"),
+        ("3X", "3", "3"),
+    ],
+)
+def test_figure_suffixes_are_not_tickers(text: str, surface: str, value: str) -> None:
+    (token,) = quantity_tokens(text)
+    assert (token.surface, token.value_itn) == (surface, value)
+
+
+def test_letters_after_digits_inside_a_word_are_not_a_ticker() -> None:
+    assert quantity_tokens("abc1XYZ") == []
+
+
 def test_share_class_letter_before_gu() -> None:
     assert [(t.surface, t.kind) for t in quantity_tokens("A股")] == [("A", "ticker")]
 
