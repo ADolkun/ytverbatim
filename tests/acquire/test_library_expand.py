@@ -1,3 +1,5 @@
+from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 
@@ -6,6 +8,7 @@ import pytest
 import ytverbatim
 from ytverbatim import config, paths
 from ytverbatim.acquire import session
+from ytverbatim.auth import snapshot
 from ytverbatim.auth.cooldown import read_cooldown, start_cooldown, utcnow
 from ytverbatim.auth.state import AuthState
 from ytverbatim.errors import AuthError, BatchStopError, YtDlpError
@@ -45,6 +48,7 @@ def test_a_cooldown_refuses_before_any_request(session_kit, yt) -> None:
     with pytest.raises(BatchStopError) as stopped:
         session.expand(LIST_URL)
     assert stopped.value.signal is Signal.BOT_CHECK
+    assert stopped.value.fix and "Wait until" in stopped.value.fix
     assert yt.calls == []
 
 
@@ -90,6 +94,28 @@ def test_a_members_playlist_without_a_source_is_refused_not_listed_anonymously(s
     assert yt.calls == []
 
 
+def test_policy_always_without_a_source_is_refused(session_kit, yt) -> None:
+    with pytest.raises(AuthError) as refused:
+        session.expand(LIST_URL, options=options(policy="always"))
+    assert refused.value.state is AuthState.NO_SOURCE and refused.value.fix
+    assert yt.calls == []
+
+
+def test_a_failing_cookie_snapshot_raises_with_a_fix_and_never_falls_back_to_anonymous(
+    session_kit, yt, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    @contextmanager
+    def denied(_source: object, **_: object) -> Generator[None]:
+        raise AuthError(AuthState.COOKIE_FILE_INVALID, "not a cookies.txt export")
+        yield
+
+    monkeypatch.setattr(snapshot, "cookie_snapshot", denied)
+    with pytest.raises(AuthError) as failed:
+        session.expand(MEMBERS_URL, auth=COOKIE_FILE)
+    assert failed.value.state is AuthState.COOKIE_FILE_INVALID and "Netscape" in failed.value.fix
+    assert yt.calls == []
+
+
 def test_policy_never_lists_a_members_playlist_anonymously(session_kit, yt) -> None:
     yt.playlist = ["aaaaaaaaaaa"]
     session.expand(MEMBERS_URL, auth=COOKIE_FILE, options=options(policy="never"))
@@ -106,7 +132,7 @@ def test_a_bot_check_writes_the_cooldown_and_raises(session_kit, yt) -> None:
     yt.failures[("expand", False)] = [session_kit.fail(Signal.BOT_CHECK)]
     with pytest.raises(BatchStopError) as stopped:
         session.expand(LIST_URL)
-    assert stopped.value.signal is Signal.BOT_CHECK
+    assert stopped.value.signal is Signal.BOT_CHECK and "Do not add cookies" in stopped.value.fix
     cooldown = read_cooldown()
     assert cooldown is not None and cooldown.signal is Signal.BOT_CHECK and cooldown.active(utcnow())
     with pytest.raises(BatchStopError):
@@ -119,7 +145,7 @@ def test_a_stop_signal_on_a_successful_listing_also_raises(session_kit, yt) -> N
     yt.secondary[("expand", False)] = (Signal.RATE_LIMITED,)
     with pytest.raises(BatchStopError) as stopped:
         session.expand(LIST_URL)
-    assert stopped.value.signal is Signal.RATE_LIMITED
+    assert stopped.value.signal is Signal.RATE_LIMITED and stopped.value.fix
     cooldown = read_cooldown()
     assert cooldown is not None and cooldown.active(utcnow())
 

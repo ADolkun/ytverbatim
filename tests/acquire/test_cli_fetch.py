@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from click.testing import CliRunner
 
+from ytverbatim import paths
 from ytverbatim.acquire import session
 from ytverbatim.cli import fetch as cli_fetch
 from ytverbatim.cli import main
@@ -30,6 +31,18 @@ def test_public_video_prints_one_line_and_exits_zero(session_kit, monkeypatch: p
     assert "pubVideo001" in line and "anonymous" in line and "2 chapters" in line and "audio 100s" in line
     assert "1 ok, 0 failed" in result.output
     assert str(session_kit.home) not in result.output
+
+
+def test_fetch_follows_the_creator_note_option(session_kit, monkeypatch: pytest.MonkeyPatch) -> None:
+    yt = session_kit.yt()
+    assert _invoke(session_kit, yt, monkeypatch, "pubVideo001").exit_code == 0
+    assert "--get-comments" not in yt.labels("metadata")[0].args
+
+    config_file = paths.config_file()
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text("[ytdlp]\ncreator_note = true\n", encoding="utf-8")
+    assert _invoke(session_kit, yt, monkeypatch, "pubVideo002").exit_code == 0
+    assert "--get-comments" in yt.labels("metadata")[1].args
 
 
 def test_members_without_source_exits_two_with_fix(session_kit, monkeypatch: pytest.MonkeyPatch) -> None:
