@@ -132,3 +132,24 @@ def test_overrides_are_validated_too(tmp_path: Path) -> None:
         load_options(tmp_path / "absent.toml", {"auth": {"policy": "x"}})
     with pytest.raises(ConfigError, match="unknown config section"):
         load_options(tmp_path / "absent.toml", {"bogus": {"a": 1}})
+
+
+def test_correction_is_unset_by_default() -> None:
+    assert Options().text.correct is None
+
+
+@pytest.mark.parametrize(("body", "expected"), [("true", True), ("false", False)])
+def test_toml_correct_parses_as_a_bool(tmp_path: Path, body: str, expected: bool) -> None:
+    assert load_options(_write(tmp_path, f"[text]\ncorrect = {body}\n")).text.correct is expected
+
+
+def test_correct_override_beats_the_file_but_none_leaves_it(tmp_path: Path) -> None:
+    path = _write(tmp_path, "[text]\ncorrect = false\n")
+    assert load_options(path, {"text": {"correct": True}}).text.correct is True
+    assert load_options(path, {"text": {"correct": None}}).text.correct is False
+    assert load_options(tmp_path / "absent.toml", {"text": {"correct": None}}).text.correct is None
+
+
+def test_correct_must_be_a_bool(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match=r"text\.correct must be of type bool"):
+        load_options(_write(tmp_path, "[text]\ncorrect = 1\n"))

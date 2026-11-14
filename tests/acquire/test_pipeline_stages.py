@@ -246,6 +246,7 @@ def test_end_to_end_with_a_fake_llm_punctuates_verifies_numbers_and_meters_token
     assert doc.quality.flags_by_kind == {"numeric_fixed": 1, "timing_interpolated": 1}
     assert {(u.stage, u.client, u.calls, u.input_tokens) for u in doc.llm_usage} == {
         ("punctuation", llm.id, 1, 100),
+        ("correction", llm.id, 1, 100),
         ("numeric", llm.id, 1, 100),
     }
 
@@ -253,7 +254,7 @@ def test_end_to_end_with_a_fake_llm_punctuates_verifies_numbers_and_meters_token
     assert "五十个百分点[^1]" in markdown and "十五个百分点 → 五十个百分点" in markdown
     assert "punctuation: llm" in markdown
     assert "timing_interpolated" not in markdown
-    assert [e.stage for e in events] == ["fetch", "asr", "normalize", "punctuate", "numeric", "write"]
+    assert [e.stage for e in events] == ["fetch", "asr", "normalize", "punctuate", "correct", "numeric", "write"]
     assert results[0].notices == () and not (vdir / "audio.wav").exists()
     assert {".lock", "audio.webm", "context.json", "context.md", ".stages"} <= {p.name for p in vdir.iterdir()}
 
@@ -279,7 +280,13 @@ def test_an_option_change_recomputes_only_the_stages_downstream_of_it(session_ki
 
     llm = FakeLLM()
     _, second, events = run(session_kit, yt, llm=llm)
-    assert stored(second[0]) == {"asr": True, "normalize": True, "punctuate": False, "numeric": False}
+    assert stored(second[0]) == {
+        "asr": True,
+        "normalize": True,
+        "punctuate": False,
+        "correct": False,
+        "numeric": False,
+    }
     assert len(worker.calls) == 1 and ffmpeg_calls(session_kit) == converted, "no audio once the ASR is stored"
     assert len(yt.labels("audio")) == 1 and "asr" not in [e.stage for e in events]
     assert only_document(second).transcript.punctuation == "llm"
@@ -287,13 +294,13 @@ def test_an_option_change_recomputes_only_the_stages_downstream_of_it(session_ki
     asked = len(llm.requests)
     no_chapters = config.load_options(overrides={"text": {"chapters": "none"}})
     _, third, _ = run(session_kit, yt, options=no_chapters, llm=llm)
-    assert stored(third[0]) == {"asr": True, "normalize": True, "punctuate": True, "numeric": True}
+    assert stored(third[0]) == {"asr": True, "normalize": True, "punctuate": True, "correct": True, "numeric": True}
     assert len(llm.requests) == asked and only_document(third).chapters == ()
 
     keep_script = config.load_options(overrides={"text": {"script": "keep"}})
     _, fourth, _ = run(session_kit, yt, options=keep_script, llm=llm)
     # The text was Simplified already, so normalize's output is unchanged and nothing after it reruns.
-    assert stored(fourth[0]) == {"asr": True, "normalize": False, "punctuate": True, "numeric": True}
+    assert stored(fourth[0]) == {"asr": True, "normalize": False, "punctuate": True, "correct": True, "numeric": True}
     assert len(llm.requests) == asked
 
 
@@ -323,7 +330,13 @@ def test_an_llm_failure_fails_the_video_and_keeps_every_finished_stage(session_k
     assert not (session_kit.out / ZH / "context.json").exists()
 
     _, retry, _ = run(session_kit, yt, llm=FakeLLM())
-    assert stored(retry[0]) == {"asr": True, "normalize": True, "punctuate": False, "numeric": False}
+    assert stored(retry[0]) == {
+        "asr": True,
+        "normalize": True,
+        "punctuate": False,
+        "correct": False,
+        "numeric": False,
+    }
     assert len(worker.calls) == 1 and len(yt.labels("audio")) == 1
 
 
@@ -333,7 +346,7 @@ def test_force_discards_every_stored_stage(session_kit, worker) -> None:
     llm = FakeLLM()
     _, forced, _ = run(session_kit, yt, llm=llm, force=True)
     assert not any(stored(forced[0]).values())
-    assert len(worker.calls) == 2 and llm.stages() == ["punctuate", "numeric"]
+    assert len(worker.calls) == 2 and llm.stages() == ["punctuate", "correct", "numeric"]
 
 
 def test_captions_mode_trusts_the_manual_track_and_skips_the_audio(session_kit, worker) -> None:
@@ -361,6 +374,90 @@ def test_correction_needs_an_llm_and_runs_with_one(session_kit, worker) -> None:
     _, results, _ = run(session_kit, yt, options=correct, llm=llm)
     assert only_document(results).transcript.correction_llm == llm.id
     assert llm.stages() == ["punctuate", "correct", "numeric"]
+
+
+def with_correct(value: bool | None) -> config.Options:
+    return config.load_options(overrides={"text": {"correct": value}})
+
+
+def test_correction_runs_by_default_when_there_is_an_llm(session_kit, worker) -> None:
+    llm = FakeLLM()
+    _, results, events = run(session_kit, zh_yt(session_kit), llm=llm)
+    assert only_document(results).transcript.correction_llm == llm.id
+    assert llm.stages() == ["punctuate", "correct", "numeric"]
+    assert "correct" in [e.stage for e in events]
+
+
+def test_correction_is_skipped_without_an_llm_and_the_notice_says_so(session_kit, worker) -> None:
+    yt = zh_yt(session_kit)
+    _, results, events = run(session_kit, yt)
+    doc = only_document(results)
+    assert doc.transcript.correction_llm is None and "correct" not in [e.stage for e in events]
+    notice = results[0].notices[0]
+    assert notice.startswith("punctuation not restored") and "correction is skipped" in notice
+    assert notice in doc.quality.warnings
+    assert len(doc.quality.warnings) == len(results[0].notices)
+
+
+def test_an_explicit_off_skips_correction_even_with_an_llm(session_kit, worker) -> None:
+    llm = FakeLLM()
+    _, results, events = run(session_kit, zh_yt(session_kit), options=with_correct(False), llm=llm)
+    assert only_document(results).transcript.correction_llm is None
+    assert llm.stages() == ["punctuate", "numeric"] and "correct" not in [e.stage for e in events]
+
+
+@pytest.mark.parametrize(
+    ("setting", "with_llm", "resolved"),
+    [(None, True, True), (None, False, False), (True, True, True), (False, True, False), (False, False, False)],
+)
+def test_the_tri_state_is_resolved_once_into_the_settings(session_kit, setting, with_llm, resolved) -> None:
+    settings = pipeline._settings(
+        with_correct(setting),
+        FakeLLM() if with_llm else None,
+        session_kit.out,
+        force=False,
+        captions=True,
+        emit=lambda _event: None,
+        clock=lambda: NOW,
+    )
+    assert settings.text.correct is resolved
+
+
+def test_the_resolved_value_is_what_the_stored_document_depends_on(session_kit, worker) -> None:
+    yt = zh_yt(session_kit)
+    llm = FakeLLM()
+    run(session_kit, yt, llm=llm)
+    _, _, events = run(session_kit, yt, options=with_correct(True), llm=llm)
+    assert [e.stage for e in events] == ["skip"], "unset with an LLM and True are the same identity"
+
+    _, off, events = run(session_kit, yt, options=with_correct(False), llm=llm)
+    assert "skip" not in [e.stage for e in events] and only_document(off).transcript.correction_llm is None
+    assert stored(off[0]) == {"asr": True, "normalize": True, "punctuate": True, "numeric": True}
+
+    _, on, _ = run(session_kit, yt, llm=llm)
+    assert only_document(on).transcript.correction_llm == llm.id
+
+
+def test_cli_correct_flag_is_tri_state(session_kit, worker, monkeypatch) -> None:
+    llm = FakeLLM()
+    monkeypatch.setattr(pipeline, "client_from_options", lambda _options: llm)
+    monkeypatch.setattr(pipeline, "check_ready", lambda _options: None)
+    spec = ("--llm", "claude-cli:claude-sonnet-5-5")
+
+    def correction_requests(*flags: str) -> int:
+        llm.requests.clear()
+        result = invoke(session_kit, zh_yt(session_kit), monkeypatch, ZH, "--force", *spec, *flags)
+        assert result.exit_code == 0, result.output
+        return llm.stages().count("correct")
+
+    assert correction_requests() == 1
+    assert correction_requests("--correct") == 1
+    assert correction_requests("--no-correct") == 0
+
+    without = invoke(session_kit, zh_yt(session_kit), monkeypatch, ZH, "--force")
+    assert without.exit_code == 0 and "correction is skipped" in without.output
+    refused = invoke(session_kit, zh_yt(session_kit), monkeypatch, ZH, "--force", "--correct")
+    assert refused.exit_code == 1 and "correction needs an LLM" in refused.output
 
 
 def test_a_whole_file_engine_is_refused_as_the_numeric_second_opinion(session_kit, worker) -> None:
@@ -634,7 +731,13 @@ def test_a_module_version_bump_redoes_its_stage_and_the_document(session_kit, wo
     _, results, events = run(session_kit, yt, llm=llm)
     assert "skip" not in [e.stage for e in events], "the context record names the module versions"
     # Same reply, so the text after punctuation is unchanged and numeric is reused.
-    assert stored(results[0]) == {"asr": True, "normalize": True, "punctuate": False, "numeric": True}
+    assert stored(results[0]) == {
+        "asr": True,
+        "normalize": True,
+        "punctuate": False,
+        "correct": True,
+        "numeric": True,
+    }
 
 
 def test_correction_reruns_when_its_glossary_changes(session_kit, worker) -> None:

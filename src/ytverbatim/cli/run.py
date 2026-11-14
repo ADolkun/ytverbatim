@@ -28,7 +28,9 @@ from ytverbatim.ytdlp.runner import redact
     help="Transcribe with ASR (default), or trust the manual caption track and fall back to ASR without one.",
 )
 @click.option(
-    "--correct/--no-correct", default=None, help="LLM correction of misheard words (default off; needs --llm)."
+    "--correct/--no-correct",
+    default=None,
+    help="LLM correction of misheard words. Default: on whenever there is an LLM; --correct without one is an error.",
 )
 @click.option(
     "--chapters", type=click.Choice(["auto", "none"]), help="Chapter headings: auto uses YouTube's chapters (default)."
