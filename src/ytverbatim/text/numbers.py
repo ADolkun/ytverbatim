@@ -205,6 +205,11 @@ _TOKEN = re.compile(
     )
 )
 
+# A symbol written against a figure (3.35SMH) is still a ticker, unless the run is a figure suffix: 10BN, 25BPS.
+# Lowercase suffixes (bn, mn, bps, x) and single letters never match a symbol, so only these uppercase runs need it.
+_FUSED_SYMBOL = re.compile(rf"[A-Z][A-Z0-9]+(?:\.[A-Z]+)?{_NO_ALNUM_AFTER}")
+_FIGURE_SUFFIXES = frozenset({"BN", "MN", "BPS"})
+
 _MIN_BARE_RUN = 2
 _YEAR_DIGITS = 4
 _VARIANT_NUMERALS = str.maketrans({"兩": "两", "萬": "万", "億": "亿"})
@@ -453,12 +458,29 @@ def quantity_tokens(text: str) -> list[QToken]:
                 tokens.append(token)
         elif match.group("number") is not None:
             tokens.append(_number_token(match))
+            fused = _fused_symbol(text, match.end())
+            if fused is not None:
+                tokens.append(fused)
         elif match.group("spelled") is not None:
             tokens.extend(_spelled_tokens(match))
         else:
             surface = match.group(0)
             tokens.append(QToken(match.start(), match.end(), surface, surface, "ticker"))
     return tokens
+
+
+def _fused_symbol(text: str, end: int) -> QToken | None:
+    """Read the ticker written directly after a number, where the symbol pattern's boundary stops it matching.
+
+    That boundary refuses only an ASCII letter or digit before the symbol, and a number that ends in a letter (5K,
+    $1.2M) never has one after it, so only an ASCII digit needs this.
+    """
+    if text[end - 1] not in "0123456789":
+        return None
+    match = _FUSED_SYMBOL.match(text, end)
+    if match is None or match[0] in _FIGURE_SUFFIXES:
+        return None
+    return QToken(match.start(), match.end(), match[0], match[0], "ticker")
 
 
 def itn(text: str) -> str:
