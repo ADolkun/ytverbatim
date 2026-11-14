@@ -56,7 +56,7 @@ _SIGN_OR_CURRENCY = r"(?:[-+−负負正](?:\s*[$¥€£])?\s*|[$¥€£](?:\s*[
 # Digit quantities keep their sign, currency and unit. Chinese numerals are compared as quantity tokens instead, so
 # only a sign or currency symbol in front of them is tracked here (¥一百元 → 一百元 drops the currency).
 _QUANTITY = (
-    rf"{_SIGN_OR_CURRENCY}?(?:\d+(?:,\d{{3}})*(?:\.\d+)?|\.\d+)(?:\s*[%$¥€£元块塊分])?"
+    rf"{_SIGN_OR_CURRENCY}?(?:\d+(?:,\d{{3}}(?!\d))*(?:\.\d+)?|\.\d+)(?:\s*[%$¥€£元块塊分])?"
     rf"|{_SIGN_OR_CURRENCY}(?=[{_CJK_NUMERAL_CHARS}])"
 )
 # A numeric fix may touch only data characters; any other character in a changed run means a reword rode along.
@@ -97,7 +97,7 @@ _QUANTITY_TOKEN = re.compile(
 # currency and percent. Letter-only symbols and Chinese numerals have their own guards.
 _NUMERIC_SPAN = re.compile(
     r"(?<![A-Za-z0-9])(?:[A-Z][A-Z0-9]+\.[A-Z]+|[A-Z][A-Z0-9]*[0-9][A-Z0-9]*|\d{2,}\.[A-Z]{2,})(?![A-Za-z0-9])"
-    r"|(?<![A-Za-z0-9])[-+−]?(?:[$¥€£][-+−]?)?(?:\d+(?:,\d{3})*(?:\.\d+)?|\.\d+)%?"
+    r"|(?<![A-Za-z0-9])[-+−]?(?:[$¥€£][-+−]?)?(?:\d+(?:,\d{3}(?!\d))*(?:\.\d+)?|\.\d+)%?"
 )
 _NEGATION = re.compile(
     r"(?i:\b(?:not|no|never|neither|nor|without|cannot|"
