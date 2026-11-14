@@ -7,6 +7,8 @@ aggregate ``evals/results/correction-<date>.md``.
 """
 
 import contextlib
+import importlib
+import os
 from contextlib import AbstractContextManager
 from datetime import date
 from pathlib import Path
@@ -64,6 +66,7 @@ from ytverbatim.llm.protocol import LLMClient, Readiness
 
 DEFAULT_PUNCTUATION_LLM = "claude-cli:claude-sonnet-5-5"
 JUDGE_SAMPLE = 1500
+CLIENT_FACTORY_ENV = "YTVERBATIM_EVAL_CLIENT_FACTORY"
 _LOCAL = sorted(c.id for c in CANDIDATES.values() if c.local)
 
 
@@ -88,11 +91,43 @@ def judge_client() -> LLMClient:
     return ClaudeCLIClient(model=JUDGE_MODEL)
 
 
+def external_client(candidate: Candidate) -> LLMClient:
+    """Build the client of an external candidate with ``$YTVERBATIM_EVAL_CLIENT_FACTORY`` (``package.module:function``).
+
+    The factory is called as ``factory(model=..., effort=...)`` and must return an `LLMClient`. It owns readiness: a
+    factory that cannot reach its model raises, preferably `ConfigError`, instead of returning a client that fails on
+    its first call.
+    """
+    spec = os.environ.get(CLIENT_FACTORY_ENV, "").strip()
+    hint = f"set {CLIENT_FACTORY_ENV}=package.module:function to a factory called as function(model=..., effort=...)"
+    if not spec:
+        raise ConfigError(f"{candidate.id} is an external candidate and {CLIENT_FACTORY_ENV} is not set; {hint}")
+    module_name, separator, attribute = spec.partition(":")
+    if not (separator and module_name and attribute):
+        raise ConfigError(f"{CLIENT_FACTORY_ENV}={spec!r} is not package.module:function; {hint}")
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise ConfigError(f"{CLIENT_FACTORY_ENV}={spec!r}: cannot import {module_name!r} ({exc}); {hint}") from exc
+    factory = getattr(module, attribute, None)
+    if not callable(factory):
+        raise ConfigError(f"{CLIENT_FACTORY_ENV}={spec!r}: {module_name} has no callable {attribute!r}; {hint}")
+    client = factory(model=candidate.model, effort=candidate.effort)
+    if not isinstance(getattr(client, "id", None), str) or not callable(getattr(client, "complete", None)):
+        raise ConfigError(
+            f"{CLIENT_FACTORY_ENV}={spec!r}: the factory returned {type(client).__name__}, which is not an LLMClient "
+            "(it needs a string `id` property and a `complete(request)` method)"
+        )
+    return client
+
+
 def open_client(store: Layout, candidate: Candidate, cache: Path) -> AbstractContextManager[LLMClient]:
     if candidate.local:
         click.echo(f"{candidate.id}: starting the local server (waits for the MLX worker lock if another one is held)")
         cap = memory_cap_bytes(config.load_options().asr.memory_cap_gib)
         return local_server(candidate, cache, run_dir(store, candidate), memory_cap=cap)
+    if candidate.external:
+        return contextlib.nullcontext(external_client(candidate))
     _require_ready(claude_cli.readiness())
     return contextlib.nullcontext(ClaudeCLIClient(model=candidate.model))
 

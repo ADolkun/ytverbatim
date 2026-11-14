@@ -51,6 +51,7 @@ uv run python -m evals.run_correction base --hyp w-prod             # normalize 
 uv run python -m evals.run_correction correct --candidate c-sonnet  # the production correction, per candidate
 uv run python -m evals.run_correction correct --candidate c-haiku
 uv run python -m evals.run_correction correct --candidate l-qwen35-9b
+uv run python -m evals.run_correction correct --candidate x-gpt61-medium   # external: needs the factory variable below
 uv run python -m evals.run_correction screen                        # edit disputes, blind judge sample, the pick
 uv run python -m evals.run_correction session                       # the picked candidate's edits, blind A/B
 uv run python -m evals.run_correction listen                        # the owner's blind terminal A/B
@@ -60,6 +61,16 @@ uv run python -m evals.run_correction cleanup --candidate l-qwen35-9b   # last: 
 ```
 
 `cleanup` comes last and is skipped when the local model wins and the owner keeps its weights.
+
+An external candidate (`x-gpt61-medium`, `x-gpt61-high`: model `gpt-6.1-sol` at reasoning effort `medium` or `high`)
+uses a model the repo cannot call itself. Set `YTVERBATIM_EVAL_CLIENT_FACTORY=package.module:function`; `correct`
+imports it and calls `function(model="<model>", effort="<effort>")`, keyword arguments only. The result must be a
+`ytverbatim.LLMClient`: a string `id` property and `complete(request) -> LLMResponse`. The harness makes no readiness
+call for it, so the factory must raise (preferably `ytverbatim.errors.ConfigError`) when its model is unreachable.
+An unset variable, an import failure, or an object without `id` and `complete` stops the run with a `ConfigError`;
+nothing falls back to another client. The run is keyed `external:<model>@<effort>`, so each effort is its own run
+and an effort change never resumes the other's checkpoints. External candidates have no weights, so `cleanup` does not
+apply. `screen` includes a finished external run like any other.
 
 Correction changes the text only where it edits, so a candidate's net change in errors is the sum over its edits of
 +1 (a fix), -1 (a break) and 0. The blind LLM judge labels a uniform sample of those edits to rank the candidates and

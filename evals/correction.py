@@ -104,19 +104,34 @@ _SERVER_FLAGS = (
 
 @dataclass(frozen=True)
 class Candidate:
-    """A correction model: a Claude CLI model id, or (with ``revision``) a Hugging Face repo served locally."""
+    """A correction model.
+
+    By default a Claude CLI model id. With ``revision``, a Hugging Face repo served locally. With ``effort``, a model
+    labelled ``model`` that an external client factory serves at that reasoning effort.
+    """
 
     id: str
     model: str
     revision: str | None = None
+    effort: str | None = None
 
     @property
     def local(self) -> bool:
         return self.revision is not None
 
     @property
+    def external(self) -> bool:
+        return self.effort is not None
+
+    @property
     def client_id(self) -> str:
-        """The id checkpoints and `Edit.llm` carry; for a local model it names the weights, not the server's host."""
+        """The id checkpoints and `Edit.llm` carry.
+
+        A local model's names its weights, not the server's host; an external one's names the model and the effort,
+        so another effort never resumes or reuses this run.
+        """
+        if self.effort is not None:
+            return f"external:{self.model}@{self.effort}"
         if self.revision is None:
             return f"claude-cli:{self.model}"
         return f"mlx:{self.model}@{self.revision[:12]}"
@@ -124,7 +139,7 @@ class Candidate:
     @property
     def weights(self) -> disk.Weights:
         if self.revision is None:
-            raise ConfigError(f"{self.id} runs through the Claude CLI and has no local weights")
+            raise ConfigError(f"{self.id} has no local weights; it runs through the Claude CLI or an external factory")
         return disk.Weights(self.model, self.revision)
 
 
@@ -135,6 +150,8 @@ CANDIDATES: dict[str, Candidate] = {
         Candidate("c-haiku", "claude-haiku-5-5"),
         Candidate("l-qwen35-9b", "mlx-community/Qwen3.5-9B-8bit", "16daa4818c54ce5f5436f929d52542eb65bbed9d"),
         Candidate("l-qwen3-8b", "mlx-community/Qwen3-8B-8bit", "48a0b75b1ae72503e21e1558d040bc227510ff06"),
+        Candidate("x-gpt61-medium", "gpt-6.1-sol", effort="medium"),
+        Candidate("x-gpt61-high", "gpt-6.1-sol", effort="high"),
     )
 }
 
