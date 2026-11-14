@@ -233,6 +233,12 @@ def _magnitude_exponent(magnitudes: str) -> int:
 
 @dataclass(frozen=True, slots=True)
 class QToken:
+    """One quantity in a text: ``char_start`` and ``char_end`` are half-open offsets and ``surface`` the text between.
+
+    ``value_itn`` is the inverse text normalization that two spellings of one quantity share; a ticker's is its
+    surface.
+    """
+
     char_start: int
     char_end: int
     surface: str
