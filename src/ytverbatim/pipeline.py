@@ -376,7 +376,8 @@ class _RunHook:
             if _reusable(vdir, self.settings) is None:
                 return False
             return not self.settings.video or ready_video(vdir) is not None
-        except OSError:
+        except (OSError, YtverbatimError):
+            # A failed probe must not abort the batch from its pre-check; the video's own run records it.
             return False
 
     def __call__(self, session: FetchSession, planned: PlannedVideo) -> VideoOutcome:
@@ -421,15 +422,21 @@ def _run_video(session: FetchSession, planned: PlannedVideo, settings: _Settings
                     chapters=len(document.chapters),
                     reused=("context",),
                 )
+                timings: tuple[StageTiming, ...] = ()
                 if settings.video and ready_video(vdir) is None:
-                    # The video is not part of the run key, so a current document says nothing about it.
-                    fetched = session.fetch_video(
-                        video_id, cookies_first=planned.cookies_first, audio=False, captions=False
+                    # The video is not part of the run key, so a current document says nothing about it. The saved
+                    # info is usually too old to reuse, so the earlier auth decision spares a refused anonymous try.
+                    settings.emit(ProgressEvent(video_id, "fetch"))
+                    began = time.monotonic()
+                    cookies_first = planned.cookies_first or (
+                        document.access is not None and document.access.cookies_used
                     )
+                    fetched = session.fetch_video(video_id, cookies_first=cookies_first, audio=False, captions=False)
                     if fetched.status is not VideoStatus.OK:
                         return VideoResult(fetched)
                     outcome = replace(outcome, reused=("context", *fetched.reused))
-                return VideoResult(outcome, document, vdir / CONTEXT_MD)
+                    timings = (StageTiming("fetch", time.monotonic() - began, reused=False),)
+                return VideoResult(outcome, document, vdir / CONTEXT_MD, timings=timings)
             if settings.force:
                 StageStore(vdir).clear()
             return _VideoRun(session, planned, vdir, settings).run()

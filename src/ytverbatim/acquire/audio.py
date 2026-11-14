@@ -49,6 +49,7 @@ def fetch_audio(
     cookies: Path | None = None,
     timeout_s: float = DEFAULT_DOWNLOAD_TIMEOUT_S,
     now: Callable[[], float] = time.time,
+    creator_note: bool = False,
 ) -> Path:
     """Download the best audio in its native container and validate it; the info JSON must already be saved."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -65,6 +66,7 @@ def fetch_audio(
         lambda: _download(runner, stage_dir, out_dir, cookies, timeout_s),
         what="audio",
         now=now,
+        creator_note=creator_note,
     )
 
     path = find_audio(out_dir)
@@ -87,8 +89,12 @@ def download_refreshing_stale_info(
     *,
     what: str,
     now: Callable[[], float] = time.time,
+    creator_note: bool = False,
 ) -> None:
-    """Run `download`; a 403 with an old info JSON means expired signed URLs, so extract once more and retry once."""
+    """Run `download`; a 403 with an old info JSON means expired signed URLs, so extract once more and retry once.
+
+    The extraction overwrites the info JSON, so it must ask for comments again when the first one did.
+    """
     try:
         download()
     except YtDlpError as exc:
@@ -96,7 +102,7 @@ def download_refreshing_stale_info(
         if exc.primary is not Signal.HTTP_403 or now() - saved.stat().st_mtime <= INFO_MAX_AGE_S:
             raise
         log.warning("%s download got 403 with a stale info JSON; extracting the video again", what)
-        fetch_info(runner, video_id, stage_dir, cookies=cookies)
+        fetch_info(runner, video_id, stage_dir, cookies=cookies, creator_note=creator_note)
         download()
 
 
